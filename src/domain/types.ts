@@ -1,21 +1,51 @@
 import { z } from "zod";
 
+export const IssueStatusSchema = z.enum([
+  "open",
+  "in_progress",
+  "blocked",
+  "deferred",
+  "draft",
+  "closed",
+  "tombstone",
+  "pinned",
+]);
+export type IssueStatus = z.infer<typeof IssueStatusSchema>;
+
+export const IssueTypeSchema = z.enum([
+  "task",
+  "bug",
+  "feature",
+  "epic",
+  "chore",
+  "docs",
+  "question",
+]);
+export type IssueType = z.infer<typeof IssueTypeSchema>;
+
 export const IssueSchema = z
   .object({
     id: z.string().min(1),
-    title: z.string().default("Untitled issue"),
-    description: z.string().default(""),
-    acceptance_criteria: z.string().default(""),
-    status: z.string().default("open"),
+    title: z.string().min(1),
+    description: z.string().nullable().optional().transform(emptyString),
+    acceptance_criteria: z.string().nullable().optional().transform(emptyString),
+    status: IssueStatusSchema,
     priority: z.number().int().min(0).max(4).default(2),
-    issue_type: z.string().default("task"),
+    issue_type: IssueTypeSchema,
     labels: z.array(z.string()).default([]),
+    assignee: z.string().nullable().optional(),
+    agent_context: z.unknown().optional(),
+    inherited_context: z.unknown().optional(),
     dependents: z.array(z.unknown()).optional(),
     dependencies: z.array(z.unknown()).optional(),
   })
   .passthrough();
 
 export type Issue = z.infer<typeof IssueSchema>;
+
+function emptyString(value: string | null | undefined): string {
+  return value ?? "";
+}
 
 export const ReviewFindingSchema = z.object({
   severity: z.enum(["critical", "high", "medium", "low"]),

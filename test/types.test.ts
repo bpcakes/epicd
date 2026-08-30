@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ImplementationResultSchema,
   IMPLEMENTATION_OUTPUT_SCHEMA,
+  IssueSchema,
   ReviewResultSchema,
   REVIEW_OUTPUT_SCHEMA,
   SELECTION_OUTPUT_SCHEMA,
@@ -66,5 +67,34 @@ describe("agent result schemas", () => {
       required: ["candidateId", "rationale", "dependencyNotes", "riskNotes"],
       additionalProperties: false,
     });
+  });
+});
+
+describe("Beads issue schema", () => {
+  const issue = {
+    id: "epic.1",
+    title: "Concrete work",
+    description: null,
+    acceptance_criteria: null,
+    status: "open",
+    priority: 1,
+    issue_type: "task",
+    labels: [],
+  };
+
+  it("normalizes nullable descriptive text without defaulting operational fields", () => {
+    expect(IssueSchema.parse(issue)).toMatchObject({
+      description: "",
+      acceptance_criteria: "",
+      status: "open",
+      issue_type: "task",
+    });
+    const { status: _, ...missingStatus } = issue;
+    expect(IssueSchema.safeParse(missingStatus).success).toBe(false);
+  });
+
+  it("rejects issue types and statuses outside epicd's supported Beads contract", () => {
+    expect(IssueSchema.safeParse({ ...issue, issue_type: "custom-work" }).success).toBe(false);
+    expect(IssueSchema.safeParse({ ...issue, status: "custom-status" }).success).toBe(false);
   });
 });
