@@ -23,6 +23,12 @@ type EventRow = {
 };
 type LeaseRow = { owner_token: string; pid: number };
 
+function decodeRunRow(row: RunRow): RunState;
+function decodeRunRow(row: RunRow | undefined): RunState | null;
+function decodeRunRow(row: RunRow | undefined): RunState | null {
+  return row ? RunStateSchema.parse(JSON.parse(row.state_json)) : null;
+}
+
 export function defaultStatePath(): string {
   const stateRoot = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
   return join(stateRoot, "epicd", "epicd.sqlite3");
@@ -144,7 +150,7 @@ export class StateStore {
   get(runId: string): RunState | null {
     const row = this.db.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as
       RunRow | undefined;
-    return row ? RunStateSchema.parse(JSON.parse(row.state_json)) : null;
+    return decodeRunRow(row);
   }
 
   findLatest(repoPath: string, epicId?: string): RunState | null {
@@ -159,7 +165,7 @@ export class StateStore {
             "SELECT state_json FROM runs WHERE repo_path = ? ORDER BY updated_at DESC LIMIT 1",
           )
           .get(repoPath) as RunRow | undefined);
-    return row ? RunStateSchema.parse(JSON.parse(row.state_json)) : null;
+    return decodeRunRow(row);
   }
 
   findActive(repoPath: string): RunState | null {
@@ -168,7 +174,7 @@ export class StateStore {
         "SELECT state_json FROM runs WHERE repo_path = ? AND phase != 'complete' ORDER BY updated_at DESC LIMIT 1",
       )
       .get(repoPath) as RunRow | undefined;
-    return row ? RunStateSchema.parse(JSON.parse(row.state_json)) : null;
+    return decodeRunRow(row);
   }
 
   list(repoPath?: string): RunState[] {
@@ -177,7 +183,7 @@ export class StateStore {
           .prepare("SELECT state_json FROM runs WHERE repo_path = ? ORDER BY updated_at DESC")
           .all(repoPath) as RunRow[])
       : (this.db.prepare("SELECT state_json FROM runs ORDER BY updated_at DESC").all() as RunRow[]);
-    return rows.map((row) => RunStateSchema.parse(JSON.parse(row.state_json)));
+    return rows.map((row) => decodeRunRow(row));
   }
 
   addEvent(

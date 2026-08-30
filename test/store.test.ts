@@ -75,6 +75,18 @@ describe("StateStore", () => {
       currentBeadId: "epic-1.1",
       implementationThreadId: "thr-implementation",
     });
+    for (const recovered of [
+      store.findLatest("/repo", "epic-1"),
+      store.findActive("/repo"),
+      store.list("/repo")[0],
+    ]) {
+      expect(recovered).toMatchObject({
+        runId: "run-1",
+        phase: "implementing",
+        runtime: "sdk",
+        agentSettings: DEFAULT_AGENT_SETTINGS,
+      });
+    }
     expect(store.events("run-1").map((event) => event.kind)).toEqual([
       "thread.started",
       "implementation.complete",
