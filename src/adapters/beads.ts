@@ -17,7 +17,7 @@ export class BeadsClient {
   constructor(readonly repoPath: string) {}
 
   private async listIssues(filters: readonly string[]): Promise<Issue[]> {
-    const value = await runJson<unknown>("br", ["list", ...filters, "--limit", "0", "--json"], {
+    const value = await runJson("br", ["list", ...filters, "--limit", "0", "--json"], {
       cwd: this.repoPath,
     });
     return parseIssueList(value);
@@ -40,7 +40,7 @@ export class BeadsClient {
   }
 
   async show(id: string): Promise<Issue> {
-    const value = await runJson<unknown>("br", ["show", id, "--json"], { cwd: this.repoPath });
+    const value = await runJson("br", ["show", id, "--json"], { cwd: this.repoPath });
     const candidate = Array.isArray(value) ? value[0] : value;
     return IssueSchema.parse(candidate);
   }
@@ -48,20 +48,20 @@ export class BeadsClient {
   async ready(epicId?: string): Promise<Issue[]> {
     const args = ["ready", "--limit", "0", "--json"];
     if (epicId) args.splice(1, 0, "--epic", epicId);
-    const value = await runJson<unknown>("br", args, { cwd: this.repoPath });
+    const value = await runJson("br", args, { cwd: this.repoPath });
     return parseIssueList(value);
   }
 
   async triage(): Promise<unknown> {
-    return await runJson<unknown>("bv", ["--robot-triage"], { cwd: this.repoPath });
+    return await runJson("bv", ["--robot-triage"], { cwd: this.repoPath });
   }
 
   async plan(): Promise<unknown> {
-    return await runJson<unknown>("bv", ["--robot-plan"], { cwd: this.repoPath });
+    return await runJson("bv", ["--robot-plan"], { cwd: this.repoPath });
   }
 
   async graph(): Promise<unknown> {
-    return await runJson<unknown>("bv", ["--robot-graph", "--graph-format=json"], {
+    return await runJson("bv", ["--robot-graph", "--graph-format=json"], {
       cwd: this.repoPath,
     });
   }
@@ -110,7 +110,7 @@ export class BeadsClient {
       throw new Error(`${candidateId} does not own concrete implementation work`);
     }
 
-    await runJson<unknown>(
+    await runJson(
       "br",
       [
         "update",
@@ -130,7 +130,7 @@ export class BeadsClient {
   }
 
   async close(id: string, reason: string): Promise<void> {
-    await runJson<unknown>("br", ["close", id, `--reason=${reason}`, "--json"], {
+    await runJson("br", ["close", id, `--reason=${reason}`, "--json"], {
       cwd: this.repoPath,
     });
   }

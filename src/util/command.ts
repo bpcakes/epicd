@@ -92,15 +92,29 @@ export async function runCommand(
   });
 }
 
-export async function runJson<T>(
+export type JsonParser<Result> = {
+  parse(value: unknown): Result;
+};
+
+export function runJson(command: string, args: string[], options: CommandOptions): Promise<unknown>;
+export function runJson<Result>(
   command: string,
   args: string[],
   options: CommandOptions,
-): Promise<T> {
+  parser: JsonParser<Result>,
+): Promise<Result>;
+export async function runJson(
+  command: string,
+  args: string[],
+  options: CommandOptions,
+  parser?: JsonParser<unknown>,
+): Promise<unknown> {
   const result = await runCommand(command, args, options);
+  let value: unknown;
   try {
-    return JSON.parse(result.stdout) as T;
+    value = JSON.parse(result.stdout);
   } catch {
     throw new Error(`${command} returned invalid JSON`);
   }
+  return parser ? parser.parse(value) : value;
 }

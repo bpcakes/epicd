@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import type {
   AgentRole,
   AgentRuntime,
@@ -13,12 +14,14 @@ import type {
 import { CommandError, runCommand, runJson } from "../util/command.js";
 import { redactSensitiveText } from "../util/redact.js";
 
-type HerdrEnvelope = {
-  ok?: boolean;
-  result?: {
-    root_pane?: { pane_id?: string };
-  };
-};
+const HerdrEnvelopeSchema = z.object({
+  ok: z.boolean().optional(),
+  result: z
+    .object({
+      root_pane: z.object({ pane_id: z.string().min(1).optional() }).optional(),
+    })
+    .optional(),
+});
 
 type HerdrSessionHandle = { existing: boolean };
 
@@ -152,7 +155,7 @@ export class HerdrRuntime implements AgentRuntime {
     const settings = this.settings[role];
     let paneId: string | undefined;
     try {
-      const created = await runJson<HerdrEnvelope>(
+      const created = await runJson(
         this.herdrPath,
         [
           "tab",
@@ -166,6 +169,7 @@ export class HerdrRuntime implements AgentRuntime {
           "--no-focus",
         ],
         { cwd: this.repoPath, timeoutMs: 30_000 },
+        HerdrEnvelopeSchema,
       );
       paneId = created.result?.root_pane?.pane_id;
       if (!paneId) throw new Error("tab creation returned no root pane id");

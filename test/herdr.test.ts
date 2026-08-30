@@ -40,7 +40,8 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.EPICD_HERDR_LOG, JSON.stringify(args) + "\\n");
 if (args[0] === "tab" && args[1] === "create") {
-  console.log(JSON.stringify({ok:true,result:{root_pane:{pane_id:"w-test:p9"}}}));
+  const paneId = process.env.EPICD_HERDR_MODE === "invalid-create" ? 42 : "w-test:p9";
+  console.log(JSON.stringify({ok:true,result:{root_pane:{pane_id:paneId}}}));
 } else if (args[0] === "agent" && args[1] === "start") {
   console.log(JSON.stringify({ok:true,result:{agent:{name:args[2]}}}));
 } else if (args[0] === "agent" && args[1] === "get") {
@@ -142,6 +143,21 @@ describe("HerdrRuntime", () => {
         (args) => args[0] === "agent" && args[1] === "send-keys" && args.at(-1) === "ctrl+c",
       ),
     ).toBe(true);
+  });
+
+  it("rejects a structurally invalid Herdr creation response", async () => {
+    const setup = fixture();
+    process.env.EPICD_HERDR_MODE = "invalid-create";
+    const runtime = new HerdrRuntime(
+      setup.root,
+      "invalid-envelope",
+      DEFAULT_AGENT_SETTINGS,
+      setup.herdr,
+    );
+
+    await expect(runtime.run(runtime.start("review"), "Review")).rejects.toThrow(
+      "Could not start Herdr review agent",
+    );
   });
 
   it("refuses to operate outside a Herdr-managed environment", async () => {
