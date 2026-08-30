@@ -388,11 +388,12 @@ export class EpicEngine {
       );
     }
 
-    const firstTurn = this.state.orchestratorThreadId === null;
+    const orchestratorThreadId = this.state.orchestratorThreadId;
+    const firstTurn = orchestratorThreadId === null;
     const beforeSelection = await this.git.reviewFingerprint();
     const thread = firstTurn
       ? this.runtime.start("orchestrator")
-      : this.runtime.resume(this.state.orchestratorThreadId as string, "orchestrator");
+      : this.runtime.resume(orchestratorThreadId, "orchestrator");
     this.emit(
       "info",
       "orchestrator.select",
@@ -464,9 +465,10 @@ export class EpicEngine {
   private async implementCurrent(signal?: AbortSignal): Promise<void> {
     const issue = await this.beads.show(this.requireCurrentBead());
     const epic = await this.beads.show(this.state.epicId);
-    const recovery = this.state.implementationThreadId !== null;
+    const implementationThreadId = this.state.implementationThreadId;
+    const recovery = implementationThreadId !== null;
     const thread = recovery
-      ? this.runtime.resume(this.state.implementationThreadId as string, "implementation")
+      ? this.runtime.resume(implementationThreadId, "implementation")
       : this.runtime.start("implementation");
     this.emit(
       "info",
@@ -510,14 +512,16 @@ export class EpicEngine {
     const issue = await this.beads.show(this.requireCurrentBead());
     const epic = await this.beads.show(this.state.epicId);
     const before = await this.git.status();
-    const recovery = this.state.reviewThreadId !== null;
-    const thread = recovery
-      ? this.runtime.resume(this.state.reviewThreadId as string, "review")
+    const reviewThreadId = this.state.reviewThreadId;
+    const thread = reviewThreadId
+      ? this.runtime.resume(reviewThreadId, "review")
       : this.runtime.start("review");
+    const baseRevision = this.state.baseRevision;
+    if (!baseRevision) throw new Error("Review requires a persisted base revision");
     const revision = exactRevision ? this.state.candidateRevision : null;
     if (exactRevision && !revision)
       throw new Error("Exact verification requires a candidate revision");
-    if (exactRevision) await this.git.assertExactRevision(revision as string);
+    if (revision) await this.git.assertExactRevision(revision);
     const beforeFingerprint = await this.git.reviewFingerprint();
     if (
       this.state.reviewBaselineFingerprint &&
@@ -540,7 +544,7 @@ export class EpicEngine {
     );
     const execution = await this.runtime.run(
       thread,
-      taskReviewPrompt(epic, issue, this.state.baseRevision as string, revision),
+      taskReviewPrompt(epic, issue, baseRevision, revision),
       {
         outputSchema: REVIEW_OUTPUT_SCHEMA,
         signal,
@@ -554,7 +558,7 @@ export class EpicEngine {
       throw new Error(
         `Reviewer modified the working tree; refusing to treat the review as independent\nBefore:\n${before}\nAfter:\n${after}`,
       );
-    if (exactRevision) await this.git.assertExactRevision(revision as string);
+    if (revision) await this.git.assertExactRevision(revision);
 
     const result = parseStructured(execution.finalResponse, ReviewResultSchema);
     this.state.lastReviewSummary = result.summary;
@@ -768,9 +772,9 @@ export class EpicEngine {
       this.state.reviewBaselineFingerprint = beforeFingerprint;
       this.save();
     }
-    const recovery = this.state.reviewThreadId !== null;
-    const thread = recovery
-      ? this.runtime.resume(this.state.reviewThreadId as string, "review")
+    const reviewThreadId = this.state.reviewThreadId;
+    const thread = reviewThreadId
+      ? this.runtime.resume(reviewThreadId, "review")
       : this.runtime.start("review");
     this.emit("info", "epic.review_started", `Final epic verification at ${head.slice(0, 12)}`);
     const execution = await this.runtime.run(

@@ -118,7 +118,7 @@ export const RunPhaseSchema = z.enum([
 
 export type RunPhase = z.infer<typeof RunPhaseSchema>;
 
-export const RunStateSchema = z.object({
+const RunStateBaseSchema = z.object({
   runId: z.string(),
   repoPath: z.string(),
   epicId: z.string(),
@@ -155,6 +155,48 @@ export const RunStateSchema = z.object({
   lastError: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
+});
+
+type RequiredRunStateField =
+  | "currentBeadId"
+  | "baseRevision"
+  | "implementationThreadId"
+  | "candidateRevision"
+  | "reviewedFingerprint"
+  | "reviewedTree";
+
+const requiredFieldsByPhase: Partial<Record<RunPhase, readonly RequiredRunStateField[]>> = {
+  claiming: ["currentBeadId", "baseRevision"],
+  implementing: ["currentBeadId", "baseRevision"],
+  reviewing: ["currentBeadId", "baseRevision", "implementationThreadId"],
+  fixing: ["currentBeadId", "baseRevision", "implementationThreadId"],
+  committing: ["currentBeadId", "baseRevision", "reviewedFingerprint", "reviewedTree"],
+  verifying: ["currentBeadId", "baseRevision", "candidateRevision"],
+  closing: ["currentBeadId", "baseRevision", "candidateRevision"],
+};
+
+export const RunStateSchema = RunStateBaseSchema.superRefine((state, context) => {
+  const activePhase =
+    state.phase === "paused" || state.phase === "blocked" ? state.resumePhase : state.phase;
+  if (!activePhase) return;
+
+  const requiredFields: readonly RequiredRunStateField[] = requiredFieldsByPhase[activePhase] ?? [];
+  for (const field of requiredFields) {
+    if (!state[field]) {
+      context.addIssue({
+        code: "custom",
+        path: [field],
+        message: `${field} is required while the run is ${activePhase}`,
+      });
+    }
+  }
+  if (activePhase === "fixing" && state.pendingFindings.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["pendingFindings"],
+      message: "pendingFindings must not be empty while the run is fixing",
+    });
+  }
 });
 
 export type RunState = z.infer<typeof RunStateSchema>;

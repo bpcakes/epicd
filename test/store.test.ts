@@ -65,6 +65,7 @@ describe("StateStore", () => {
     store.create(run);
     run.phase = "implementing";
     run.currentBeadId = "epic-1.1";
+    run.baseRevision = "abc123";
     run.implementationThreadId = "thr-implementation";
     store.save(run);
     store.addEvent(run.runId, "info", "thread.started", "Implementation started");
@@ -92,6 +93,17 @@ describe("StateStore", () => {
       "implementation.complete",
     ]);
     store.close();
+  });
+
+  it("rejects persisted phases that are missing their recovery-critical fields", () => {
+    const invalid = {
+      ...state("invalid"),
+      phase: "reviewing",
+      currentBeadId: "epic-1.1",
+      implementationThreadId: "thr-implementation",
+    };
+
+    expect(() => RunStateSchema.parse(invalid)).toThrow("baseRevision");
   });
 
   it("prevents two non-complete controllers from owning the same repository", () => {
