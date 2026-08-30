@@ -28,18 +28,20 @@ export const ReviewFindingSchema = z.object({
 
 export type ReviewFinding = z.infer<typeof ReviewFindingSchema>;
 
+export const TestExecutionSchema = z.object({
+  command: z.string(),
+  outcome: z.enum(["passed", "failed", "not_run"]),
+  detail: z.string(),
+});
+
+export type TestExecution = z.infer<typeof TestExecutionSchema>;
+
 export const ReviewResultSchema = z.object({
   verdict: z.enum(["approved", "changes_requested", "blocked"]),
   summary: z.string(),
   revision: z.string().nullable(),
   findings: z.array(ReviewFindingSchema),
-  tests: z.array(
-    z.object({
-      command: z.string(),
-      outcome: z.enum(["passed", "failed", "not_run"]),
-      detail: z.string(),
-    }),
-  ),
+  tests: z.array(TestExecutionSchema),
   residualRisks: z.array(z.string()),
 });
 
@@ -49,13 +51,7 @@ export const ImplementationResultSchema = z.object({
   status: z.enum(["completed", "blocked"]),
   summary: z.string(),
   changedFiles: z.array(z.string()),
-  tests: z.array(
-    z.object({
-      command: z.string(),
-      outcome: z.enum(["passed", "failed", "not_run"]),
-      detail: z.string(),
-    }),
-  ),
+  tests: z.array(TestExecutionSchema),
   blockers: z.array(z.string()),
 });
 
