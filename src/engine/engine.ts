@@ -16,6 +16,7 @@ import {
   SELECTION_OUTPUT_SCHEMA,
   SelectionResultSchema,
   DEFAULT_AGENT_SETTINGS,
+  DEFAULT_MAX_REVIEW_PASSES,
   type AgentRoleSettings,
   type AgentSettings,
   type EngineEvent,
@@ -31,8 +32,10 @@ import {
   finalEpicReviewPrompt,
   fixPrompt,
   implementationPrompt,
+  reviewFixesPrompt,
   selectionPrompt,
   taskReviewPrompt,
+  taskVerificationPrompt,
 } from "./prompts.js";
 
 export type EpicEngineOptions = {
@@ -156,6 +159,7 @@ export class EpicEngine {
       model: options.model ?? null,
       runtime: options.runtime ?? "sdk",
       agentSettings: applyAgentSettings(DEFAULT_AGENT_SETTINGS, options),
+      maxReviewPasses: options.maxReviewPasses ?? DEFAULT_MAX_REVIEW_PASSES,
       phase: "preparing",
       currentBeadId: null,
       currentBeadTitle: null,
@@ -183,7 +187,7 @@ export class EpicEngine {
     const engine = new EpicEngine(store, state, {
       ...options,
       repoPath,
-      maxReviewPasses: options.maxReviewPasses ?? 5,
+      maxReviewPasses: state.maxReviewPasses,
     });
     engine.emit(
       "success",
@@ -205,6 +209,14 @@ export class EpicEngine {
         `Run ${state.runId.slice(0, 8)} uses the ${state.runtime} runtime and cannot resume as ${options.runtime}`,
       );
     }
+    if (
+      options.maxReviewPasses !== undefined &&
+      options.maxReviewPasses !== state.maxReviewPasses
+    ) {
+      throw new Error(
+        `Run ${state.runId.slice(0, 8)} has a persisted repair budget of ${state.maxReviewPasses} passes; start a new run to change it`,
+      );
+    }
     const currentSettings = effectiveAgentSettings(state);
     const requestedSettings = applyAgentSettings(currentSettings, options);
     if (JSON.stringify(requestedSettings) !== JSON.stringify(currentSettings)) {
@@ -216,7 +228,7 @@ export class EpicEngine {
       ...options,
       repoPath: state.repoPath,
       epicId: state.epicId,
-      maxReviewPasses: options.maxReviewPasses ?? 5,
+      maxReviewPasses: state.maxReviewPasses,
     });
   }
 
@@ -293,6 +305,20 @@ export class EpicEngine {
         this.resumeRequested &&
         (this.state.phase === "paused" || this.state.phase === "blocked")
       ) {
+        const recoversLegacyPostCommitBudget =
+          this.state.phase === "blocked" &&
+          this.state.resumePhase === "fixing" &&
+          this.state.candidateRevision !== null &&
+          /^Review did not converge after \d+ fix passes$/.test(this.state.lastError ?? "");
+        if (recoversLegacyPostCommitBudget) {
+          this.state.reviewPass = 0;
+          this.emit(
+            "warning",
+            "repair.budget_recovered",
+            "Recovered a fresh repair budget for post-commit verification findings",
+            this.state.candidateRevision,
+          );
+        }
         const next = this.state.resumePhase ?? "selecting";
         this.state.lastError = null;
         this.state.resumePhase = null;
@@ -513,6 +539,8 @@ export class EpicEngine {
     const epic = await this.beads.show(this.state.epicId);
     const before = await this.git.status();
     const reviewThreadId = this.state.reviewThreadId;
+    const verifyingFixes =
+      !exactRevision && reviewThreadId !== null && this.state.pendingFindings.length > 0;
     const thread = reviewThreadId
       ? this.runtime.resume(reviewThreadId, "review")
       : this.runtime.start("review");
@@ -540,17 +568,25 @@ export class EpicEngine {
       exactRevision ? "verification.started" : "review.started",
       exactRevision
         ? `Verifying ${revision}`
-        : `Starting independent review pass ${this.state.reviewPass + 1}`,
+        : verifyingFixes
+          ? `Verifying fixes from review pass ${this.state.reviewPass}`
+          : `Starting independent review pass ${this.state.reviewPass + 1}`,
     );
-    const execution = await this.runtime.run(
-      thread,
-      taskReviewPrompt(epic, issue, baseRevision, revision),
-      {
-        outputSchema: REVIEW_OUTPUT_SCHEMA,
-        signal,
-        onEvent: this.runtimeEvents("review"),
-      },
-    );
+    const prompt = exactRevision
+      ? taskVerificationPrompt(issue, revision as string)
+      : verifyingFixes
+        ? reviewFixesPrompt(
+            issue,
+            this.state.pendingFindings,
+            baseRevision,
+            this.state.candidateRevision,
+          )
+        : taskReviewPrompt(epic, issue, baseRevision);
+    const execution = await this.runtime.run(thread, prompt, {
+      outputSchema: REVIEW_OUTPUT_SCHEMA,
+      signal,
+      onEvent: this.runtimeEvents("review"),
+    });
     this.state.reviewThreadId = execution.sessionId;
     const after = await this.git.status();
     const afterFingerprint = await this.git.reviewFingerprint();
@@ -573,6 +609,7 @@ export class EpicEngine {
       this.state.reviewBaselineFingerprint = null;
       this.state.reviewedFingerprint = exactRevision ? null : afterFingerprint;
       this.state.reviewedTree = exactRevision ? null : await this.git.prospectiveTree();
+      if (!exactRevision) this.state.reviewPass = 0;
       this.emit(
         "success",
         exactRevision ? "verification.approved" : "review.approved",
@@ -617,7 +654,7 @@ export class EpicEngine {
 
   private async fixCurrent(signal?: AbortSignal): Promise<void> {
     if (this.state.reviewPass >= this.options.maxReviewPasses) {
-      throw new Error(`Review did not converge after ${this.options.maxReviewPasses} fix passes`);
+      throw new Error(`Repair budget exhausted after ${this.options.maxReviewPasses} fix passes`);
     }
     const issue = await this.beads.show(this.requireCurrentBead());
     if (!this.state.implementationThreadId)
@@ -651,8 +688,6 @@ export class EpicEngine {
       );
     }
     this.state.reviewPass += 1;
-    this.state.pendingFindings = [];
-    this.state.reviewThreadId = null;
     this.state.reviewBaselineFingerprint = null;
     this.state.reviewedFingerprint = null;
     this.state.reviewedTree = null;

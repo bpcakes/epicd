@@ -243,8 +243,8 @@ export function RunView({ engine }: { engine: EpicEngine }) {
               {shortId(state.candidateRevision)}
             </Text>
             <Text>
-              <Text dimColor>Review pass </Text>
-              {state.reviewPass + 1}
+              <Text dimColor>Repair attempts </Text>
+              {state.reviewPass}/{state.maxReviewPasses}
             </Text>
             {state.pendingFindings.length > 0 ? (
               <Text color="yellow">

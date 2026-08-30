@@ -97,18 +97,10 @@ ${JSON.stringify(findings)}
 Return only the requested structured implementation report.`;
 }
 
-export function taskReviewPrompt(
-  epic: Issue,
-  issue: Issue,
-  baseRevision: string,
-  exactRevision: string | null,
-): string {
-  const target = exactRevision
-    ? `Review the exact committed revision ${exactRevision}. Confirm HEAD and cite this revision in the result.`
-    : `Review all implementation changes since base revision ${baseRevision}, excluding tracker-only .beads changes.`;
+export function taskReviewPrompt(epic: Issue, issue: Issue, baseRevision: string): string {
   return `You are a fresh, independent comprehensive reviewer. You did not implement this work.
 
-${target}
+Review all implementation changes since base revision ${baseRevision}, excluding tracker-only .beads changes.
 
 Review for correctness, acceptance-criteria coverage, regressions, security, error handling, concurrency and transaction risks where applicable, test quality, and unintended scope. Read applicable AGENTS.md and inspect actual source and diff. Inspect every path reported by git status, including untracked files. Run the strongest relevant tests that are safe in this repository.
 
@@ -118,6 +110,52 @@ EPIC CONTEXT
 ${JSON.stringify(issueView(epic))}
 
 ISSUE UNDER REVIEW
+${JSON.stringify(issueView(issue))}
+
+Return only the requested structured review result.`;
+}
+
+export function reviewFixesPrompt(
+  issue: Issue,
+  findings: ReviewFinding[],
+  baseRevision: string,
+  committedRevision: string | null,
+): string {
+  return `Continue as the independent reviewer for ${issue.id}. The implementation owner has attempted to fix your previously reported findings.
+
+Verify only whether each reported finding is resolved at its root, whether the repair delta directly introduced a regression, and whether the relevant validation passes. Do not restart a comprehensive review of unchanged implementation or search for unrelated improvements.
+
+If every reported finding is resolved and the repair introduced no regression, approve. Otherwise return only the unresolved findings and repair-caused regressions. A failed relevant test is actionable evidence and must prevent approval.
+
+Do not edit, format, generate, stage, commit, reset, or push files. If a command would mutate tracked files, do not run it.
+
+The implementation changes are based on ${baseRevision}.${
+    committedRevision
+      ? ` The previously approved candidate was committed as ${committedRevision}; review the corrective working-tree delta on top of it.`
+      : " The candidate remains uncommitted."
+  }
+
+ISSUE
+${JSON.stringify(issueView(issue))}
+
+FINDINGS TO VERIFY
+${JSON.stringify(findings)}
+
+Return only the requested structured review result.`;
+}
+
+export function taskVerificationPrompt(issue: Issue, revision: string): string {
+  return `You are a fresh, independent exact-revision verifier. You did not implement or review this work.
+
+Verify the exact committed revision ${revision}. Confirm HEAD and cite exactly this revision in the result.
+
+The committed tree has already passed an independent comprehensive review. Verify artifact identity and acceptance evidence: run the repository's required validation and the strongest safe issue-specific regression tests, then check the issue's stated acceptance criteria against observable repository state. Do not conduct another open-ended comprehensive code review or search for unrelated improvements.
+
+Request changes only for a failed relevant validation command or a direct, reproducible mismatch between the stated acceptance criteria and the exact committed repository state. Do not report speculative risks as findings.
+
+Do not edit, format, generate, stage, commit, reset, or push files. If a command would mutate tracked files, do not run it.
+
+ISSUE TO VERIFY
 ${JSON.stringify(issueView(issue))}
 
 Return only the requested structured review result.`;

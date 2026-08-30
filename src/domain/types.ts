@@ -123,6 +123,8 @@ export const DEFAULT_AGENT_SETTINGS = {
   review: { model: null, reasoningEffort: "xhigh" },
 } as const satisfies Record<string, AgentRoleSettings>;
 
+export const DEFAULT_MAX_REVIEW_PASSES = 3;
+
 export const AgentSettingsSchema = z.object({
   orchestrator: AgentRoleSettingsSchema,
   implementation: AgentRoleSettingsSchema,
@@ -156,6 +158,8 @@ const RunStateBaseSchema = z.object({
   model: z.string().nullable(),
   runtime: RuntimeKindSchema.default("sdk"),
   agentSettings: AgentSettingsSchema.default(DEFAULT_AGENT_SETTINGS),
+  // Runs persisted before this setting existed used the historical default of five.
+  maxReviewPasses: z.number().int().positive().default(5),
   phase: RunPhaseSchema,
   currentBeadId: z.string().nullable(),
   currentBeadTitle: z.string().nullable(),

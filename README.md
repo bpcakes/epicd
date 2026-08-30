@@ -1,6 +1,6 @@
 # epicd
 
-`epicd` delivers a fully specified Beads epic through durable Codex agents. The user chooses either direct SDK threads or visible Herdr-managed sessions. One persistent orchestrator understands the epic graph, each concrete Bead gets its own implementation session, and every candidate is reviewed in a separate fresh session before and after commit.
+`epicd` delivers a fully specified Beads epic through durable Codex agents. The user chooses either direct SDK threads or visible Herdr-managed sessions. One persistent orchestrator understands the epic graph, each concrete Bead gets its own implementation session, every candidate receives a fresh comprehensive review before commit, and a fresh verifier checks the exact commit afterward.
 
 The terminal UI is the primary interface. It shows the selected runtime, current task, lifecycle stage, implementation and review session IDs, verified revision, progress across the epic, and a recoverable activity stream.
 
@@ -10,8 +10,8 @@ The terminal UI is the primary interface. It shows the selected runtime, current
 - Every claim reruns `br ready` immediately, then `br show`, and rejects epic containers before calling `br update`.
 - Implementation agents cannot claim, close, sync, stage, commit, amend, or push.
 - Review happens in a separate Codex session. Reviewers are checked for working-tree mutations.
-- Findings go back to the original implementation session until review converges.
-- The controller commits a reviewed candidate, then a fresh verifier cites and checks the exact commit SHA.
+- Findings go back to the original implementation session, then the same independent reviewer verifies those fixes without restarting an open-ended review.
+- The controller commits the reviewed tree, then a fresh verifier cites the exact commit SHA and checks its acceptance evidence.
 - A Bead closes only after exact-revision verification. Tracker exports are committed separately so the next task starts clean.
 - Nested epic containers close only after their descendants close. The root epic receives a final comprehensive review.
 - Thread IDs and lifecycle state survive process failure in a transactional SQLite store.
@@ -98,6 +98,14 @@ Available reasoning values are `minimal`, `low`, `medium`, `high`, `xhigh`, `max
 
 Without flags, every role inherits the model from the local Codex configuration. The orchestrator and implementation roles default to `high`; review defaults to `xhigh`. Role settings are persisted and cannot change during resume because SDK threads and live Herdr agents must retain a stable execution contract.
 
+Each comprehensive review cycle allows three implementation fix passes by default. Set a different positive integer when starting a run:
+
+```bash
+epicd run my-project-epic-id --max-review-passes 6 -C /path/to/repository
+```
+
+The repair budget is persisted with the run and cannot change during resume. Targeted fix verification uses the same reviewer session; approval resets the budget before exact-revision verification.
+
 For logs suitable for a supervisor or CI console:
 
 ```bash
@@ -138,9 +146,9 @@ For every implementation task, epicd performs:
 3. Rerun the authoritative ready/show claim gate and claim the selected task.
 4. Start a top-level implementation session with the exact Bead and epic context.
 5. Start a fresh comprehensive review session over the uncommitted candidate.
-6. Resume the implementation session with every finding and repeat review as needed.
+6. Resume the implementation session with every finding, then resume the same reviewer to verify those fixes and repair-caused regressions.
 7. Commit application changes without staging `.beads`.
-8. Start a fresh verifier session over the exact candidate SHA.
+8. Start a fresh verifier session to confirm the exact candidate SHA and its acceptance evidence without repeating the comprehensive review.
 9. Close and sync the Bead, then commit tracker-only changes.
 10. Refresh the graph and select the next ready task.
 
@@ -154,7 +162,7 @@ By default, epicd stores minimal runtime state at:
 $XDG_STATE_HOME/epicd/epicd.sqlite3
 ```
 
-When `XDG_STATE_HOME` is unset, it uses `~/.local/state/epicd/epicd.sqlite3`. The database contains lifecycle state, the selected runtime, opaque SDK/Herdr session IDs, exact revisions, and the activity events displayed by the TUI. It does not duplicate the Beads dependency graph.
+When `XDG_STATE_HOME` is unset, it uses `~/.local/state/epicd/epicd.sqlite3`. The database contains lifecycle state, the selected runtime, repair budget, opaque SDK/Herdr session IDs, exact revisions, and the activity events displayed by the TUI. It does not duplicate the Beads dependency graph. Runs created before repair-budget persistence retain the historical default of five passes.
 
 Herdr agents use an atomic structured-result file under `$XDG_STATE_HOME/epicd/herdr/<run-id>` (or the corresponding `~/.local/state` path). This avoids treating terminal screen text as an API. Result files are deleted after each turn; the dedicated agent tabs remain available for inspection and recovery.
 
@@ -168,7 +176,7 @@ Version 0.1 runs one implementation task at a time in the selected repository. S
 
 Automatic commits are part of the requested lifecycle. Starting a run therefore requires a clean working tree and is an explicit request for epicd to create local commits. Pushing remains a separate human action.
 
-If a reviewer modifies tracked files, a structured response is invalid, a command fails, a task has no concrete changes, a verifier cites the wrong revision, or review does not converge, epicd enters `blocked`. The TUI preserves the exact phase and evidence so the operator can correct the cause and press `r`.
+If a reviewer modifies tracked files, a structured response is invalid, a command fails, a task has no concrete changes, a verifier cites the wrong revision, or the repair budget is exhausted, epicd enters `blocked`. The TUI preserves the exact phase and evidence so the operator can correct the cause and press `r`.
 
 ## Development
 

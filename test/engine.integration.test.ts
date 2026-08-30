@@ -135,33 +135,45 @@ process.stdin.on("end", () => {
   let response;
   if (prompt.includes("persistent epicd orchestrator")) {
     response = {candidateId:"demo.1",rationale:"Only ready concrete task",dependencyNotes:[],riskNotes:[]};
-  } else if (prompt.includes("implementation owner")) {
+  } else if (prompt.includes("You are the implementation owner") || prompt.includes("Continue as the implementation owner")) {
     const fixing = prompt.includes("Continue as the implementation owner");
-    fs.writeFileSync(path.join(repo, "feature.txt"), fixing ? "fixed\\n" : "implemented\\n");
+    const committedFix = prompt.includes("last candidate was already committed");
+    fs.writeFileSync(path.join(repo, "feature.txt"), committedFix ? "verified-fixed\\n" : fixing ? "fixed\\n" : "implemented\\n");
     response = {status:"completed",summary:fixing ? "Fixed review finding" : "Implemented feature",changedFiles:["feature.txt"],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],blockers:[]};
   } else if (prompt.includes("final independent verifier")) {
     const head = cp.execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
     response = {verdict:"approved",summary:"Epic accepted",revision:head,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
-	  } else if (prompt.includes("fresh, independent comprehensive reviewer")) {
-	    const exact = prompt.includes("exact committed revision");
-	    const actualHead = exact ? cp.execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {encoding:"utf8"}).trim() : null;
-	    if (!exact && mode === "reviewer-mutate") fs.writeFileSync(path.join(repo, "feature.txt"), "reviewer overwrite\\n");
-	    if (exact && mode === "reviewer-commit") {
-	      fs.writeFileSync(path.join(repo, "reviewer.txt"), "unauthorized reviewer commit\\n");
-	      cp.execFileSync("git", ["-C", repo, "add", "reviewer.txt"]);
-	      cp.execFileSync("git", ["-C", repo, "commit", "-qm", "reviewer mutation"]);
-	    }
-	    const head = exact && mode === "wrong-revision" ? "deadbeef" : actualHead;
+  } else if (prompt.includes("fresh, independent comprehensive reviewer")) {
+    if (mode === "reviewer-mutate") fs.writeFileSync(path.join(repo, "feature.txt"), "reviewer overwrite\\n");
     let requestFix = false;
-    if (!exact && mode === "review-fix") {
+    if (mode === "review-fix") {
       const counter = process.env.EPICD_FAKE_COUNTER;
       const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0;
       fs.writeFileSync(counter, String(count + 1));
       requestFix = count === 0;
     }
+    if (mode === "review-and-verification-fix") {
+      requestFix = fs.readFileSync(path.join(repo, "feature.txt"), "utf8") === "implemented\\n";
+    }
     response = requestFix
       ? {verdict:"changes_requested",summary:"Feature needs correction",revision:null,findings:[{severity:"medium",title:"Wrong content",detail:"Expected fixed content",file:"feature.txt",line:1,remediation:"Write fixed content"}],tests:[{command:"test feature content",outcome:"failed",detail:"not fixed"}],residualRisks:[]}
-      : {verdict:"approved",summary:"Task accepted",revision:head,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
+      : {verdict:"approved",summary:"Task accepted",revision:null,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
+  } else if (prompt.includes("Continue as the independent reviewer")) {
+    response = {verdict:"approved",summary:"Reported findings are resolved",revision:null,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
+  } else if (prompt.includes("fresh, independent exact-revision verifier")) {
+    const actualHead = cp.execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+    if (mode === "reviewer-commit") {
+      fs.writeFileSync(path.join(repo, "reviewer.txt"), "unauthorized reviewer commit\\n");
+      cp.execFileSync("git", ["-C", repo, "add", "reviewer.txt"]);
+      cp.execFileSync("git", ["-C", repo, "commit", "-qm", "reviewer mutation"]);
+    }
+    const head = mode === "wrong-revision" ? "deadbeef" : actualHead;
+    const feature = fs.readFileSync(path.join(repo, "feature.txt"), "utf8");
+    const requestFix = (mode === "review-and-verification-fix" && feature === "fixed\\n")
+      || (mode === "verification-fix" && feature === "implemented\\n");
+    response = requestFix
+      ? {verdict:"changes_requested",summary:"Exact revision fails acceptance evidence",revision:head,findings:[{severity:"high",title:"Exact revision mismatch",detail:"Expected verified content",file:"feature.txt",line:1,remediation:"Write verified content"}],tests:[{command:"test feature verified content",outcome:"failed",detail:"not verified"}],residualRisks:[]}
+      : {verdict:"approved",summary:"Exact revision accepted",revision:head,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
   } else {
     console.error("unknown prompt", prompt.slice(0, 200)); process.exit(2);
   }
@@ -201,16 +213,17 @@ if (args[0] === "tab" && args[1] === "create") {
   let response;
   if (prompt.includes("persistent epicd orchestrator")) {
     response = {candidateId:"demo.1",rationale:"Only ready concrete task",dependencyNotes:[],riskNotes:[]};
-  } else if (prompt.includes("implementation owner")) {
+  } else if (prompt.includes("You are the implementation owner") || prompt.includes("Continue as the implementation owner")) {
     fs.writeFileSync(path.join(repo, "feature.txt"), "implemented\\n");
     response = {status:"completed",summary:"Implemented feature",changedFiles:["feature.txt"],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],blockers:[]};
   } else if (prompt.includes("final independent verifier")) {
     const head = cp.execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
     response = {verdict:"approved",summary:"Epic accepted",revision:head,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
   } else if (prompt.includes("fresh, independent comprehensive reviewer")) {
-    const exact = prompt.includes("exact committed revision");
-    const head = exact ? cp.execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {encoding:"utf8"}).trim() : null;
-    response = {verdict:"approved",summary:"Task accepted",revision:head,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
+    response = {verdict:"approved",summary:"Task accepted",revision:null,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
+  } else if (prompt.includes("fresh, independent exact-revision verifier")) {
+    const head = cp.execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+    response = {verdict:"approved",summary:"Exact revision accepted",revision:head,findings:[],tests:[{command:"test -f feature.txt",outcome:"passed",detail:"exists"}],residualRisks:[]};
   } else process.exit(2);
   fs.writeFileSync(resultPath + ".tmp", JSON.stringify(response));
   fs.renameSync(resultPath + ".tmp", resultPath);
@@ -240,6 +253,7 @@ describe.sequential("EpicEngine workflow", () => {
       },
       setup.store,
     );
+    expect(engine.state.maxReviewPasses).toBe(3);
     expect(() =>
       EpicEngine.resume(
         engine.state,
@@ -254,6 +268,9 @@ describe.sequential("EpicEngine workflow", () => {
         setup.store,
       ),
     ).not.toThrow();
+    expect(() => EpicEngine.resume(engine.state, { maxReviewPasses: 4 }, setup.store)).toThrow(
+      "persisted repair budget of 3 passes",
+    );
     setup.store.close();
   });
 
@@ -348,6 +365,75 @@ describe.sequential("EpicEngine workflow", () => {
     expect(setup.store.events(state.runId).some((event) => event.kind === "fix.completed")).toBe(
       true,
     );
+    setup.store.close();
+  }, 30_000);
+
+  it("uses targeted repair review and a fresh repair budget after exact verification", async () => {
+    const setup = await fixture();
+    const argumentLog = join(setup.repo, "..", "codex-args.jsonl");
+    process.env.EPICD_FAKE_ARGS = argumentLog;
+    process.env.EPICD_FAKE_MODE = "review-and-verification-fix";
+    const engine = await EpicEngine.create(
+      {
+        repoPath: setup.repo,
+        epicId: "demo",
+        codexPath: setup.codex,
+        maxReviewPasses: 1,
+      },
+      setup.store,
+    );
+
+    const state = await engine.run();
+
+    expect(state.phase, state.lastError ?? undefined).toBe("complete");
+    expect(state.maxReviewPasses).toBe(1);
+    expect(readFileSync(join(setup.repo, "feature.txt"), "utf8")).toBe("verified-fixed\n");
+    const events = setup.store.events(state.runId);
+    expect(events.filter((event) => event.kind === "fix.completed")).toHaveLength(2);
+    expect(events.filter((event) => event.kind === "git.committed")).toHaveLength(2);
+    expect(
+      events.filter(
+        (event) =>
+          event.kind === "review.started" && event.message.startsWith("Verifying fixes from"),
+      ),
+    ).toHaveLength(2);
+    const invocations = readFileSync(argumentLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(invocations.filter((args) => args.includes("resume"))).toHaveLength(4);
+    setup.store.close();
+  }, 30_000);
+
+  it("recovers the exhausted post-commit repair budget from legacy run state", async () => {
+    const setup = await fixture();
+    process.env.EPICD_FAKE_MODE = "verification-fix";
+    const engine = await EpicEngine.create(
+      { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+      setup.store,
+    );
+    engine.onEvent((event) => {
+      if (event.kind === "review.changes_requested" && engine.state.candidateRevision) {
+        engine.requestPause();
+      }
+    });
+
+    const paused = await engine.run();
+    expect(paused.phase).toBe("paused");
+    expect(paused.resumePhase).toBe("fixing");
+    paused.phase = "blocked";
+    paused.reviewPass = 5;
+    paused.lastError = "Review did not converge after 5 fix passes";
+    setup.store.save(paused);
+
+    engine.continueRun();
+    const resumed = await engine.run();
+
+    expect(resumed.phase, resumed.lastError ?? undefined).toBe("complete");
+    expect(readFileSync(join(setup.repo, "feature.txt"), "utf8")).toBe("verified-fixed\n");
+    expect(
+      setup.store.events(resumed.runId).some((event) => event.kind === "repair.budget_recovered"),
+    ).toBe(true);
     setup.store.close();
   }, 30_000);
 

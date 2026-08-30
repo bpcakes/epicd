@@ -22,6 +22,7 @@ function state(runId: string, epicId = "epic-1"): RunState {
     model: null,
     runtime: "sdk",
     agentSettings: DEFAULT_AGENT_SETTINGS,
+    maxReviewPasses: 3,
     phase: "selecting",
     currentBeadId: null,
     currentBeadTitle: null,
@@ -52,8 +53,10 @@ describe("StateStore", () => {
     const legacy = { ...state("legacy") } as Partial<RunState>;
     delete legacy.runtime;
     delete legacy.agentSettings;
+    delete legacy.maxReviewPasses;
     expect(RunStateSchema.parse(legacy).runtime).toBe("sdk");
     expect(RunStateSchema.parse(legacy).agentSettings).toEqual(DEFAULT_AGENT_SETTINGS);
+    expect(RunStateSchema.parse(legacy).maxReviewPasses).toBe(5);
   });
 
   it("persists recovery-critical state and ordered UI events", () => {
@@ -86,6 +89,7 @@ describe("StateStore", () => {
         phase: "implementing",
         runtime: "sdk",
         agentSettings: DEFAULT_AGENT_SETTINGS,
+        maxReviewPasses: 3,
       });
     }
     expect(store.events("run-1").map((event) => event.kind)).toEqual([

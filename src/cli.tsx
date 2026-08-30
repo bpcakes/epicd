@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import process from "node:process";
 import { resolve } from "node:path";
-import { Command, Option } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import { render } from "ink";
 import React from "react";
 import { BeadsClient } from "./adapters/beads.js";
@@ -26,6 +26,7 @@ type CommonOptions = {
   reviewModel?: string;
   reviewReasoning?: ReasoningEffort;
   runtime?: RuntimeKind;
+  maxReviewPasses?: number;
 };
 
 function commonOptions(command: Command): CommonOptions {
@@ -62,6 +63,10 @@ function agentOptions(
   };
 }
 
+function reviewLoopOptions(options: CommonOptions): Pick<EpicEngineOptions, "maxReviewPasses"> {
+  return options.maxReviewPasses === undefined ? {} : { maxReviewPasses: options.maxReviewPasses };
+}
+
 function resumeEngine(
   state: Parameters<typeof EpicEngine.resume>[0],
   options: CommonOptions,
@@ -71,6 +76,7 @@ function resumeEngine(
     state,
     {
       ...agentOptions(options),
+      ...reviewLoopOptions(options),
       ...(options.runtime ? { runtime: options.runtime } : {}),
     },
     store,
@@ -110,6 +116,7 @@ async function createOrReject(
       epicId,
       runtime: options.runtime ?? "sdk",
       ...agentOptions(options),
+      ...reviewLoopOptions(options),
     },
     store,
   );
@@ -135,6 +142,7 @@ async function defaultTui(epicId: string | undefined, options: CommonOptions): P
               epicId,
               runtime,
               ...agentOptions(options),
+              ...reviewLoopOptions(options),
             },
             store,
           );
@@ -161,6 +169,7 @@ async function defaultTui(epicId: string | undefined, options: CommonOptions): P
             epicId: item.epic.id,
             runtime,
             ...agentOptions(options),
+            ...reviewLoopOptions(options),
           },
           store,
         );
@@ -172,6 +181,14 @@ async function defaultTui(epicId: string | undefined, options: CommonOptions): P
 
 function reasoningOption(flags: string, description: string): Option {
   return new Option(flags, description).choices(ReasoningEffortSchema.options);
+}
+
+function positiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new InvalidArgumentError("must be a positive integer");
+  }
+  return parsed;
 }
 
 const program = new Command();
@@ -193,6 +210,12 @@ program
   )
   .option("--review-model <model>", "review model override")
   .addOption(reasoningOption("--review-reasoning <effort>", "review reasoning override"))
+  .addOption(
+    new Option(
+      "--max-review-passes <count>",
+      "maximum fix passes per review cycle for new runs (default: 3)",
+    ).argParser(positiveInteger),
+  )
   .addOption(
     new Option("--runtime <runtime>", "agent runtime for new runs").choices([
       "sdk",
