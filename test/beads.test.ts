@@ -13,6 +13,8 @@ afterEach(() => {
   delete process.env.EPICD_TEST_TYPE;
   delete process.env.EPICD_TEST_NOT_READY;
   delete process.env.EPICD_TEST_MALFORMED_LIST;
+  delete process.env.EPICD_TEST_STATUS;
+  delete process.env.EPICD_TEST_ASSIGNEE;
   for (const path of tempDirs.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -30,11 +32,12 @@ const fs = require("node:fs");
 fs.appendFileSync(process.env.EPICD_TEST_LOG, process.argv.slice(2).join(" ") + "\\n");
 const cmd = process.argv[2];
 const type = process.env.EPICD_TEST_TYPE || "task";
-const issue = {id:"epic.1",title:"Concrete work",description:"Implement it",acceptance_criteria:"It works",status:"open",priority:1,issue_type:type,labels:[]};
+const issue = {id:"epic.1",title:"Concrete work",description:"Implement it",acceptance_criteria:"It works",status:process.env.EPICD_TEST_STATUS || "open",priority:1,issue_type:type,labels:[],assignee:process.env.EPICD_TEST_ASSIGNEE || null};
 if (cmd === "ready") console.log(JSON.stringify(process.env.EPICD_TEST_NOT_READY ? [] : [issue]));
+else if (cmd === "blocked") console.log(JSON.stringify([]));
 else if (cmd === "list") console.log(JSON.stringify(process.env.EPICD_TEST_MALFORMED_LIST ? {} : {issues:[issue]}));
 else if (cmd === "show") console.log(JSON.stringify(issue));
-else if (cmd === "update") console.log(JSON.stringify({...issue,status:"in_progress"}));
+else if (cmd === "update") { const actorIndex = process.argv.indexOf("--actor"); console.log(JSON.stringify({...issue,status:"in_progress",assignee:actorIndex >= 0 ? process.argv[actorIndex + 1] : issue.assignee})); }
 else if (cmd === "--version") console.log("br test");
 else console.log("{}");
 `,
@@ -67,14 +70,38 @@ describe.sequential("BeadsClient claim gate", () => {
     await expect(new BeadsClient(fixture.root).listAll()).rejects.toThrow();
   });
 
-  it("executes ready, show, and only then the status mutation", async () => {
+  it("executes ready, show, and only then an atomic claim", async () => {
     const fixture = installFakeBr();
     await new BeadsClient(fixture.root).claim("epic", "epic.1", "run-1");
     const commands = readFileSync(fixture.log, "utf8").trim().split("\n");
     expect(commands[0]).toContain("ready --epic epic");
     expect(commands[1]).toBe("show epic.1 --json");
-    expect(commands[2]).toContain("update epic.1 --status=in_progress");
+    expect(commands[2]).toContain("update epic.1 --claim --actor epicd:run-1");
     expect(commands[2]).not.toContain("--force");
+  });
+
+  it("atomically adopts unassigned in-progress work", async () => {
+    const fixture = installFakeBr();
+    process.env.EPICD_TEST_STATUS = "in_progress";
+    await new BeadsClient(fixture.root).adoptUnownedInProgress("epic", "epic.1", "run-2");
+
+    const commands = readFileSync(fixture.log, "utf8").trim().split("\n");
+    expect(commands).toEqual([
+      "show epic.1 --json",
+      expect.stringContaining("update epic.1 --claim --actor epicd:run-2"),
+      "show epic.1 --json",
+    ]);
+  });
+
+  it("refuses to adopt in-progress work owned by someone else", async () => {
+    const fixture = installFakeBr();
+    process.env.EPICD_TEST_STATUS = "in_progress";
+    process.env.EPICD_TEST_ASSIGNEE = "other-agent";
+
+    await expect(
+      new BeadsClient(fixture.root).adoptUnownedInProgress("epic", "epic.1", "run-2"),
+    ).rejects.toThrow("owner other-agent");
+    expect(readFileSync(fixture.log, "utf8")).not.toContain("update ");
   });
 
   it("refuses an epic container before mutation", async () => {

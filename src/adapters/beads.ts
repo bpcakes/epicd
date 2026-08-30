@@ -52,6 +52,13 @@ export class BeadsClient {
     return parseIssueList(value);
   }
 
+  async blocked(): Promise<Issue[]> {
+    const value = await runJson("br", ["blocked", "--limit", "0", "--json"], {
+      cwd: this.repoPath,
+    });
+    return parseIssueList(value);
+  }
+
   async triage(): Promise<unknown> {
     return await runJson("bv", ["--robot-triage"], { cwd: this.repoPath });
   }
@@ -67,10 +74,11 @@ export class BeadsClient {
   }
 
   async snapshot(epicId: string): Promise<EpicSnapshot> {
-    const [epic, allIssues, readyIssues, triage, plan, graph] = await Promise.all([
+    const [epic, allIssues, readyIssues, blockedIssues, triage, plan, graph] = await Promise.all([
       this.show(epicId),
       this.listAll(),
       this.ready(epicId),
+      this.blocked(),
       this.triage(),
       this.plan(),
       this.graph(),
@@ -85,6 +93,7 @@ export class BeadsClient {
         (issue) => issue.status !== "closed" && issue.status !== "tombstone",
       ),
       readyIssues: readyIssues.filter((issue) => isDescendant(epicId, issue.id)),
+      blockedIssues: blockedIssues.filter((issue) => isDescendant(epicId, issue.id)),
       triage,
       plan,
       graph,
@@ -110,23 +119,48 @@ export class BeadsClient {
       throw new Error(`${candidateId} does not own concrete implementation work`);
     }
 
+    await this.claimMutation(candidateId, runId);
+    return await this.show(candidateId);
+  }
+
+  /**
+   * Atomically adopts dependency-safe work that was marked in progress without
+   * recording an owner. Beads rejects blocked work and ownership races.
+   */
+  async adoptUnownedInProgress(epicId: string, candidateId: string, runId: string): Promise<Issue> {
+    const issue = await this.show(candidateId);
+    if (!isDescendant(epicId, issue.id))
+      throw new Error(`${candidateId} is not a descendant of ${epicId}`);
+    if (issue.issue_type === "epic")
+      throw new Error(`${candidateId} is an epic container and cannot be adopted`);
+    const assignee = typeof issue.assignee === "string" ? issue.assignee.trim() : "";
+    if (issue.status !== "in_progress" || assignee) {
+      throw new Error(
+        `${candidateId} is not unowned in-progress work (status ${issue.status}, owner ${assignee || "none"})`,
+      );
+    }
+
+    await this.claimMutation(candidateId, runId);
+    return await this.show(candidateId);
+  }
+
+  private async claimMutation(candidateId: string, runId: string): Promise<void> {
     await runJson(
       "br",
       [
         "update",
         candidateId,
-        "--status=in_progress",
-        "--assignee",
+        "--claim",
+        "--actor",
         `epicd:${runId}`,
         "--agent-name",
         "epicd",
         "--harness",
-        "codex-sdk",
+        "epicd",
         "--json",
       ],
       { cwd: this.repoPath },
     );
-    return await this.show(candidateId);
   }
 
   async close(id: string, reason: string): Promise<void> {

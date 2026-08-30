@@ -41,7 +41,7 @@ export function selectionPrompt(
 
 ${firstTurn ? "Build a complete mental model of the epic and its dependency graph before selecting work." : "Refresh your model using this authoritative current snapshot; earlier task states may now be stale."}
 
-Choose exactly one concrete, non-epic implementation issue from readyCandidateIds. Consider dependency impact, merge-risk sequencing, shared abstractions, and the bv recommendations, but never select an epic container. br ready has already supplied the candidate set; your output is advisory and epicd will independently enforce the gate immediately before claiming.
+Choose exactly one concrete, non-epic implementation issue from readyCandidateIds. Consider dependency impact, merge-risk sequencing, shared abstractions, and the bv recommendations, but never select an epic container. Epicd built this exact candidate set from br ready plus dependency-safe in-progress work already owned by this run or missing an owner. Your output is advisory and epicd will independently enforce the claim or adoption gate immediately before mutation.
 
 Do not modify files, invoke tracker mutations, or claim anything. Return only the requested structured selection.
 

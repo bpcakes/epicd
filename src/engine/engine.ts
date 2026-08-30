@@ -91,6 +91,11 @@ function taskIssues(snapshot: EpicSnapshot): Issue[] {
   );
 }
 
+function issueAssignee(issue: Issue): string | null {
+  const assignee = typeof issue.assignee === "string" ? issue.assignee.trim() : "";
+  return assignee || null;
+}
+
 function isApproved(result: ReturnType<typeof ReviewResultSchema.parse>): boolean {
   return (
     result.verdict === "approved" &&
@@ -420,15 +425,38 @@ export class EpicEngine {
       return;
     }
 
-    const candidates = snapshot.readyIssues.filter(
+    const readyCandidates = snapshot.readyIssues.filter(
       (issue) =>
         issue.issue_type !== "epic" &&
         issue.status !== "closed" &&
         openTasks.some((task) => task.id === issue.id),
     );
+    const blockedIds = new Set((snapshot.blockedIssues ?? []).map((issue) => issue.id));
+    const recoverableCandidates = openTasks.filter(
+      (issue) =>
+        issue.status === "in_progress" &&
+        !blockedIds.has(issue.id) &&
+        (issueAssignee(issue) === null || issueAssignee(issue) === `epicd:${this.state.runId}`),
+    );
+    const candidates = [
+      ...new Map(
+        [...readyCandidates, ...recoverableCandidates].map((issue) => [issue.id, issue]),
+      ).values(),
+    ];
     if (candidates.length === 0) {
+      const ownership = openTasks
+        .filter((issue) => issue.status === "in_progress")
+        .map((issue) => {
+          const owner = issueAssignee(issue) ?? "unassigned";
+          const blocked = blockedIds.has(issue.id) ? ", dependency-blocked" : "";
+          return `${issue.id} (${owner}${blocked})`;
+        });
+      const statuses = openTasks
+        .filter((issue) => issue.status !== "in_progress")
+        .map((issue) => `${issue.id} (${issue.status})`);
+      const detail = [...ownership, ...statuses].join(", ");
       throw new Error(
-        `${openTasks.length} implementation tasks remain, but br ready returned no concrete descendant`,
+        `${openTasks.length} implementation tasks remain, but none is claimable${detail ? `: ${detail}` : ""}`,
       );
     }
 
@@ -491,9 +519,17 @@ export class EpicEngine {
   private async claimCurrent(): Promise<void> {
     const beadId = this.requireCurrentBead();
     const existing = await this.beads.show(beadId);
-    const assignee = typeof existing.assignee === "string" ? existing.assignee : null;
+    const assignee = issueAssignee(existing);
     if (existing.status === "in_progress" && assignee === `epicd:${this.state.runId}`) {
       this.emit("info", "beads.claim_recovered", `Recovered completed claim for ${beadId}`);
+    } else if (existing.status === "in_progress" && assignee === null) {
+      this.emit(
+        "warning",
+        "beads.claim_reconciling",
+        `Adopting unowned in-progress task ${beadId}`,
+      );
+      await this.beads.adoptUnownedInProgress(this.state.epicId, beadId, this.state.runId);
+      this.emit("success", "beads.claim_reconciled", `Adopted ${beadId} for this run`);
     } else {
       this.emit(
         "info",

@@ -92,7 +92,8 @@ const save = () => { fs.writeFileSync(statePath, JSON.stringify(state, null, 2))
 if (args[0] === "list") console.log(JSON.stringify({issues: state.issues, total: state.issues.length, limit: 0, offset: 0, has_more: false}));
 else if (args[0] === "show") console.log(JSON.stringify(state.issues.find(i => i.id === args[1])));
 else if (args[0] === "ready") console.log(JSON.stringify(state.issues.filter(i => i.status === "open")));
-else if (args[0] === "update") { const issue = state.issues.find(i => i.id === args[1]); issue.status = "in_progress"; const ai = args.indexOf("--assignee"); if (ai >= 0) issue.assignee = args[ai + 1]; save(); console.log(JSON.stringify(issue)); }
+else if (args[0] === "blocked") console.log(JSON.stringify([]));
+else if (args[0] === "update") { const issue = state.issues.find(i => i.id === args[1]); const si = args.findIndex(arg => arg.startsWith("--status=")); if (si >= 0) issue.status = args[si].slice("--status=".length); if (args.includes("--claim")) { issue.status = "in_progress"; const ai = args.indexOf("--actor"); issue.assignee = ai >= 0 ? args[ai + 1] : "unknown"; } const ai = args.indexOf("--assignee"); if (ai >= 0) issue.assignee = args[ai + 1]; save(); console.log(JSON.stringify(issue)); }
 else if (args[0] === "close") { const issue = state.issues.find(i => i.id === args[1]); issue.status = "closed"; save(); console.log(JSON.stringify(issue)); }
 else if (args[0] === "sync") { save(); console.log("synced"); }
 else { console.error("unsupported br", args); process.exit(2); }
@@ -241,6 +242,27 @@ if (args[0] === "tab" && args[1] === "create") {
   return { repo, codex, herdr, store: new StateStore(join(root, "epicd.sqlite3")) };
 }
 
+async function seedTaskOwnership(
+  repo: string,
+  status: "open" | "in_progress",
+  assignee?: string,
+): Promise<void> {
+  const statePath = join(repo, ".beads", "state.json");
+  const exportPath = join(repo, ".beads", "issues.jsonl");
+  const tracker = JSON.parse(readFileSync(statePath, "utf8")) as {
+    issues: Array<Record<string, unknown>>;
+  };
+  const task = tracker.issues.find((issue) => issue.id === "demo.1");
+  if (!task) throw new Error("fixture task demo.1 is missing");
+  task.status = status;
+  if (assignee) task.assignee = assignee;
+  else delete task.assignee;
+  writeFileSync(statePath, JSON.stringify(tracker, null, 2));
+  writeFileSync(exportPath, tracker.issues.map((issue) => JSON.stringify(issue)).join("\n") + "\n");
+  await runCommand("git", ["add", ".beads/state.json", ".beads/issues.jsonl"], { cwd: repo });
+  await runCommand("git", ["commit", "-qm", "seed task ownership"], { cwd: repo });
+}
+
 describe.sequential("EpicEngine workflow", () => {
   it("rejects per-role model or reasoning changes when resuming", async () => {
     const setup = await fixture();
@@ -273,6 +295,45 @@ describe.sequential("EpicEngine workflow", () => {
     );
     setup.store.close();
   });
+
+  it("adopts an unassigned in-progress descendant instead of stalling", async () => {
+    const setup = await fixture();
+    await seedTaskOwnership(setup.repo, "in_progress");
+    const engine = await EpicEngine.create(
+      { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+      setup.store,
+    );
+
+    const state = await engine.run();
+
+    expect(state.phase, state.lastError ?? undefined).toBe("complete");
+    expect(
+      setup.store.events(state.runId).some((event) => event.kind === "beads.claim_reconciled"),
+    ).toBe(true);
+    const tracker = JSON.parse(readFileSync(join(setup.repo, ".beads", "state.json"), "utf8")) as {
+      issues: Array<{ id: string; assignee?: string }>;
+    };
+    expect(tracker.issues.find((issue) => issue.id === "demo.1")?.assignee).toBe(
+      `epicd:${state.runId}`,
+    );
+    setup.store.close();
+  }, 30_000);
+
+  it("reports the owner when no descendant can be claimed", async () => {
+    const setup = await fixture();
+    await seedTaskOwnership(setup.repo, "in_progress", "other-agent");
+    const engine = await EpicEngine.create(
+      { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+      setup.store,
+    );
+
+    const state = await engine.run();
+
+    expect(state.phase).toBe("blocked");
+    expect(state.lastError).toContain("none is claimable");
+    expect(state.lastError).toContain("demo.1 (other-agent)");
+    setup.store.close();
+  }, 30_000);
 
   it("delivers an epic through first-class Herdr agent sessions", async () => {
     const setup = await fixture();

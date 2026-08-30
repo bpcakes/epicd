@@ -256,6 +256,7 @@ export type EpicSnapshot = {
   issues: Issue[];
   openIssues: Issue[];
   readyIssues: Issue[];
+  blockedIssues?: Issue[];
   triage: unknown;
   plan: unknown;
   graph: unknown;
