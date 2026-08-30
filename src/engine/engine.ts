@@ -17,7 +17,10 @@ import {
   SelectionResultSchema,
   DEFAULT_AGENT_SETTINGS,
   DEFAULT_MAX_REVIEW_PASSES,
+  RunStateSchema,
   type AgentRoleSettings,
+  type AgentAccessMode,
+  type AgentCleanupAction,
   type AgentSettings,
   type EngineEvent,
   type EpicSnapshot,
@@ -37,6 +40,7 @@ import {
   taskReviewPrompt,
   taskVerificationPrompt,
 } from "./prompts.js";
+import { requireAcceptedImplementationResult } from "./result-policy.js";
 
 export type EpicEngineOptions = {
   repoPath: string;
@@ -48,6 +52,7 @@ export type EpicEngineOptions = {
   codexPath?: string;
   herdrPath?: string;
   maxReviewPasses?: number;
+  accessMode?: AgentAccessMode;
 };
 
 const agentRoles = ["orchestrator", "implementation", "review"] as const;
@@ -78,6 +83,38 @@ function effectiveAgentSettings(state: RunState): AgentSettings {
       { ...state.agentSettings[role], model: state.agentSettings[role].model ?? state.model },
     ]),
   ) as AgentSettings;
+}
+
+function createAgentRuntime(
+  runtime: RuntimeKind,
+  state: RunState,
+  settings: AgentSettings,
+  options: EpicEngineOptions,
+  accessMode: AgentAccessMode,
+): AgentRuntime {
+  return runtime === "herdr"
+    ? new HerdrRuntime({
+        repoPath: state.repoPath,
+        runId: state.runId,
+        agentNamespace: state.agentNamespace,
+        settings,
+        herdrPath: options.herdrPath,
+        accessMode,
+        legacyAgentIds: [
+          state.orchestratorThreadId,
+          state.implementationThreadId,
+          state.reviewThreadId,
+          ...state.pendingAgentCleanup.flatMap((action) =>
+            action.kind === "session" && action.runtime === "herdr" ? [action.sessionId] : [],
+          ),
+        ].filter((sessionId): sessionId is string => sessionId !== null),
+      })
+    : new CodexRuntime({
+        repoPath: state.repoPath,
+        settings,
+        codexPath: options.codexPath,
+        accessMode,
+      });
 }
 
 type EngineEvents = {
@@ -120,18 +157,25 @@ function commitSubject(issue: Issue): string {
   return `${issue.title.slice(0, available).trim()}${suffix}`;
 }
 
+function cleanupActionKey(action: AgentCleanupAction): string {
+  return action.kind === "run"
+    ? `run:${action.runtime}`
+    : `session:${action.runtime}:${action.sessionId}`;
+}
+
 export class EpicEngine {
   private readonly emitter = new EventEmitter<EngineEvents>();
   private readonly beads: BeadsClient;
   private readonly git: GitClient;
   private readonly runtime: AgentRuntime;
   private pendingRuntimeSwitch: RuntimeKind | null;
+  private pendingAccessModeSwitch: AgentAccessMode | null;
   private pauseRequested = false;
   private resumeRequested = false;
 
   private constructor(
-    readonly store: StateStore,
-    readonly state: RunState,
+    private readonly store: StateStore,
+    private readonly state: RunState,
     private readonly options: Required<Pick<EpicEngineOptions, "maxReviewPasses">> &
       EpicEngineOptions,
   ) {
@@ -139,11 +183,10 @@ export class EpicEngine {
     this.git = new GitClient(state.repoPath);
     const settings = effectiveAgentSettings(state);
     const runtime = options.runtime ?? state.runtime;
+    const accessMode = options.accessMode ?? state.agentAccessMode;
     this.pendingRuntimeSwitch = runtime === state.runtime ? null : runtime;
-    this.runtime =
-      runtime === "herdr"
-        ? new HerdrRuntime(state.repoPath, state.runId, settings, options.herdrPath)
-        : new CodexRuntime(state.repoPath, settings, options.codexPath);
+    this.pendingAccessModeSwitch = accessMode === state.agentAccessMode ? null : accessMode;
+    this.runtime = createAgentRuntime(runtime, state, settings, options, accessMode);
   }
 
   static async create(options: EpicEngineOptions, store = new StateStore()): Promise<EpicEngine> {
@@ -161,12 +204,14 @@ export class EpicEngine {
     const now = new Date().toISOString();
     const state: RunState = {
       runId: randomUUID(),
+      agentNamespace: randomUUID().replaceAll("-", "").slice(0, 20),
       repoPath,
       epicId: snapshot.epic.id,
       epicTitle: snapshot.epic.title,
       model: options.model ?? null,
       runtime: options.runtime ?? "sdk",
       agentSettings: applyAgentSettings(DEFAULT_AGENT_SETTINGS, options),
+      agentAccessMode: options.accessMode ?? "sandboxed",
       maxReviewPasses: options.maxReviewPasses ?? DEFAULT_MAX_REVIEW_PASSES,
       phase: "preparing",
       currentBeadId: null,
@@ -174,6 +219,7 @@ export class EpicEngine {
       orchestratorThreadId: null,
       implementationThreadId: null,
       reviewThreadId: null,
+      pendingAgentCleanup: [],
       baseRevision: null,
       epicBaseRevision: await git.head(),
       candidateRevision: null,
@@ -212,27 +258,30 @@ export class EpicEngine {
     options: Omit<EpicEngineOptions, "repoPath" | "epicId"> = {},
     store = new StateStore(),
   ): EpicEngine {
+    const resumedState = RunStateSchema.parse(state);
     if (
       options.maxReviewPasses !== undefined &&
-      options.maxReviewPasses !== state.maxReviewPasses
+      options.maxReviewPasses !== resumedState.maxReviewPasses
     ) {
       throw new Error(
-        `Run ${state.runId.slice(0, 8)} has a persisted repair budget of ${state.maxReviewPasses} passes; start a new run to change it`,
+        `Run ${resumedState.runId.slice(0, 8)} has a persisted repair budget of ${resumedState.maxReviewPasses} passes; start a new run to change it`,
       );
     }
-    const currentSettings = effectiveAgentSettings(state);
+    const currentSettings = effectiveAgentSettings(resumedState);
     const requestedSettings = applyAgentSettings(currentSettings, options);
     if (JSON.stringify(requestedSettings) !== JSON.stringify(currentSettings)) {
       throw new Error(
-        `Run ${state.runId.slice(0, 8)} has persisted per-role model/reasoning settings; start a new run to change them`,
+        `Run ${resumedState.runId.slice(0, 8)} has persisted per-role model/reasoning settings; start a new run to change them`,
       );
     }
-    return new EpicEngine(store, state, {
+    const engine = new EpicEngine(store, resumedState, {
       ...options,
-      repoPath: state.repoPath,
-      epicId: state.epicId,
-      maxReviewPasses: state.maxReviewPasses,
+      repoPath: resumedState.repoPath,
+      epicId: resumedState.epicId,
+      maxReviewPasses: resumedState.maxReviewPasses,
     });
+    engine.prepareResume();
+    return engine;
   }
 
   onEvent(listener: (event: EngineEvent) => void): () => void {
@@ -245,6 +294,14 @@ export class EpicEngine {
     return () => this.emitter.off("state", listener);
   }
 
+  snapshot(): RunState {
+    return RunStateSchema.parse(this.state);
+  }
+
+  recentEvents(limit = 200): EngineEvent[] {
+    return this.store.events(this.state.runId, limit);
+  }
+
   requestPause(): void {
     this.pauseRequested = true;
     this.emit(
@@ -254,7 +311,15 @@ export class EpicEngine {
     );
   }
 
-  continueRun(): void {
+  async resumeRun(signal?: AbortSignal): Promise<RunState> {
+    if (this.state.phase !== "paused" && this.state.phase !== "blocked") {
+      throw new Error(`Cannot resume a run in phase ${this.state.phase}`);
+    }
+    this.prepareResume();
+    return await this.run(signal);
+  }
+
+  private prepareResume(): void {
     if (this.state.phase !== "paused" && this.state.phase !== "blocked") return;
     this.resumeRequested = true;
     this.pauseRequested = false;
@@ -272,7 +337,7 @@ export class EpicEngine {
 
   private save(): void {
     this.store.save(this.state);
-    this.emitter.emit("state", { ...this.state, pendingFindings: [...this.state.pendingFindings] });
+    this.emitter.emit("state", this.snapshot());
   }
 
   private transition(phase: RunPhase): void {
@@ -290,23 +355,120 @@ export class EpicEngine {
     this.emit("error", "run.blocked", "Run needs attention", message);
   }
 
-  private applyPendingRuntimeSwitch(): void {
+  private enqueueSessionCleanup(
+    role: AgentRole,
+    sessionId: string | null,
+    runtime: RuntimeKind,
+  ): void {
+    if (!sessionId) return;
+    const action: AgentCleanupAction = { kind: "session", runtime, role, sessionId };
+    const key = cleanupActionKey(action);
+    if (!this.state.pendingAgentCleanup.some((pending) => cleanupActionKey(pending) === key)) {
+      this.state.pendingAgentCleanup.push(action);
+    }
+    if (role === "orchestrator" && this.state.orchestratorThreadId === sessionId)
+      this.state.orchestratorThreadId = null;
+    else if (role === "implementation" && this.state.implementationThreadId === sessionId)
+      this.state.implementationThreadId = null;
+    else if (role === "review" && this.state.reviewThreadId === sessionId)
+      this.state.reviewThreadId = null;
+  }
+
+  private async retireAgent(
+    role: AgentRole,
+    sessionId: string | null,
+    runtime = this.state.runtime,
+  ): Promise<void> {
+    if (!sessionId) return;
+    this.enqueueSessionCleanup(role, sessionId, runtime);
+    this.save();
+    await this.drainAgentCleanup();
+  }
+
+  private async retireRunAgents(runtime = this.state.runtime): Promise<void> {
+    this.enqueueSessionCleanup("orchestrator", this.state.orchestratorThreadId, runtime);
+    this.enqueueSessionCleanup("implementation", this.state.implementationThreadId, runtime);
+    this.enqueueSessionCleanup("review", this.state.reviewThreadId, runtime);
+    const runAction: AgentCleanupAction = { kind: "run", runtime };
+    const runKey = cleanupActionKey(runAction);
+    if (!this.state.pendingAgentCleanup.some((action) => cleanupActionKey(action) === runKey)) {
+      this.state.pendingAgentCleanup.push(runAction);
+    }
+    this.save();
+    await this.drainAgentCleanup();
+  }
+
+  private async drainAgentCleanup(): Promise<void> {
+    const actions = [...this.state.pendingAgentCleanup].sort((left, right) =>
+      left.kind === right.kind ? 0 : left.kind === "run" ? -1 : 1,
+    );
+    for (const action of actions) {
+      const key = cleanupActionKey(action);
+      if (!this.state.pendingAgentCleanup.some((pending) => cleanupActionKey(pending) === key)) {
+        continue;
+      }
+      try {
+        const runtime = createAgentRuntime(
+          action.runtime,
+          this.state,
+          effectiveAgentSettings(this.state),
+          this.options,
+          this.state.agentAccessMode,
+        );
+        if (action.kind === "run") await runtime.releaseAll();
+        else await runtime.release(action.sessionId);
+        this.state.pendingAgentCleanup = this.state.pendingAgentCleanup.filter(
+          (pending) => cleanupActionKey(pending) !== key,
+        );
+        this.save();
+      } catch (error) {
+        const target =
+          action.kind === "run"
+            ? `every ${action.runtime} resource owned by this run`
+            : `${action.role} session ${action.sessionId}`;
+        this.emit(
+          "warning",
+          "agent.cleanup_failed",
+          `Could not close ${target}`,
+          redactSensitiveText(error instanceof Error ? error.message : String(error)),
+        );
+      }
+    }
+  }
+
+  private applyPendingAgentContractSwitch(): void {
     const runtime = this.pendingRuntimeSwitch;
-    if (!runtime) return;
+    const accessMode = this.pendingAccessModeSwitch;
+    if (!runtime && accessMode === null) return;
 
     const previousRuntime = this.state.runtime;
-    this.state.runtime = runtime;
+    if (runtime) this.state.runtime = runtime;
+    if (accessMode !== null) this.state.agentAccessMode = accessMode;
     this.state.orchestratorThreadId = null;
     this.state.implementationThreadId = null;
     this.state.reviewThreadId = null;
     this.save();
     this.pendingRuntimeSwitch = null;
-    this.emit(
-      "warning",
-      "runtime.switched",
-      `Switched runtime from ${previousRuntime} to ${runtime}`,
-      "Previous agent sessions were discarded; workflow and Git state were preserved",
-    );
+    this.pendingAccessModeSwitch = null;
+    const detail = "Previous agent sessions were discarded; workflow and Git state were preserved";
+    if (runtime) {
+      this.emit(
+        "warning",
+        "runtime.switched",
+        `Switched runtime from ${previousRuntime} to ${runtime}`,
+        detail,
+      );
+    }
+    if (accessMode !== null) {
+      this.emit(
+        "warning",
+        "permissions.switched",
+        accessMode === "danger-full-access"
+          ? "Enabled dangerous full access for all agents"
+          : "Restored sandboxed agent permissions",
+        detail,
+      );
+    }
   }
 
   async run(signal?: AbortSignal): Promise<RunState> {
@@ -320,10 +482,14 @@ export class EpicEngine {
         "Another epicd process already controls this run",
         error instanceof Error ? error.message : String(error),
       );
-      return this.state;
+      return this.snapshot();
     }
     try {
-      this.applyPendingRuntimeSwitch();
+      await this.drainAgentCleanup();
+      if (this.pendingRuntimeSwitch || this.pendingAccessModeSwitch !== null) {
+        await this.retireRunAgents(this.state.runtime);
+      }
+      this.applyPendingAgentContractSwitch();
       if (
         this.resumeRequested &&
         (this.state.phase === "paused" || this.state.phase === "blocked")
@@ -399,7 +565,7 @@ export class EpicEngine {
     } finally {
       this.store.releaseLease(this.state.runId, lease);
     }
-    return this.state;
+    return this.snapshot();
   }
 
   private async selectNext(signal?: AbortSignal): Promise<void> {
@@ -569,16 +735,7 @@ export class EpicEngine {
       "implementation.result",
       result.summary,
     );
-    if (result.status === "blocked")
-      throw new Error(`Implementation blocked: ${result.blockers.join("; ")}`);
-    if (
-      !result.tests.some((test) => test.outcome === "passed") ||
-      result.tests.some((test) => test.outcome === "failed")
-    ) {
-      throw new Error(
-        `Implementation did not provide a passing, failure-free validation result for ${issue.id}`,
-      );
-    }
+    requireAcceptedImplementationResult(result, "implementation", issue.id);
     const paths = await this.git.changedPaths();
     if (paths.length === 0)
       throw new Error(
@@ -670,7 +827,7 @@ export class EpicEngine {
         result.summary,
         revision,
       );
-      this.state.reviewThreadId = null;
+      await this.retireAgent("review", this.state.reviewThreadId);
       this.transition(exactRevision ? "closing" : "committing");
       return;
     }
@@ -735,15 +892,7 @@ export class EpicEngine {
     );
     this.state.implementationThreadId = execution.sessionId;
     const result = parseStructured(execution.finalResponse, ImplementationResultSchema);
-    if (result.status === "blocked") throw new Error(`Fix blocked: ${result.blockers.join("; ")}`);
-    if (
-      !result.tests.some((test) => test.outcome === "passed") ||
-      result.tests.some((test) => test.outcome === "failed")
-    ) {
-      throw new Error(
-        `Fix turn did not provide a passing, failure-free validation result for ${issue.id}`,
-      );
-    }
+    requireAcceptedImplementationResult(result, "fix", issue.id);
     this.state.reviewPass += 1;
     this.state.reviewBaselineFingerprint = null;
     this.state.reviewedFingerprint = null;
@@ -762,10 +911,10 @@ export class EpicEngine {
         throw new Error("HEAD changed after review and does not match the approved candidate tree");
       }
       this.state.candidateRevision = head;
+      await this.retireAgent("review", this.state.reviewThreadId);
       this.state.reviewBaselineFingerprint = null;
       this.state.reviewedFingerprint = null;
       this.state.reviewedTree = null;
-      this.state.reviewThreadId = null;
       this.emit("info", "git.commit_recovered", `Recovered candidate commit ${head}`);
       this.transition("verifying");
       return;
@@ -788,10 +937,10 @@ export class EpicEngine {
       throw new Error("Committed tree does not match the candidate approved by review");
     }
     this.state.candidateRevision = revision;
+    await this.retireAgent("review", this.state.reviewThreadId);
     this.state.reviewBaselineFingerprint = null;
     this.state.reviewedFingerprint = null;
     this.state.reviewedTree = null;
-    this.state.reviewThreadId = null;
     this.emit(
       "success",
       "git.committed",
@@ -832,6 +981,8 @@ export class EpicEngine {
     ].slice(-100);
 
     this.state.completedTasks += 1;
+    await this.retireAgent("implementation", this.state.implementationThreadId);
+    await this.retireAgent("review", this.state.reviewThreadId);
     this.state.currentBeadId = null;
     this.state.currentBeadTitle = null;
     this.state.baseRevision = null;
@@ -839,8 +990,6 @@ export class EpicEngine {
     this.state.reviewBaselineFingerprint = null;
     this.state.reviewedFingerprint = null;
     this.state.reviewedTree = null;
-    this.state.implementationThreadId = null;
-    this.state.reviewThreadId = null;
     this.state.reviewPass = 0;
     this.state.pendingFindings = [];
     this.transition("selecting");
@@ -903,7 +1052,7 @@ export class EpicEngine {
       await this.beads.sync();
       await this.git.commitBeadsIfChanged(`chore(beads): close ${snapshot.epic.id}`);
     }
-    this.state.reviewThreadId = null;
+    await this.retireRunAgents();
     this.state.reviewBaselineFingerprint = null;
     this.transition("complete");
     this.emit(

@@ -6,7 +6,9 @@ import { z } from "zod";
 import type {
   AgentRole,
   AgentRuntime,
+  AgentRuntimeBaseOptions,
   AgentSession,
+  HerdrAgentId,
   HerdrAgentSession,
   RunTurnOptions,
   RuntimeAgentSettings,
@@ -24,19 +26,46 @@ const HerdrEnvelopeSchema = z.object({
     .optional(),
 });
 
+const HerdrAgentListEnvelopeSchema = z.object({
+  result: z.object({
+    agents: z.array(
+      z.object({
+        name: z.string().optional(),
+        tab_id: z.string().min(1),
+      }),
+    ),
+  }),
+});
+
 const TURN_TIMEOUT_MS = 6 * 60 * 60 * 1_000;
+
+export type HerdrRuntimeOptions = AgentRuntimeBaseOptions & {
+  runId: string;
+  agentNamespace: string;
+  herdrPath?: string | undefined;
+  legacyAgentIds?: readonly string[] | undefined;
+};
 
 export class HerdrRuntime implements AgentRuntime {
   private readonly resultRoot: string;
+  private readonly repoPath: string;
+  private readonly runId: string;
+  private readonly agentNamespace: string;
+  private readonly settings: RuntimeAgentSettings;
+  private readonly herdrPath: string;
+  private readonly accessMode: HerdrRuntimeOptions["accessMode"];
+  private readonly legacyAgentIds: ReadonlySet<string>;
 
-  constructor(
-    private readonly repoPath: string,
-    private readonly runId: string,
-    private readonly settings: RuntimeAgentSettings,
-    private readonly herdrPath = "herdr",
-  ) {
+  constructor(options: HerdrRuntimeOptions) {
+    this.repoPath = options.repoPath;
+    this.runId = options.runId;
+    this.agentNamespace = options.agentNamespace;
+    this.settings = options.settings;
+    this.herdrPath = options.herdrPath ?? "herdr";
+    this.accessMode = options.accessMode;
+    this.legacyAgentIds = new Set(options.legacyAgentIds ?? []);
     const stateRoot = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-    this.resultRoot = join(stateRoot, "epicd", "herdr", safeName(runId));
+    this.resultRoot = join(stateRoot, "epicd", "herdr", safeName(options.runId));
   }
 
   start(role: AgentRole): HerdrAgentSession {
@@ -46,7 +75,7 @@ export class HerdrRuntime implements AgentRuntime {
   resume(sessionId: string, role: AgentRole): HerdrAgentSession {
     return {
       runtime: "herdr",
-      id: sessionId,
+      id: this.ownedAgentId(sessionId),
       role,
     };
   }
@@ -108,6 +137,46 @@ export class HerdrRuntime implements AgentRuntime {
     return { sessionId: agentName, finalResponse };
   }
 
+  async release(sessionId: string): Promise<void> {
+    this.assertEnvironment();
+    const agentName = this.ownedAgentId(sessionId);
+    const listed = await runJson(
+      this.herdrPath,
+      ["agent", "list"],
+      { cwd: this.repoPath, timeoutMs: 10_000 },
+      HerdrAgentListEnvelopeSchema,
+    );
+    const agent = listed.result.agents.find((candidate) => candidate.name === agentName);
+    if (agent) await this.closeTab(agent.tab_id);
+  }
+
+  async releaseAll(): Promise<void> {
+    this.assertEnvironment();
+    const prefix = this.agentPrefix();
+    const listed = await runJson(
+      this.herdrPath,
+      ["agent", "list"],
+      { cwd: this.repoPath, timeoutMs: 10_000 },
+      HerdrAgentListEnvelopeSchema,
+    );
+    const tabIds = new Set(
+      listed.result.agents
+        .filter((agent) => agent.name?.startsWith(prefix))
+        .map((agent) => agent.tab_id),
+    );
+    const failures: string[] = [];
+    for (const tabId of tabIds) {
+      try {
+        await this.closeTab(tabId);
+      } catch {
+        failures.push(tabId);
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(`Could not close Herdr tab(s): ${failures.join(", ")}`);
+    }
+  }
+
   private assertEnvironment(): void {
     if (process.env.HERDR_ENV !== "1") {
       throw new Error("Herdr runtime requires epicd to be launched inside Herdr (HERDR_ENV=1)");
@@ -148,7 +217,7 @@ export class HerdrRuntime implements AgentRuntime {
     }
   }
 
-  private async createAgent(role: AgentRole): Promise<string> {
+  private async createAgent(role: AgentRole): Promise<HerdrAgentId> {
     const workspaceId = process.env.HERDR_WORKSPACE_ID;
     if (!workspaceId) throw new Error("Herdr did not provide HERDR_WORKSPACE_ID");
     const agentName = this.agentName(role);
@@ -174,6 +243,17 @@ export class HerdrRuntime implements AgentRuntime {
       paneId = created.result?.root_pane?.pane_id;
       if (!paneId) throw new Error("tab creation returned no root pane id");
 
+      const permissionArgs =
+        this.accessMode === "danger-full-access"
+          ? ["--dangerously-bypass-approvals-and-sandbox"]
+          : [
+              "--sandbox",
+              "workspace-write",
+              "--ask-for-approval",
+              "never",
+              "--config",
+              "sandbox_workspace_write.network_access=false",
+            ];
       const args = [
         "agent",
         "start",
@@ -189,14 +269,9 @@ export class HerdrRuntime implements AgentRuntime {
         this.repoPath,
         "--add-dir",
         this.resultRoot,
-        "--sandbox",
-        "workspace-write",
-        "--ask-for-approval",
-        "never",
+        ...permissionArgs,
         "--config",
         `model_reasoning_effort="${settings.reasoningEffort}"`,
-        "--config",
-        "sandbox_workspace_write.network_access=false",
       ];
       if (settings.model) args.push("--model", settings.model);
       await runCommand(this.herdrPath, args, { cwd: this.repoPath, timeoutMs: 150_000 });
@@ -208,9 +283,29 @@ export class HerdrRuntime implements AgentRuntime {
     }
   }
 
-  private agentName(role: AgentRole): string {
+  private agentName(role: AgentRole): HerdrAgentId {
     const roleCode = role === "orchestrator" ? "o" : role === "implementation" ? "i" : "r";
-    return `ed-${safeName(this.runId).slice(0, 8)}-${roleCode}-${randomUUID().slice(0, 6)}`;
+    return `${this.agentPrefix()}${roleCode}-${randomUUID().slice(0, 6)}` as HerdrAgentId;
+  }
+
+  private agentPrefix(): string {
+    return `ed-${this.agentNamespace}-`;
+  }
+
+  private ownedAgentId(value: string): HerdrAgentId {
+    const legacyPrefix = `ed-${safeName(this.runId).slice(0, 8)}-`;
+    const isPersistedLegacyAgent = value.startsWith(legacyPrefix) && this.legacyAgentIds.has(value);
+    if (!value.startsWith(this.agentPrefix()) && !isPersistedLegacyAgent) {
+      throw new Error(`Refusing to close Herdr agent ${value}: it is not owned by this run`);
+    }
+    return value as HerdrAgentId;
+  }
+
+  private async closeTab(tabId: string): Promise<void> {
+    await runCommand(this.herdrPath, ["tab", "close", tabId], {
+      cwd: this.repoPath,
+      timeoutMs: 10_000,
+    });
   }
 
   private async interrupt(agentName: string): Promise<void> {

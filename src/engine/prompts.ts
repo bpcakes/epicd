@@ -27,6 +27,9 @@ function snapshotView(snapshot: EpicSnapshot): Record<string, unknown> {
   };
 }
 
+const REVIEWER_READ_ONLY_BOUNDARY = `Do not edit, format, generate, stage, commit, reset, or push files. If a command would mutate tracked files, do not run it.`;
+const STRUCTURED_REVIEW_RESULT_INSTRUCTION = "Return only the requested structured review result.";
+
 export function selectionPrompt(
   snapshot: EpicSnapshot,
   firstTurn: boolean,
@@ -104,7 +107,8 @@ Review all implementation changes since base revision ${baseRevision}, excluding
 
 Review for correctness, acceptance-criteria coverage, regressions, security, error handling, concurrency and transaction risks where applicable, test quality, and unintended scope. Read applicable AGENTS.md and inspect actual source and diff. Inspect every path reported by git status, including untracked files. Run the strongest relevant tests that are safe in this repository.
 
-Do not edit, format, generate, stage, commit, reset, or push files. If a command would mutate tracked files, do not run it. Report only reproducible defects; do not invent findings to appear thorough. Approval requires no unresolved findings and no failed relevant tests.
+${REVIEWER_READ_ONLY_BOUNDARY}
+Report only reproducible defects; do not invent findings to appear thorough. Approval requires no unresolved findings and no failed relevant tests.
 
 EPIC CONTEXT
 ${JSON.stringify(issueView(epic))}
@@ -112,7 +116,7 @@ ${JSON.stringify(issueView(epic))}
 ISSUE UNDER REVIEW
 ${JSON.stringify(issueView(issue))}
 
-Return only the requested structured review result.`;
+${STRUCTURED_REVIEW_RESULT_INSTRUCTION}`;
 }
 
 export function reviewFixesPrompt(
@@ -127,7 +131,7 @@ Verify only whether each reported finding is resolved at its root, whether the r
 
 If every reported finding is resolved and the repair introduced no regression, approve. Otherwise return only the unresolved findings and repair-caused regressions. A failed relevant test is actionable evidence and must prevent approval.
 
-Do not edit, format, generate, stage, commit, reset, or push files. If a command would mutate tracked files, do not run it.
+${REVIEWER_READ_ONLY_BOUNDARY}
 
 The implementation changes are based on ${baseRevision}.${
     committedRevision
@@ -141,7 +145,7 @@ ${JSON.stringify(issueView(issue))}
 FINDINGS TO VERIFY
 ${JSON.stringify(findings)}
 
-Return only the requested structured review result.`;
+${STRUCTURED_REVIEW_RESULT_INSTRUCTION}`;
 }
 
 export function taskVerificationPrompt(issue: Issue, revision: string): string {
@@ -153,12 +157,12 @@ The committed tree has already passed an independent comprehensive review. Verif
 
 Request changes only for a failed relevant validation command or a direct, reproducible mismatch between the stated acceptance criteria and the exact committed repository state. Do not report speculative risks as findings.
 
-Do not edit, format, generate, stage, commit, reset, or push files. If a command would mutate tracked files, do not run it.
+${REVIEWER_READ_ONLY_BOUNDARY}
 
 ISSUE TO VERIFY
 ${JSON.stringify(issueView(issue))}
 
-Return only the requested structured review result.`;
+${STRUCTURED_REVIEW_RESULT_INSTRUCTION}`;
 }
 
 export function finalEpicReviewPrompt(
@@ -170,10 +174,11 @@ export function finalEpicReviewPrompt(
 
 Review the exact repository revision ${head} against the epic and all descendant acceptance criteria. Inspect the complete change from epic base ${epicBaseRevision} through ${head}, the dependency graph, production code, and tests. Run the strongest relevant verification that is safe. Confirm that the child implementations compose without gaps or conflicting ownership.
 
-Do not edit, format, generate, stage, commit, reset, or push files. Report only evidence-backed defects. Approval requires no unresolved findings, no failed relevant tests, and an exact revision of ${head} in the result.
+${REVIEWER_READ_ONLY_BOUNDARY}
+Report only evidence-backed defects. Approval requires no unresolved findings, no failed relevant tests, and an exact revision of ${head} in the result.
 
 EPIC SNAPSHOT
 ${JSON.stringify(snapshotView(snapshot))}
 
-Return only the requested structured review result.`;
+${STRUCTURED_REVIEW_RESULT_INSTRUCTION}`;
 }

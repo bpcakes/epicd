@@ -80,13 +80,10 @@ function Activity({
 export function RunView({ engine }: { engine: EpicEngine }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
-  const [state, setState] = useState<RunState>({ ...engine.state });
-  const [events, setEvents] = useState<EngineEvent[]>(() =>
-    engine.store.events(engine.state.runId, 100),
-  );
+  const [state, setState] = useState<RunState>(() => engine.snapshot());
+  const [events, setEvents] = useState<EngineEvent[]>(() => engine.recentEvents(100));
   const [showDetail, setShowDetail] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
-  const [runGeneration, setRunGeneration] = useState(0);
   const [pauseThenExit, setPauseThenExit] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const columns = stdout.columns ?? 100;
@@ -105,7 +102,7 @@ export function RunView({ engine }: { engine: EpicEngine }) {
       offEvent();
       offState();
     };
-  }, [engine, runGeneration]);
+  }, [engine]);
 
   useEffect(() => {
     if (pauseThenExit && ["paused", "blocked"].includes(state.phase)) exit();
@@ -120,8 +117,9 @@ export function RunView({ engine }: { engine: EpicEngine }) {
     else if (input === "p" && !["paused", "blocked", "complete"].includes(state.phase))
       engine.requestPause();
     else if (input === "r" && ["paused", "blocked"].includes(state.phase)) {
-      engine.continueRun();
-      setRunGeneration((value) => value + 1);
+      const controller = new AbortController();
+      abortRef.current = controller;
+      void engine.resumeRun(controller.signal).then((next) => setState({ ...next }));
     } else if (input === "q") {
       if (["paused", "blocked", "complete"].includes(state.phase)) exit();
       else {
@@ -185,6 +183,16 @@ export function RunView({ engine }: { engine: EpicEngine }) {
         </Text>
         <Text dimColor>{state.epicId}</Text>
         <Text dimColor>Runtime: {state.runtime.toUpperCase()}</Text>
+        {state.agentAccessMode === "danger-full-access" ? (
+          <Text bold color="red">
+            Permissions: FULL HOST ACCESS
+          </Text>
+        ) : null}
+        {state.pendingAgentCleanup.length > 0 ? (
+          <Text bold color="yellow">
+            Cleanup pending: {state.pendingAgentCleanup.length}
+          </Text>
+        ) : null}
         <Box marginTop={1}>
           <Text color="cyan">
             {progressBar(state.completedTasks, state.totalTasks, compact ? 24 : 42)}

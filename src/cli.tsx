@@ -27,6 +27,7 @@ type CommonOptions = {
   reviewReasoning?: ReasoningEffort;
   runtime?: RuntimeKind;
   maxReviewPasses?: number;
+  dangerouslyBypassApprovalsAndSandbox?: boolean;
 };
 
 function commonOptions(command: Command): CommonOptions {
@@ -67,6 +68,16 @@ function reviewLoopOptions(options: CommonOptions): Pick<EpicEngineOptions, "max
   return options.maxReviewPasses === undefined ? {} : { maxReviewPasses: options.maxReviewPasses };
 }
 
+function permissionOptions(options: CommonOptions): Pick<EpicEngineOptions, "accessMode"> {
+  return options.dangerouslyBypassApprovalsAndSandbox === undefined
+    ? {}
+    : {
+        accessMode: options.dangerouslyBypassApprovalsAndSandbox
+          ? "danger-full-access"
+          : "sandboxed",
+      };
+}
+
 function resumeEngine(
   state: Parameters<typeof EpicEngine.resume>[0],
   options: CommonOptions,
@@ -77,6 +88,7 @@ function resumeEngine(
     {
       ...agentOptions(options),
       ...reviewLoopOptions(options),
+      ...permissionOptions(options),
       ...(options.runtime ? { runtime: options.runtime } : {}),
     },
     store,
@@ -117,6 +129,7 @@ async function createOrReject(
       runtime: options.runtime ?? "sdk",
       ...agentOptions(options),
       ...reviewLoopOptions(options),
+      ...permissionOptions(options),
     },
     store,
   );
@@ -143,6 +156,7 @@ async function defaultTui(epicId: string | undefined, options: CommonOptions): P
               runtime,
               ...agentOptions(options),
               ...reviewLoopOptions(options),
+              ...permissionOptions(options),
             },
             store,
           );
@@ -170,6 +184,7 @@ async function defaultTui(epicId: string | undefined, options: CommonOptions): P
             runtime,
             ...agentOptions(options),
             ...reviewLoopOptions(options),
+            ...permissionOptions(options),
           },
           store,
         );
@@ -216,6 +231,10 @@ program
       "maximum fix passes per review cycle for new runs (default: 3)",
     ).argParser(positiveInteger),
   )
+  .option(
+    "--dangerously-bypass-approvals-and-sandbox",
+    "give all agents unsandboxed host access without approvals (DANGEROUS)",
+  )
   .addOption(
     new Option("--runtime <runtime>", "agent runtime for new runs").choices([
       "sdk",
@@ -254,13 +273,14 @@ program
     const store = new StateStore();
     const state = store.findLatest(root, epicId);
     if (!state) throw new Error(`No epicd run found for ${epicId}`);
-    if (state.phase === "complete") throw new Error(`${epicId} is already complete`);
+    if (state.phase === "complete" && state.pendingAgentCleanup.length === 0) {
+      throw new Error(`${epicId} is already complete`);
+    }
     const doctor = await runDoctor(root, common.runtime ?? state.runtime);
     const failed = doctor.checks.filter((check) => check.status === "fail");
     if (failed.length > 0)
       throw new Error(failed.map((check) => `${check.name}: ${check.message}`).join("\n"));
     const engine = resumeEngine(state, common, store);
-    engine.continueRun();
     await launchEngine(engine, options.tui && process.stdout.isTTY);
   });
 
@@ -282,7 +302,7 @@ program
       for (const state of states) {
         if (!state) continue;
         process.stdout.write(
-          `${state.epicId}\n  ${state.phase} · ${state.runtime} · ${state.completedTasks}/${state.totalTasks} tasks · updated ${state.updatedAt}\n`,
+          `${state.epicId}\n  ${state.phase} · ${state.runtime}${state.agentAccessMode === "danger-full-access" ? " · FULL ACCESS" : ""}${state.pendingAgentCleanup.length > 0 ? ` · CLEANUP PENDING (${state.pendingAgentCleanup.length})` : ""} · ${state.completedTasks}/${state.totalTasks} tasks · updated ${state.updatedAt}\n`,
         );
       }
     }

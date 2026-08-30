@@ -2,6 +2,7 @@ import { Codex, type Thread, type ThreadEvent, type ThreadOptions } from "@opena
 import type {
   AgentRole,
   AgentRuntime,
+  AgentRuntimeBaseOptions,
   AgentSession,
   RunTurnOptions,
   RuntimeAgentSettings,
@@ -10,16 +11,25 @@ import type {
   TurnExecution,
 } from "./runtime.js";
 
+export type CodexRuntimeOptions = AgentRuntimeBaseOptions & {
+  codexPath?: string | undefined;
+};
+
 export class CodexRuntime implements AgentRuntime {
   private readonly codex: Codex;
   private readonly threads = new WeakMap<SdkAgentSession, Thread>();
 
-  constructor(
-    private readonly repoPath: string,
-    private readonly settings: RuntimeAgentSettings,
-    codexPath?: string,
-  ) {
-    this.codex = new Codex(codexPath ? { codexPathOverride: codexPath } : undefined);
+  private readonly repoPath: string;
+  private readonly settings: RuntimeAgentSettings;
+  private readonly accessMode: CodexRuntimeOptions["accessMode"];
+
+  constructor(options: CodexRuntimeOptions) {
+    this.repoPath = options.repoPath;
+    this.settings = options.settings;
+    this.accessMode = options.accessMode;
+    this.codex = new Codex(
+      options.codexPath ? { codexPathOverride: options.codexPath } : undefined,
+    );
   }
 
   start(role: AgentRole): SdkAgentSession {
@@ -39,10 +49,15 @@ export class CodexRuntime implements AgentRuntime {
     const common: ThreadOptions = {
       workingDirectory: this.repoPath,
       approvalPolicy: "never",
-      sandboxMode: role === "orchestrator" ? "read-only" : "workspace-write",
+      sandboxMode:
+        this.accessMode === "danger-full-access"
+          ? "danger-full-access"
+          : role === "orchestrator"
+            ? "read-only"
+            : "workspace-write",
       modelReasoningEffort: settings.reasoningEffort,
       threadSource: `epicd-${role}`,
-      networkAccessEnabled: false,
+      networkAccessEnabled: this.accessMode === "danger-full-access",
     };
     if (settings.model) common.model = settings.model;
     return common;
@@ -75,6 +90,14 @@ export class CodexRuntime implements AgentRuntime {
     if (!thread.id) throw new Error("Codex turn completed without a persistent thread id");
     if (!finalResponse.trim()) throw new Error("Codex turn completed without a final response");
     return { sessionId: thread.id, finalResponse };
+  }
+
+  async release(_sessionId: string): Promise<void> {
+    // SDK threads do not own visible terminal resources.
+  }
+
+  async releaseAll(): Promise<void> {
+    // SDK threads do not own visible terminal resources.
   }
 }
 

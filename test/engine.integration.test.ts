@@ -19,6 +19,8 @@ afterEach(() => {
   delete process.env.EPICD_FAKE_MODE;
   delete process.env.EPICD_FAKE_COUNTER;
   delete process.env.EPICD_FAKE_ARGS;
+  delete process.env.EPICD_HERDR_CLOSE_FAIL;
+  delete process.env.EPICD_HERDR_REGISTRY;
   restoreEnvironment("HERDR_ENV", originalHerdrEnvironment.herdr);
   restoreEnvironment("HERDR_WORKSPACE_ID", originalHerdrEnvironment.workspace);
   restoreEnvironment("XDG_STATE_HOME", originalHerdrEnvironment.state);
@@ -194,16 +196,30 @@ const fs = require("node:fs");
 const cp = require("node:child_process");
 const path = require("node:path");
 const args = process.argv.slice(2);
+const registryPath = process.env.EPICD_HERDR_REGISTRY;
+const readAgents = () => fs.existsSync(registryPath) ? JSON.parse(fs.readFileSync(registryPath, "utf8")) : [];
+const writeAgents = agents => fs.writeFileSync(registryPath, JSON.stringify(agents));
 if (args[0] === "tab" && args[1] === "create") {
   console.log(JSON.stringify({ok:true,result:{root_pane:{pane_id:"w-e2e:p9"}}}));
 } else if (args[0] === "agent" && args[1] === "start") {
+  const agents = readAgents();
+  agents.push({name:args[2],tab_id:"w-e2e:t-" + args[2]});
+  writeAgents(agents);
   console.log(JSON.stringify({ok:true,result:{agent:{name:args[2]}}}));
 } else if (args[0] === "agent" && args[1] === "get") {
-  console.log(JSON.stringify({ok:true,result:{agent:{name:args[2],state:"idle"}}}));
+  const agent = readAgents().find(candidate => candidate.name === args[2]);
+  if (!agent) process.exit(1);
+  console.log(JSON.stringify({ok:true,result:{agent:{...agent,state:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "list") {
+  console.log(JSON.stringify({ok:true,result:{agents:readAgents()}}));
 } else if (args[0] === "agent" && args[1] === "wait") {
   console.log(JSON.stringify({ok:true,result:{state:"idle"}}));
 } else if (args[0] === "agent" && args[1] === "send-keys") {
   console.log(JSON.stringify({ok:true}));
+} else if (args[0] === "tab" && args[1] === "close") {
+  if (process.env.EPICD_HERDR_CLOSE_FAIL === "1") process.exit(1);
+  writeAgents(readAgents().filter(agent => agent.tab_id !== args[2]));
+  console.log(JSON.stringify({ok:true,result:{}}));
 } else if (args[0] === "agent" && args[1] === "prompt") {
   const prompt = args[3];
   const marker = "write only the final JSON object to ";
@@ -238,6 +254,7 @@ if (args[0] === "tab" && args[1] === "create") {
   await runCommand("git", ["config", "user.email", "epicd@example.test"], { cwd: repo });
   await runCommand("git", ["add", "-A"], { cwd: repo });
   await runCommand("git", ["commit", "-qm", "initial"], { cwd: repo });
+  process.env.EPICD_HERDR_REGISTRY = join(root, "herdr-agents.json");
   process.env.PATH = `${bin}:${originalPath ?? ""}`;
   return { repo, codex, herdr, store: new StateStore(join(root, "epicd.sqlite3")) };
 }
@@ -275,24 +292,52 @@ describe.sequential("EpicEngine workflow", () => {
       },
       setup.store,
     );
-    expect(engine.state.maxReviewPasses).toBe(3);
+    const state = engine.snapshot();
+    expect(state.maxReviewPasses).toBe(3);
+    expect(state.agentAccessMode).toBe("sandboxed");
     expect(() =>
       EpicEngine.resume(
-        engine.state,
+        state,
         { agentSettings: { review: { model: "gpt-review", reasoningEffort: "low" } } },
         setup.store,
       ),
     ).toThrow("persisted per-role model/reasoning settings");
     expect(() =>
       EpicEngine.resume(
-        engine.state,
+        state,
         { agentSettings: { review: { model: "gpt-review", reasoningEffort: "xhigh" } } },
         setup.store,
       ),
     ).not.toThrow();
-    expect(() => EpicEngine.resume(engine.state, { maxReviewPasses: 4 }, setup.store)).toThrow(
+    expect(() => EpicEngine.resume(state, { maxReviewPasses: 4 }, setup.store)).toThrow(
       "persisted repair budget of 3 passes",
     );
+    await expect(engine.resumeRun()).rejects.toThrow("Cannot resume a run in phase selecting");
+    setup.store.close();
+  });
+
+  it("keeps engine-owned state detached from public snapshots and resume input", async () => {
+    const setup = await fixture();
+    const engine = await EpicEngine.create(
+      { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+      setup.store,
+    );
+
+    const snapshot = engine.snapshot();
+    snapshot.phase = "complete";
+    snapshot.pendingAgentCleanup.push({ kind: "run", runtime: "sdk" });
+
+    expect(engine.snapshot()).toMatchObject({ phase: "selecting", pendingAgentCleanup: [] });
+
+    const resumeInput = engine.snapshot();
+    const resumedEngine = EpicEngine.resume(resumeInput, { codexPath: setup.codex }, setup.store);
+    resumeInput.phase = "complete";
+    resumeInput.pendingAgentCleanup.push({ kind: "run", runtime: "sdk" });
+
+    expect(resumedEngine.snapshot()).toMatchObject({
+      phase: "selecting",
+      pendingAgentCleanup: [],
+    });
     setup.store.close();
   });
 
@@ -307,9 +352,9 @@ describe.sequential("EpicEngine workflow", () => {
     const state = await engine.run();
 
     expect(state.phase, state.lastError ?? undefined).toBe("complete");
-    expect(
-      setup.store.events(state.runId).some((event) => event.kind === "beads.claim_reconciled"),
-    ).toBe(true);
+    expect(engine.recentEvents().some((event) => event.kind === "beads.claim_reconciled")).toBe(
+      true,
+    );
     const tracker = JSON.parse(readFileSync(join(setup.repo, ".beads", "state.json"), "utf8")) as {
       issues: Array<{ id: string; assignee?: string }>;
     };
@@ -335,11 +380,12 @@ describe.sequential("EpicEngine workflow", () => {
     setup.store.close();
   }, 30_000);
 
-  it("delivers an epic through first-class Herdr agent sessions", async () => {
+  it("delivers through Herdr and treats tab cleanup failures as warnings", async () => {
     const setup = await fixture();
     process.env.HERDR_ENV = "1";
     process.env.HERDR_WORKSPACE_ID = "w-e2e";
     process.env.XDG_STATE_HOME = join(setup.repo, ".state");
+    process.env.EPICD_HERDR_CLOSE_FAIL = "1";
     const engine = await EpicEngine.create(
       {
         repoPath: setup.repo,
@@ -352,14 +398,25 @@ describe.sequential("EpicEngine workflow", () => {
     const state = await engine.run();
     expect(state.phase, state.lastError ?? undefined).toBe("complete");
     expect(state.runtime).toBe("herdr");
-    expect(state.orchestratorThreadId).toMatch(/^ed-/);
+    expect(state.orchestratorThreadId).toBeNull();
+    expect(state.implementationThreadId).toBeNull();
+    expect(state.reviewThreadId).toBeNull();
     expect(
       setup.store.events(state.runId).some((event) => event.message.includes("herdr session")),
     ).toBe(true);
+    expect(
+      setup.store.events(state.runId).some((event) => event.kind === "agent.cleanup_failed"),
+    ).toBe(true);
+    expect(state.pendingAgentCleanup.length).toBeGreaterThan(0);
+
+    delete process.env.EPICD_HERDR_CLOSE_FAIL;
+    const cleanupRetry = EpicEngine.resume(state, { herdrPath: setup.herdr }, setup.store);
+    const recovered = await cleanupRetry.run();
+    expect(recovered.pendingAgentCleanup).toEqual([]);
     setup.store.close();
   }, 30_000);
 
-  it("cold-switches an SDK repair to Herdr without losing workflow state", async () => {
+  it("atomically switches an SDK repair to full-access Herdr without losing workflow state", async () => {
     const setup = await fixture();
     process.env.EPICD_FAKE_MODE = "review-fix";
     const sdkEngine = await EpicEngine.create(
@@ -384,7 +441,11 @@ describe.sequential("EpicEngine workflow", () => {
     process.env.XDG_STATE_HOME = join(setup.repo, ".state");
     const herdrEngine = EpicEngine.resume(
       paused,
-      { runtime: "herdr", herdrPath: setup.herdr },
+      {
+        runtime: "herdr",
+        herdrPath: setup.herdr,
+        accessMode: "danger-full-access",
+      },
       setup.store,
     );
     expect(paused.runtime).toBe("sdk");
@@ -392,15 +453,15 @@ describe.sequential("EpicEngine workflow", () => {
     herdrEngine.onState((state) => {
       if (state.runtime === "herdr") handoffStates.push(state);
     });
-    herdrEngine.continueRun();
-
     const completed = await herdrEngine.run();
 
     expect(completed.phase, completed.lastError ?? undefined).toBe("complete");
     expect(completed.runtime).toBe("herdr");
+    expect(completed.agentAccessMode).toBe("danger-full-access");
     const handoffState = handoffStates[0];
     expect(handoffState).toMatchObject({
       runtime: "herdr",
+      agentAccessMode: "danger-full-access",
       orchestratorThreadId: null,
       implementationThreadId: null,
       reviewThreadId: null,
@@ -414,11 +475,68 @@ describe.sequential("EpicEngine workflow", () => {
           message: "Switched runtime from sdk to herdr",
         }),
         expect.objectContaining({
+          kind: "permissions.switched",
+          message: "Enabled dangerous full access for all agents",
+        }),
+        expect.objectContaining({
           kind: "fix.started",
           message: `Starting a fresh implementation session for ${pendingFindingCount} finding(s)`,
         }),
       ]),
     );
+    setup.store.close();
+  }, 30_000);
+
+  it("rotates blocked sessions when enabling dangerous full access", async () => {
+    const setup = await fixture();
+    const argumentLog = join(setup.repo, "..", "codex-args.jsonl");
+    process.env.EPICD_FAKE_ARGS = argumentLog;
+    process.env.EPICD_FAKE_MODE = "review-fix";
+    const sandboxedEngine = await EpicEngine.create(
+      { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+      setup.store,
+    );
+    sandboxedEngine.onEvent((event) => {
+      if (event.kind === "review.changes_requested") sandboxedEngine.requestPause();
+    });
+
+    const paused = await sandboxedEngine.run();
+    expect(paused.phase).toBe("paused");
+    expect(paused.agentAccessMode).toBe("sandboxed");
+    expect(paused.implementationThreadId).toMatch(/^thr-/);
+    expect(paused.reviewThreadId).toMatch(/^thr-/);
+
+    const fullAccessEngine = EpicEngine.resume(
+      paused,
+      {
+        codexPath: setup.codex,
+        accessMode: "danger-full-access",
+      },
+      setup.store,
+    );
+    const switchedStates: Array<typeof paused> = [];
+    fullAccessEngine.onState((state) => {
+      if (state.agentAccessMode === "danger-full-access") switchedStates.push(state);
+    });
+    const completed = await fullAccessEngine.run();
+
+    expect(completed.phase, completed.lastError ?? undefined).toBe("complete");
+    expect(completed.agentAccessMode).toBe("danger-full-access");
+    expect(switchedStates[0]).toMatchObject({
+      orchestratorThreadId: null,
+      implementationThreadId: null,
+      reviewThreadId: null,
+    });
+    expect(
+      setup.store.events(completed.runId).some((event) => event.kind === "permissions.switched"),
+    ).toBe(true);
+    const invocations = readFileSync(argumentLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(
+      invocations.some((args) => args.includes("--sandbox") && args.includes("danger-full-access")),
+    ).toBe(true);
     setup.store.close();
   }, 30_000);
 
@@ -450,7 +568,6 @@ describe.sequential("EpicEngine workflow", () => {
       { runtime: "sdk", codexPath: setup.codex },
       setup.store,
     );
-    sdkEngine.continueRun();
     const completed = await sdkEngine.run();
 
     expect(completed.phase, completed.lastError ?? undefined).toBe("complete");
@@ -582,7 +699,7 @@ describe.sequential("EpicEngine workflow", () => {
       setup.store,
     );
     engine.onEvent((event) => {
-      if (event.kind === "review.changes_requested" && engine.state.candidateRevision) {
+      if (event.kind === "review.changes_requested" && engine.snapshot().candidateRevision) {
         engine.requestPause();
       }
     });
@@ -595,8 +712,8 @@ describe.sequential("EpicEngine workflow", () => {
     paused.lastError = "Review did not converge after 5 fix passes";
     setup.store.save(paused);
 
-    engine.continueRun();
-    const resumed = await engine.run();
+    const resumedEngine = EpicEngine.resume(paused, { codexPath: setup.codex }, setup.store);
+    const resumed = await resumedEngine.run();
 
     expect(resumed.phase, resumed.lastError ?? undefined).toBe("complete");
     expect(readFileSync(join(setup.repo, "feature.txt"), "utf8")).toBe("verified-fixed\n");
@@ -622,8 +739,7 @@ describe.sequential("EpicEngine workflow", () => {
     };
     expect(tracker.issues.find((issue) => issue.id === "demo.1")?.status).toBe("in_progress");
     process.env.EPICD_FAKE_MODE = "happy";
-    engine.continueRun();
-    const resumed = await engine.run();
+    const resumed = await engine.resumeRun();
     expect(resumed.phase, resumed.lastError ?? undefined).toBe("complete");
     setup.store.close();
   }, 30_000);
@@ -685,8 +801,7 @@ describe.sequential("EpicEngine workflow", () => {
     expect(paused.resumePhase).toBe("committing");
     writeFileSync(join(setup.repo, "feature.txt"), "changed after review\n");
 
-    engine.continueRun();
-    const resumed = await engine.run();
+    const resumed = await engine.resumeRun();
     expect(resumed.phase).toBe("blocked");
     expect(resumed.lastError).toContain("working tree changed after review");
     setup.store.close();
@@ -707,8 +822,7 @@ describe.sequential("EpicEngine workflow", () => {
     expect(paused.resumePhase).toBe("closing");
     writeFileSync(join(setup.repo, "feature.txt"), "changed after verification\n");
 
-    engine.continueRun();
-    const resumed = await engine.run();
+    const resumed = await engine.resumeRun();
     expect(resumed.phase).toBe("blocked");
     expect(resumed.lastError).toContain("clean application tree");
     const tracker = JSON.parse(readFileSync(join(setup.repo, ".beads", "state.json"), "utf8")) as {

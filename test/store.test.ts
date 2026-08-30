@@ -16,12 +16,14 @@ function state(runId: string, epicId = "epic-1"): RunState {
   const now = new Date().toISOString();
   return {
     runId,
+    agentNamespace: "0123456789abcdef0123",
     repoPath: "/repo",
     epicId,
     epicTitle: "Test epic",
     model: null,
     runtime: "sdk",
     agentSettings: DEFAULT_AGENT_SETTINGS,
+    agentAccessMode: "sandboxed",
     maxReviewPasses: 3,
     phase: "selecting",
     currentBeadId: null,
@@ -29,6 +31,7 @@ function state(runId: string, epicId = "epic-1"): RunState {
     orchestratorThreadId: null,
     implementationThreadId: null,
     reviewThreadId: null,
+    pendingAgentCleanup: [],
     baseRevision: null,
     epicBaseRevision: "abc123",
     candidateRevision: null,
@@ -50,13 +53,27 @@ function state(runId: string, epicId = "epic-1"): RunState {
 
 describe("StateStore", () => {
   it("defaults legacy persisted runs to the SDK runtime", () => {
-    const legacy = { ...state("legacy") } as Partial<RunState>;
+    const legacy = { ...state("legacy") } as Record<string, unknown>;
     delete legacy.runtime;
     delete legacy.agentSettings;
+    delete legacy.agentAccessMode;
+    delete legacy.agentNamespace;
+    delete legacy.pendingAgentCleanup;
     delete legacy.maxReviewPasses;
     expect(RunStateSchema.parse(legacy).runtime).toBe("sdk");
     expect(RunStateSchema.parse(legacy).agentSettings).toEqual(DEFAULT_AGENT_SETTINGS);
+    expect(RunStateSchema.parse(legacy).agentAccessMode).toBe("sandboxed");
+    expect(RunStateSchema.parse(legacy).agentNamespace).toMatch(/^[a-f0-9]{20}$/);
+    expect(RunStateSchema.parse(legacy).pendingAgentCleanup).toEqual([]);
     expect(RunStateSchema.parse(legacy).maxReviewPasses).toBe(5);
+  });
+
+  it("migrates the legacy dangerous permission boolean to a named access mode", () => {
+    const legacy = { ...state("legacy-danger") } as Record<string, unknown>;
+    delete legacy.agentAccessMode;
+    legacy.dangerouslyBypassApprovalsAndSandbox = true;
+
+    expect(RunStateSchema.parse(legacy).agentAccessMode).toBe("danger-full-access");
   });
 
   it("persists recovery-critical state and ordered UI events", () => {
@@ -89,6 +106,7 @@ describe("StateStore", () => {
         phase: "implementing",
         runtime: "sdk",
         agentSettings: DEFAULT_AGENT_SETTINGS,
+        agentAccessMode: "sandboxed",
         maxReviewPasses: 3,
       });
     }
@@ -108,6 +126,18 @@ describe("StateStore", () => {
     };
 
     expect(() => RunStateSchema.parse(invalid)).toThrow("baseRevision");
+  });
+
+  it("rejects a session that is both active and pending cleanup", () => {
+    const invalid = state("invalid-cleanup");
+    invalid.reviewThreadId = "thr-review";
+    invalid.pendingAgentCleanup = [
+      { kind: "session", runtime: "sdk", role: "review", sessionId: "thr-review" },
+    ];
+
+    expect(() => RunStateSchema.parse(invalid)).toThrow(
+      "a session cannot be active and pending cleanup at the same time",
+    );
   });
 
   it("prevents two non-complete controllers from owning the same repository", () => {

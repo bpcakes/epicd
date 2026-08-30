@@ -5,7 +5,11 @@ import { DEFAULT_AGENT_SETTINGS } from "../src/domain/types.js";
 
 describe("CodexRuntime sessions", () => {
   it("rejects foreign and fabricated sessions before starting a turn", async () => {
-    const runtime = new CodexRuntime(process.cwd(), DEFAULT_AGENT_SETTINGS);
+    const runtime = new CodexRuntime({
+      repoPath: process.cwd(),
+      settings: DEFAULT_AGENT_SETTINGS,
+      accessMode: "sandboxed",
+    });
     const foreignSession: AgentSession = { runtime: "herdr", id: null, role: "review" };
     const fabricatedSession: AgentSession = { runtime: "sdk", id: null, role: "review" };
 

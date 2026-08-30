@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 export const IssueStatusSchema = z.enum([
@@ -99,6 +100,26 @@ export type SelectionResult = z.infer<typeof SelectionResultSchema>;
 export const RuntimeKindSchema = z.enum(["sdk", "herdr"]);
 export type RuntimeKind = z.infer<typeof RuntimeKindSchema>;
 
+export const AgentRoleSchema = z.enum(["orchestrator", "implementation", "review"]);
+export type AgentRole = z.infer<typeof AgentRoleSchema>;
+
+export const AgentAccessModeSchema = z.enum(["sandboxed", "danger-full-access"]);
+export type AgentAccessMode = z.infer<typeof AgentAccessModeSchema>;
+
+export const AgentCleanupActionSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("session"),
+    runtime: RuntimeKindSchema,
+    role: AgentRoleSchema,
+    sessionId: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal("run"),
+    runtime: RuntimeKindSchema,
+  }),
+]);
+export type AgentCleanupAction = z.infer<typeof AgentCleanupActionSchema>;
+
 export const ReasoningEffortSchema = z.enum([
   "minimal",
   "low",
@@ -152,12 +173,14 @@ export type RunPhase = z.infer<typeof RunPhaseSchema>;
 
 const RunStateBaseSchema = z.object({
   runId: z.string(),
+  agentNamespace: z.string().regex(/^[a-f0-9]{20}$/),
   repoPath: z.string(),
   epicId: z.string(),
   epicTitle: z.string(),
   model: z.string().nullable(),
   runtime: RuntimeKindSchema.default("sdk"),
   agentSettings: AgentSettingsSchema.default(DEFAULT_AGENT_SETTINGS),
+  agentAccessMode: AgentAccessModeSchema.default("sandboxed"),
   // Runs persisted before this setting existed used the historical default of five.
   maxReviewPasses: z.number().int().positive().default(5),
   phase: RunPhaseSchema,
@@ -166,6 +189,7 @@ const RunStateBaseSchema = z.object({
   orchestratorThreadId: z.string().nullable(),
   implementationThreadId: z.string().nullable(),
   reviewThreadId: z.string().nullable(),
+  pendingAgentCleanup: z.array(AgentCleanupActionSchema).default([]),
   baseRevision: z.string().nullable(),
   epicBaseRevision: z.string(),
   candidateRevision: z.string().nullable(),
@@ -191,6 +215,19 @@ const RunStateBaseSchema = z.object({
   updatedAt: z.string(),
 });
 
+function migrateRunStateInput(input: unknown): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
+  const state = { ...(input as Record<string, unknown>) };
+  if (state.agentAccessMode === undefined) {
+    state.agentAccessMode =
+      state.dangerouslyBypassApprovalsAndSandbox === true ? "danger-full-access" : "sandboxed";
+  }
+  if (state.agentNamespace === undefined && typeof state.runId === "string") {
+    state.agentNamespace = createHash("sha256").update(state.runId).digest("hex").slice(0, 20);
+  }
+  return state;
+}
+
 type RequiredRunStateField =
   "currentBeadId" | "baseRevision" | "candidateRevision" | "reviewedFingerprint" | "reviewedTree";
 
@@ -204,29 +241,59 @@ const requiredFieldsByPhase: Partial<Record<RunPhase, readonly RequiredRunStateF
   closing: ["currentBeadId", "baseRevision", "candidateRevision"],
 };
 
-export const RunStateSchema = RunStateBaseSchema.superRefine((state, context) => {
-  const activePhase =
-    state.phase === "paused" || state.phase === "blocked" ? state.resumePhase : state.phase;
-  if (!activePhase) return;
-
-  const requiredFields: readonly RequiredRunStateField[] = requiredFieldsByPhase[activePhase] ?? [];
-  for (const field of requiredFields) {
-    if (!state[field]) {
-      context.addIssue({
-        code: "custom",
-        path: [field],
-        message: `${field} is required while the run is ${activePhase}`,
-      });
+export const RunStateSchema = z
+  .preprocess(migrateRunStateInput, RunStateBaseSchema)
+  .superRefine((state, context) => {
+    const activePhase =
+      state.phase === "paused" || state.phase === "blocked" ? state.resumePhase : state.phase;
+    if (activePhase) {
+      const requiredFields: readonly RequiredRunStateField[] =
+        requiredFieldsByPhase[activePhase] ?? [];
+      for (const field of requiredFields) {
+        if (!state[field]) {
+          context.addIssue({
+            code: "custom",
+            path: [field],
+            message: `${field} is required while the run is ${activePhase}`,
+          });
+        }
+      }
+      if (activePhase === "fixing" && state.pendingFindings.length === 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["pendingFindings"],
+          message: "pendingFindings must not be empty while the run is fixing",
+        });
+      }
     }
-  }
-  if (activePhase === "fixing" && state.pendingFindings.length === 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["pendingFindings"],
-      message: "pendingFindings must not be empty while the run is fixing",
-    });
-  }
-});
+    const activeSessionIds = new Set(
+      [state.orchestratorThreadId, state.implementationThreadId, state.reviewThreadId].filter(
+        (sessionId): sessionId is string => sessionId !== null,
+      ),
+    );
+    const cleanupKeys = new Set<string>();
+    for (const [index, action] of state.pendingAgentCleanup.entries()) {
+      const key =
+        action.kind === "run"
+          ? `run:${action.runtime}`
+          : `session:${action.runtime}:${action.sessionId}`;
+      if (cleanupKeys.has(key)) {
+        context.addIssue({
+          code: "custom",
+          path: ["pendingAgentCleanup", index],
+          message: "pendingAgentCleanup must not contain duplicate actions",
+        });
+      }
+      cleanupKeys.add(key);
+      if (action.kind === "session" && activeSessionIds.has(action.sessionId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["pendingAgentCleanup", index, "sessionId"],
+          message: "a session cannot be active and pending cleanup at the same time",
+        });
+      }
+    }
+  });
 
 export type RunState = z.infer<typeof RunStateSchema>;
 

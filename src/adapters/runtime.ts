@@ -1,8 +1,17 @@
-import type { AgentSettings } from "../domain/types.js";
+import type { AgentAccessMode, AgentRole, AgentSettings } from "../domain/types.js";
 
-export type AgentRole = "orchestrator" | "implementation" | "review";
+export type { AgentRole } from "../domain/types.js";
 
 export type RuntimeAgentSettings = AgentSettings;
+
+export type AgentRuntimeBaseOptions = {
+  repoPath: string;
+  settings: RuntimeAgentSettings;
+  accessMode: AgentAccessMode;
+};
+
+declare const herdrAgentIdBrand: unique symbol;
+export type HerdrAgentId = string & { readonly [herdrAgentIdBrand]: "HerdrAgentId" };
 
 export type SdkAgentSession = {
   runtime: "sdk";
@@ -12,7 +21,7 @@ export type SdkAgentSession = {
 
 export type HerdrAgentSession = {
   runtime: "herdr";
-  id: string | null;
+  id: HerdrAgentId | null;
   role: AgentRole;
 };
 
@@ -44,4 +53,6 @@ export interface AgentRuntime {
   start(role: AgentRole): AgentSession;
   resume(sessionId: string, role: AgentRole): AgentSession;
   run(session: AgentSession, prompt: string, options?: RunTurnOptions): Promise<TurnExecution>;
+  release(sessionId: string): Promise<void>;
+  releaseAll(): Promise<void>;
 }
