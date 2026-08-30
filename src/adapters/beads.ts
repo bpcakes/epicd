@@ -19,6 +19,13 @@ function isDescendant(epicId: string, candidateId: string): boolean {
 export class BeadsClient {
   constructor(readonly repoPath: string) {}
 
+  private async listIssues(filters: readonly string[]): Promise<Issue[]> {
+    const value = await runJson<unknown>("br", ["list", ...filters, "--limit", "0", "--json"], {
+      cwd: this.repoPath,
+    });
+    return parseIssueList(value);
+  }
+
   async versions(): Promise<{ br: string; bv: string }> {
     const [br, bv] = await Promise.all([
       runCommand("br", ["--version"], { cwd: this.repoPath }),
@@ -28,19 +35,11 @@ export class BeadsClient {
   }
 
   async listAll(): Promise<Issue[]> {
-    const value = await runJson<unknown>("br", ["list", "--all", "--limit", "0", "--json"], {
-      cwd: this.repoPath,
-    });
-    return parseIssueList(value);
+    return await this.listIssues(["--all"]);
   }
 
   async listOpenEpics(): Promise<Issue[]> {
-    const value = await runJson<unknown>(
-      "br",
-      ["list", "--status=open", "--type=epic", "--limit", "0", "--json"],
-      { cwd: this.repoPath },
-    );
-    return parseIssueList(value);
+    return await this.listIssues(["--status=open", "--type=epic"]);
   }
 
   async show(id: string): Promise<Issue> {

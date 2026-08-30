@@ -31,6 +31,7 @@ const cmd = process.argv[2];
 const type = process.env.EPICD_TEST_TYPE || "task";
 const issue = {id:"epic.1",title:"Concrete work",description:"Implement it",acceptance_criteria:"It works",status:"open",priority:1,issue_type:type,labels:[]};
 if (cmd === "ready") console.log(JSON.stringify(process.env.EPICD_TEST_NOT_READY ? [] : [issue]));
+else if (cmd === "list") console.log(JSON.stringify({issues:[issue]}));
 else if (cmd === "show") console.log(JSON.stringify(issue));
 else if (cmd === "update") console.log(JSON.stringify({...issue,status:"in_progress"}));
 else if (cmd === "--version") console.log("br test");
@@ -44,6 +45,20 @@ else console.log("{}");
 }
 
 describe.sequential("BeadsClient claim gate", () => {
+  it("uses the shared list contract for all issues and open epics", async () => {
+    const fixture = installFakeBr();
+    const client = new BeadsClient(fixture.root);
+
+    expect(await client.listAll()).toMatchObject([{ id: "epic.1", issue_type: "task" }]);
+    expect(await client.listOpenEpics()).toMatchObject([{ id: "epic.1", issue_type: "task" }]);
+
+    const commands = readFileSync(fixture.log, "utf8").trim().split("\n");
+    expect(commands).toEqual([
+      "list --all --limit 0 --json",
+      "list --status=open --type=epic --limit 0 --json",
+    ]);
+  });
+
   it("executes ready, show, and only then the status mutation", async () => {
     const fixture = installFakeBr();
     await new BeadsClient(fixture.root).claim("epic", "epic.1", "run-1");
