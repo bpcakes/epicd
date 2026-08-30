@@ -298,6 +298,114 @@ describe.sequential("EpicEngine workflow", () => {
     setup.store.close();
   }, 30_000);
 
+  it("cold-switches an SDK repair to Herdr without losing workflow state", async () => {
+    const setup = await fixture();
+    process.env.EPICD_FAKE_MODE = "review-fix";
+    const sdkEngine = await EpicEngine.create(
+      { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+      setup.store,
+    );
+    sdkEngine.onEvent((event) => {
+      if (event.kind === "review.changes_requested") sdkEngine.requestPause();
+    });
+
+    const paused = await sdkEngine.run();
+    expect(paused.phase).toBe("paused");
+    expect(paused.resumePhase).toBe("fixing");
+    expect(paused.runtime).toBe("sdk");
+    expect(paused.implementationThreadId).toMatch(/^thr-/);
+    expect(paused.reviewThreadId).toMatch(/^thr-/);
+    const pendingFindingCount = paused.pendingFindings.length;
+    expect(pendingFindingCount).toBeGreaterThan(0);
+
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_WORKSPACE_ID = "w-e2e";
+    process.env.XDG_STATE_HOME = join(setup.repo, ".state");
+    const herdrEngine = EpicEngine.resume(
+      paused,
+      { runtime: "herdr", herdrPath: setup.herdr },
+      setup.store,
+    );
+    expect(paused.runtime).toBe("sdk");
+    const handoffStates: Array<typeof paused> = [];
+    herdrEngine.onState((state) => {
+      if (state.runtime === "herdr") handoffStates.push(state);
+    });
+    herdrEngine.continueRun();
+
+    const completed = await herdrEngine.run();
+
+    expect(completed.phase, completed.lastError ?? undefined).toBe("complete");
+    expect(completed.runtime).toBe("herdr");
+    const handoffState = handoffStates[0];
+    expect(handoffState).toMatchObject({
+      runtime: "herdr",
+      orchestratorThreadId: null,
+      implementationThreadId: null,
+      reviewThreadId: null,
+    });
+    expect(handoffState?.pendingFindings).toHaveLength(pendingFindingCount);
+    const events = setup.store.events(completed.runId);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "runtime.switched",
+          message: "Switched runtime from sdk to herdr",
+        }),
+        expect.objectContaining({
+          kind: "fix.started",
+          message: `Starting a fresh implementation session for ${pendingFindingCount} finding(s)`,
+        }),
+      ]),
+    );
+    setup.store.close();
+  }, 30_000);
+
+  it("cold-switches a Herdr run back to SDK", async () => {
+    const setup = await fixture();
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_WORKSPACE_ID = "w-e2e";
+    process.env.XDG_STATE_HOME = join(setup.repo, ".state");
+    const herdrEngine = await EpicEngine.create(
+      {
+        repoPath: setup.repo,
+        epicId: "demo",
+        runtime: "herdr",
+        herdrPath: setup.herdr,
+      },
+      setup.store,
+    );
+    herdrEngine.onEvent((event) => {
+      if (event.kind === "orchestrator.selected") herdrEngine.requestPause();
+    });
+
+    const paused = await herdrEngine.run();
+    expect(paused.phase).toBe("paused");
+    expect(paused.resumePhase).toBe("claiming");
+    expect(paused.orchestratorThreadId).toMatch(/^ed-/);
+
+    const sdkEngine = EpicEngine.resume(
+      paused,
+      { runtime: "sdk", codexPath: setup.codex },
+      setup.store,
+    );
+    sdkEngine.continueRun();
+    const completed = await sdkEngine.run();
+
+    expect(completed.phase, completed.lastError ?? undefined).toBe("complete");
+    expect(completed.runtime).toBe("sdk");
+    expect(
+      setup.store
+        .events(completed.runId)
+        .some(
+          (event) =>
+            event.kind === "runtime.switched" &&
+            event.message === "Switched runtime from herdr to sdk",
+        ),
+    ).toBe(true);
+    setup.store.close();
+  }, 30_000);
+
   it("delivers, independently reviews, commits, verifies, and closes an epic", async () => {
     const setup = await fixture();
     const argumentLog = join(setup.repo, "..", "codex-args.jsonl");

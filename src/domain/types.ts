@@ -192,18 +192,13 @@ const RunStateBaseSchema = z.object({
 });
 
 type RequiredRunStateField =
-  | "currentBeadId"
-  | "baseRevision"
-  | "implementationThreadId"
-  | "candidateRevision"
-  | "reviewedFingerprint"
-  | "reviewedTree";
+  "currentBeadId" | "baseRevision" | "candidateRevision" | "reviewedFingerprint" | "reviewedTree";
 
 const requiredFieldsByPhase: Partial<Record<RunPhase, readonly RequiredRunStateField[]>> = {
   claiming: ["currentBeadId", "baseRevision"],
   implementing: ["currentBeadId", "baseRevision"],
-  reviewing: ["currentBeadId", "baseRevision", "implementationThreadId"],
-  fixing: ["currentBeadId", "baseRevision", "implementationThreadId"],
+  reviewing: ["currentBeadId", "baseRevision"],
+  fixing: ["currentBeadId", "baseRevision"],
   committing: ["currentBeadId", "baseRevision", "reviewedFingerprint", "reviewedTree"],
   verifying: ["currentBeadId", "baseRevision", "candidateRevision"],
   closing: ["currentBeadId", "baseRevision", "candidateRevision"],

@@ -76,7 +76,14 @@ epicd run my-project-epic-id --runtime sdk -C /path/to/repository
 epicd run my-project-epic-id --runtime herdr -C /path/to/repository
 ```
 
-The runtime is persisted with the run and cannot be switched during resume. You can omit `--runtime` on `resume`; epicd uses the saved choice.
+The runtime is persisted with the run. Omit `--runtime` when resuming to keep the saved choice, or explicitly select the other runtime to perform a cold handoff:
+
+```bash
+epicd resume my-project-epic-id --runtime herdr -C /path/to/repository
+epicd resume my-project-epic-id --runtime sdk -C /path/to/repository
+```
+
+A cold handoff preserves the Bead, lifecycle phase, findings, repair budget, Git revisions, and per-role model settings. Runtime-specific agent sessions are discarded, so the destination runtime starts fresh agents with the persisted workflow context. The switch is written only after epicd acquires the run lease.
 
 ## Models and reasoning by role
 
@@ -146,7 +153,7 @@ For every implementation task, epicd performs:
 3. Rerun the authoritative ready/show claim gate and claim the selected task.
 4. Start a top-level implementation session with the exact Bead and epic context.
 5. Start a fresh comprehensive review session over the uncommitted candidate.
-6. Resume the implementation session with every finding, then resume the same reviewer to verify those fixes and repair-caused regressions.
+6. Resume the implementation session with every finding, then resume the same reviewer to verify those fixes and repair-caused regressions. After a runtime handoff, start fresh agents for these roles instead.
 7. Commit application changes without staging `.beads`.
 8. Start a fresh verifier session to confirm the exact candidate SHA and its acceptance evidence without repeating the comprehensive review.
 9. Close and sync the Bead, then commit tracker-only changes.

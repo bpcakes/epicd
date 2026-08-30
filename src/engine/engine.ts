@@ -120,6 +120,7 @@ export class EpicEngine {
   private readonly beads: BeadsClient;
   private readonly git: GitClient;
   private readonly runtime: AgentRuntime;
+  private pendingRuntimeSwitch: RuntimeKind | null;
   private pauseRequested = false;
   private resumeRequested = false;
 
@@ -132,8 +133,10 @@ export class EpicEngine {
     this.beads = new BeadsClient(state.repoPath);
     this.git = new GitClient(state.repoPath);
     const settings = effectiveAgentSettings(state);
+    const runtime = options.runtime ?? state.runtime;
+    this.pendingRuntimeSwitch = runtime === state.runtime ? null : runtime;
     this.runtime =
-      state.runtime === "herdr"
+      runtime === "herdr"
         ? new HerdrRuntime(state.repoPath, state.runId, settings, options.herdrPath)
         : new CodexRuntime(state.repoPath, settings, options.codexPath);
   }
@@ -204,11 +207,6 @@ export class EpicEngine {
     options: Omit<EpicEngineOptions, "repoPath" | "epicId"> = {},
     store = new StateStore(),
   ): EpicEngine {
-    if (options.runtime && options.runtime !== state.runtime) {
-      throw new Error(
-        `Run ${state.runId.slice(0, 8)} uses the ${state.runtime} runtime and cannot resume as ${options.runtime}`,
-      );
-    }
     if (
       options.maxReviewPasses !== undefined &&
       options.maxReviewPasses !== state.maxReviewPasses
@@ -287,6 +285,25 @@ export class EpicEngine {
     this.emit("error", "run.blocked", "Run needs attention", message);
   }
 
+  private applyPendingRuntimeSwitch(): void {
+    const runtime = this.pendingRuntimeSwitch;
+    if (!runtime) return;
+
+    const previousRuntime = this.state.runtime;
+    this.state.runtime = runtime;
+    this.state.orchestratorThreadId = null;
+    this.state.implementationThreadId = null;
+    this.state.reviewThreadId = null;
+    this.save();
+    this.pendingRuntimeSwitch = null;
+    this.emit(
+      "warning",
+      "runtime.switched",
+      `Switched runtime from ${previousRuntime} to ${runtime}`,
+      "Previous agent sessions were discarded; workflow and Git state were preserved",
+    );
+  }
+
   async run(signal?: AbortSignal): Promise<RunState> {
     let lease: string;
     try {
@@ -301,6 +318,7 @@ export class EpicEngine {
       return this.state;
     }
     try {
+      this.applyPendingRuntimeSwitch();
       if (
         this.resumeRequested &&
         (this.state.phase === "paused" || this.state.phase === "blocked")
@@ -492,8 +510,8 @@ export class EpicEngine {
     const issue = await this.beads.show(this.requireCurrentBead());
     const epic = await this.beads.show(this.state.epicId);
     const implementationThreadId = this.state.implementationThreadId;
-    const recovery = implementationThreadId !== null;
-    const thread = recovery
+    const recovery = implementationThreadId !== null || (await this.git.changedPaths()).length > 0;
+    const thread = implementationThreadId
       ? this.runtime.resume(implementationThreadId, "implementation")
       : this.runtime.start("implementation");
     this.emit(
@@ -657,15 +675,18 @@ export class EpicEngine {
       throw new Error(`Repair budget exhausted after ${this.options.maxReviewPasses} fix passes`);
     }
     const issue = await this.beads.show(this.requireCurrentBead());
-    if (!this.state.implementationThreadId)
-      throw new Error("Cannot fix review findings without an implementation thread");
     if (this.state.pendingFindings.length === 0)
       throw new Error("Fix phase has no persisted findings");
-    const thread = this.runtime.resume(this.state.implementationThreadId, "implementation");
+    const implementationThreadId = this.state.implementationThreadId;
+    const thread = implementationThreadId
+      ? this.runtime.resume(implementationThreadId, "implementation")
+      : this.runtime.start("implementation");
     this.emit(
       "info",
       "fix.started",
-      `Sending ${this.state.pendingFindings.length} finding(s) to the implementation thread`,
+      implementationThreadId
+        ? `Sending ${this.state.pendingFindings.length} finding(s) to the implementation thread`
+        : `Starting a fresh implementation session for ${this.state.pendingFindings.length} finding(s)`,
     );
     const execution = await this.runtime.run(
       thread,
