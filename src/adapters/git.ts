@@ -8,14 +8,16 @@ import { runCommand } from "../util/command.js";
 export class GitClient {
   constructor(readonly repoPath: string) {}
 
+  private async revParse(...args: string[]): Promise<string> {
+    return (await runCommand("git", ["rev-parse", ...args], { cwd: this.repoPath })).stdout.trim();
+  }
+
   async root(): Promise<string> {
-    return (
-      await runCommand("git", ["rev-parse", "--show-toplevel"], { cwd: this.repoPath })
-    ).stdout.trim();
+    return await this.revParse("--show-toplevel");
   }
 
   async head(): Promise<string> {
-    return (await runCommand("git", ["rev-parse", "HEAD"], { cwd: this.repoPath })).stdout.trim();
+    return await this.revParse("HEAD");
   }
 
   async status(): Promise<string> {
@@ -103,9 +105,7 @@ export class GitClient {
     const temporaryDirectory = await mkdtemp(join(tmpdir(), "epicd-index-"));
     const temporaryIndex = join(temporaryDirectory, "index");
     try {
-      const gitIndex = (
-        await runCommand("git", ["rev-parse", "--git-path", "index"], { cwd: this.repoPath })
-      ).stdout.trim();
+      const gitIndex = await this.revParse("--git-path", "index");
       await copyFile(resolve(this.repoPath, gitIndex), temporaryIndex);
       const env = { ...process.env, GIT_INDEX_FILE: temporaryIndex };
       await runCommand("git", ["add", "-A", "--", ".", ":(exclude).beads/**"], {
@@ -119,9 +119,7 @@ export class GitClient {
   }
 
   async tree(revision: string): Promise<string> {
-    return (
-      await runCommand("git", ["rev-parse", `${revision}^{tree}`], { cwd: this.repoPath })
-    ).stdout.trim();
+    return await this.revParse(`${revision}^{tree}`);
   }
 
   async changedPaths(): Promise<string[]> {
