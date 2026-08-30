@@ -190,80 +190,51 @@ export type EpicSnapshot = {
   graph: unknown;
 };
 
-export const REVIEW_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    verdict: { type: "string", enum: ["approved", "changes_requested", "blocked"] },
-    summary: { type: "string" },
-    revision: { type: ["string", "null"] },
-    findings: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          severity: { type: "string", enum: ["critical", "high", "medium", "low"] },
-          title: { type: "string" },
-          detail: { type: "string" },
-          file: { type: ["string", "null"] },
-          line: { type: ["integer", "null"] },
-          remediation: { type: "string" },
-        },
-        required: ["severity", "title", "detail", "file", "line", "remediation"],
-        additionalProperties: false,
-      },
-    },
-    tests: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          command: { type: "string" },
-          outcome: { type: "string", enum: ["passed", "failed", "not_run"] },
-          detail: { type: "string" },
-        },
-        required: ["command", "outcome", "detail"],
-        additionalProperties: false,
-      },
-    },
-    residualRisks: { type: "array", items: { type: "string" } },
-  },
-  required: ["verdict", "summary", "revision", "findings", "tests", "residualRisks"],
-  additionalProperties: false,
-} as const;
+const refinementKeywords = new Set([
+  "$schema",
+  "exclusiveMaximum",
+  "exclusiveMinimum",
+  "format",
+  "maxLength",
+  "maximum",
+  "minLength",
+  "minimum",
+  "multipleOf",
+  "pattern",
+]);
 
-export const IMPLEMENTATION_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    status: { type: "string", enum: ["completed", "blocked"] },
-    summary: { type: "string" },
-    changedFiles: { type: "array", items: { type: "string" } },
-    tests: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          command: { type: "string" },
-          outcome: { type: "string", enum: ["passed", "failed", "not_run"] },
-          detail: { type: "string" },
-        },
-        required: ["command", "outcome", "detail"],
-        additionalProperties: false,
-      },
-    },
-    blockers: { type: "array", items: { type: "string" } },
-  },
-  required: ["status", "summary", "changedFiles", "tests", "blockers"],
-  additionalProperties: false,
-} as const;
+function normalizeAgentOutputSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeAgentOutputSchema);
+  if (!value || typeof value !== "object") return value;
 
-export const SELECTION_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    candidateId: { type: "string" },
-    rationale: { type: "string" },
-    dependencyNotes: { type: "array", items: { type: "string" } },
-    riskNotes: { type: "array", items: { type: "string" } },
-  },
-  required: ["candidateId", "rationale", "dependencyNotes", "riskNotes"],
-  additionalProperties: false,
-} as const;
+  const normalized = Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !refinementKeywords.has(key))
+      .map(([key, entry]) => [key, normalizeAgentOutputSchema(entry)]),
+  );
+  const variants = normalized.anyOf;
+  if (
+    Array.isArray(variants) &&
+    variants.every(
+      (variant) =>
+        variant &&
+        typeof variant === "object" &&
+        Object.keys(variant).length === 1 &&
+        typeof (variant as { type?: unknown }).type === "string",
+    )
+  ) {
+    const { anyOf: _, ...rest } = normalized;
+    return { ...rest, type: variants.map((variant) => (variant as { type: string }).type) };
+  }
+  return normalized;
+}
+
+function agentOutputSchema(schema: z.ZodType): Record<string, unknown> {
+  // The agent boundary intentionally describes shape only. Zod remains the
+  // canonical validator for refinements after the structured response arrives.
+  return normalizeAgentOutputSchema(z.toJSONSchema(schema)) as Record<string, unknown>;
+}
+
+export const REVIEW_OUTPUT_SCHEMA = agentOutputSchema(ReviewResultSchema);
+export const IMPLEMENTATION_OUTPUT_SCHEMA = agentOutputSchema(ImplementationResultSchema);
+export const SELECTION_OUTPUT_SCHEMA = agentOutputSchema(SelectionResultSchema);
