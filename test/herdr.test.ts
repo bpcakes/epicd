@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { HerdrRuntime } from "../src/adapters/herdr.js";
+import type { AgentSession } from "../src/adapters/runtime.js";
 import { DEFAULT_AGENT_SETTINGS } from "../src/domain/types.js";
 
 const tempDirs: string[] = [];
@@ -172,5 +173,18 @@ describe("HerdrRuntime", () => {
     await expect(runtime.run(runtime.start("orchestrator"), "Select")).rejects.toThrow(
       "HERDR_ENV=1",
     );
+  });
+
+  it("rejects sessions belonging to another runtime", async () => {
+    const setup = fixture();
+    const runtime = new HerdrRuntime(
+      setup.root,
+      "foreign-session",
+      DEFAULT_AGENT_SETTINGS,
+      setup.herdr,
+    );
+    const foreignSession: AgentSession = { runtime: "sdk", id: null, role: "review" };
+
+    await expect(runtime.run(foreignSession, "Review")).rejects.toThrow("non-Herdr session");
   });
 });

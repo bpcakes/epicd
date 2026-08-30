@@ -7,6 +7,7 @@ import type {
   AgentRole,
   AgentRuntime,
   AgentSession,
+  HerdrAgentSession,
   RunTurnOptions,
   RuntimeAgentSettings,
   TurnExecution,
@@ -23,8 +24,6 @@ const HerdrEnvelopeSchema = z.object({
     .optional(),
 });
 
-type HerdrSessionHandle = { existing: boolean };
-
 const TURN_TIMEOUT_MS = 6 * 60 * 60 * 1_000;
 
 export class HerdrRuntime implements AgentRuntime {
@@ -40,15 +39,15 @@ export class HerdrRuntime implements AgentRuntime {
     this.resultRoot = join(stateRoot, "epicd", "herdr", safeName(runId));
   }
 
-  start(role: AgentRole): AgentSession {
-    return { id: null, role, handle: { existing: false } satisfies HerdrSessionHandle };
+  start(role: AgentRole): HerdrAgentSession {
+    return { runtime: "herdr", id: null, role };
   }
 
-  resume(sessionId: string, role: AgentRole): AgentSession {
+  resume(sessionId: string, role: AgentRole): HerdrAgentSession {
     return {
+      runtime: "herdr",
       id: sessionId,
       role,
-      handle: { existing: true } satisfies HerdrSessionHandle,
     };
   }
 
@@ -57,6 +56,7 @@ export class HerdrRuntime implements AgentRuntime {
     prompt: string,
     options: RunTurnOptions = {},
   ): Promise<TurnExecution> {
+    if (session.runtime !== "herdr") throw new Error("Herdr runtime received a non-Herdr session");
     this.assertEnvironment();
     await mkdir(this.resultRoot, { recursive: true, mode: 0o700 });
 

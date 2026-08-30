@@ -6,11 +6,13 @@ import type {
   RunTurnOptions,
   RuntimeAgentSettings,
   RuntimeEvent,
+  SdkAgentSession,
   TurnExecution,
 } from "./runtime.js";
 
 export class CodexRuntime implements AgentRuntime {
   private readonly codex: Codex;
+  private readonly threads = new WeakMap<SdkAgentSession, Thread>();
 
   constructor(
     private readonly repoPath: string,
@@ -20,16 +22,16 @@ export class CodexRuntime implements AgentRuntime {
     this.codex = new Codex(codexPath ? { codexPathOverride: codexPath } : undefined);
   }
 
-  start(role: AgentRole): AgentSession {
-    return { id: null, role, handle: this.codex.startThread(this.threadOptions(role)) };
+  start(role: AgentRole): SdkAgentSession {
+    const session: SdkAgentSession = { runtime: "sdk", id: null, role };
+    this.threads.set(session, this.codex.startThread(this.threadOptions(role)));
+    return session;
   }
 
-  resume(threadId: string, role: AgentRole): AgentSession {
-    return {
-      id: threadId,
-      role,
-      handle: this.codex.resumeThread(threadId, this.threadOptions(role)),
-    };
+  resume(threadId: string, role: AgentRole): SdkAgentSession {
+    const session: SdkAgentSession = { runtime: "sdk", id: threadId, role };
+    this.threads.set(session, this.codex.resumeThread(threadId, this.threadOptions(role)));
+    return session;
   }
 
   private threadOptions(role: AgentRole): ThreadOptions {
@@ -51,7 +53,9 @@ export class CodexRuntime implements AgentRuntime {
     prompt: string,
     options: RunTurnOptions = {},
   ): Promise<TurnExecution> {
-    const thread = session.handle as Thread;
+    if (session.runtime !== "sdk") throw new Error("Codex runtime received a non-SDK session");
+    const thread = this.threads.get(session);
+    if (!thread) throw new Error("Codex runtime received a session it did not create");
     const turnOptions: { outputSchema?: unknown; signal?: AbortSignal } = {};
     if (options.outputSchema !== undefined) turnOptions.outputSchema = options.outputSchema;
     if (options.signal !== undefined) turnOptions.signal = options.signal;

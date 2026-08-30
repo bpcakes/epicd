@@ -4,11 +4,19 @@ export type AgentRole = "orchestrator" | "implementation" | "review";
 
 export type RuntimeAgentSettings = AgentSettings;
 
-export type AgentSession = {
+export type SdkAgentSession = {
+  runtime: "sdk";
   id: string | null;
   role: AgentRole;
-  handle: unknown;
 };
+
+export type HerdrAgentSession = {
+  runtime: "herdr";
+  id: string | null;
+  role: AgentRole;
+};
+
+export type AgentSession = SdkAgentSession | HerdrAgentSession;
 
 export type RuntimeEvent =
   | { type: "session.started"; sessionId: string }
