@@ -12,6 +12,7 @@ afterEach(() => {
   delete process.env.EPICD_TEST_LOG;
   delete process.env.EPICD_TEST_TYPE;
   delete process.env.EPICD_TEST_NOT_READY;
+  delete process.env.EPICD_TEST_MALFORMED_LIST;
   for (const path of tempDirs.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -31,7 +32,7 @@ const cmd = process.argv[2];
 const type = process.env.EPICD_TEST_TYPE || "task";
 const issue = {id:"epic.1",title:"Concrete work",description:"Implement it",acceptance_criteria:"It works",status:"open",priority:1,issue_type:type,labels:[]};
 if (cmd === "ready") console.log(JSON.stringify(process.env.EPICD_TEST_NOT_READY ? [] : [issue]));
-else if (cmd === "list") console.log(JSON.stringify({issues:[issue]}));
+else if (cmd === "list") console.log(JSON.stringify(process.env.EPICD_TEST_MALFORMED_LIST ? {} : {issues:[issue]}));
 else if (cmd === "show") console.log(JSON.stringify(issue));
 else if (cmd === "update") console.log(JSON.stringify({...issue,status:"in_progress"}));
 else if (cmd === "--version") console.log("br test");
@@ -57,6 +58,13 @@ describe.sequential("BeadsClient claim gate", () => {
       "list --all --limit 0 --json",
       "list --status=open --type=epic --limit 0 --json",
     ]);
+  });
+
+  it("rejects a malformed list envelope instead of treating it as empty", async () => {
+    const fixture = installFakeBr();
+    process.env.EPICD_TEST_MALFORMED_LIST = "1";
+
+    await expect(new BeadsClient(fixture.root).listAll()).rejects.toThrow();
   });
 
   it("executes ready, show, and only then the status mutation", async () => {

@@ -1,15 +1,12 @@
+import { z } from "zod";
 import { IssueSchema, type EpicSnapshot, type Issue } from "../domain/types.js";
 import { runCommand, runJson } from "../util/command.js";
 
-type IssueListEnvelope = { issues?: unknown[] };
+const IssueListSchema = z.union([z.array(IssueSchema), z.object({ issues: z.array(IssueSchema) })]);
 
 function parseIssueList(value: unknown): Issue[] {
-  const raw = Array.isArray(value)
-    ? value
-    : value && typeof value === "object" && Array.isArray((value as IssueListEnvelope).issues)
-      ? ((value as IssueListEnvelope).issues ?? [])
-      : [];
-  return raw.map((issue) => IssueSchema.parse(issue));
+  const parsed = IssueListSchema.parse(value);
+  return Array.isArray(parsed) ? parsed : parsed.issues;
 }
 
 function isDescendant(epicId: string, candidateId: string): boolean {
