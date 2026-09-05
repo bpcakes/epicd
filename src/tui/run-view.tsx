@@ -1,7 +1,18 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import type { EpicEngine } from "../engine/engine.js";
-import type { EngineEvent, RunPhase, RunState } from "../domain/types.js";
+import {
+  AgentPreferencesSchema,
+  AGENT_ROLES,
+  resolveAgentRoleSettings,
+  type AgentPreferences,
+  type AgentRole,
+  type AgentRolePreferences,
+  type AgentRoleSettings,
+  type EngineEvent,
+  type RunPhase,
+  type RunState,
+} from "../domain/types.js";
 import {
   clock,
   eventColors,
@@ -11,6 +22,17 @@ import {
   progressBar,
   shortId,
 } from "../ui/format.js";
+import {
+  cycleAgentReasoningEffort,
+  normalizeAgentModelInput,
+  updateAgentPreference,
+} from "./agent-config.js";
+import {
+  canRequestPause,
+  ControllerOperationGate,
+  performControllerCommand,
+  shouldExitAfterController,
+} from "../controller.js";
 
 const pipeline: Array<{ phases: RunPhase[]; label: string }> = [
   { phases: ["selecting", "preparing"], label: "SELECT" },
@@ -21,6 +43,160 @@ const pipeline: Array<{ phases: RunPhase[]; label: string }> = [
   { phases: ["verifying", "final_review"], label: "VERIFY" },
   { phases: ["closing", "complete"], label: "CLOSE" },
 ];
+
+const roleLabels = {
+  orchestrator: "Coordinator",
+  implementation: "Implementer",
+  review: "Reviewer",
+} satisfies Record<AgentRole, string>;
+const configurableRoles = AGENT_ROLES.map((role) => ({ role, label: roleLabels[role] }));
+function effectiveFutureSettings(state: RunState, role: AgentRole): AgentRoleSettings {
+  return resolveAgentRoleSettings(state, role);
+}
+
+function displayedSettings(state: RunState, role: AgentRole): AgentRoleSettings {
+  const session = state.agentSessions[role];
+  if (session.status === "inactive") return effectiveFutureSettings(state, role);
+  return session.status === "active" ? session.contract.effective : session.settings;
+}
+
+export function AgentConfig({
+  initialSettings,
+  agentSessions,
+  fallbackModel,
+  fallbackReasoningEffort,
+  onApply,
+  onCancel,
+  onInterrupt,
+  onPause,
+  onQuit,
+  error,
+}: {
+  initialSettings: AgentPreferences;
+  agentSessions: RunState["agentSessions"];
+  fallbackModel: string | null;
+  fallbackReasoningEffort: RunState["reasoningEffort"];
+  onApply: (settings: AgentPreferences) => void;
+  onCancel: () => void;
+  onInterrupt: () => void;
+  onPause: () => void;
+  onQuit: () => void;
+  error: string | null;
+}) {
+  const [draft, setDraft] = useState<AgentPreferences>(() =>
+    AgentPreferencesSchema.parse(initialSettings),
+  );
+  const [selected, setSelected] = useState(0);
+  const [modelInput, setModelInput] = useState<string | null>(null);
+  const selectedRole = configurableRoles[selected]?.role ?? "orchestrator";
+  const initialSettingsKey = JSON.stringify(initialSettings);
+
+  useEffect(() => {
+    setDraft(AgentPreferencesSchema.parse(initialSettings));
+    setModelInput(null);
+  }, [initialSettingsKey]);
+
+  const updateSelected = (update: Partial<AgentRolePreferences>) => {
+    setDraft((current) => updateAgentPreference(current, selectedRole, update));
+  };
+
+  useInput((input, key) => {
+    if (key.ctrl && input === "c") {
+      onInterrupt();
+      return;
+    }
+    if (modelInput !== null) {
+      if (key.escape) setModelInput(null);
+      else if (key.return) {
+        updateSelected({ model: normalizeAgentModelInput(modelInput) });
+        setModelInput(null);
+      } else if (key.backspace || key.delete)
+        setModelInput((current) => current?.slice(0, -1) ?? "");
+      else if (input && !key.ctrl && !key.meta && !key.super)
+        setModelInput((current) => `${current ?? ""}${input}`);
+      return;
+    }
+
+    if (input === "p") onPause();
+    else if (input === "q") onQuit();
+    else if (key.escape || input === "c") onCancel();
+    else if (key.upArrow || input === "k")
+      setSelected((current) => (current + configurableRoles.length - 1) % configurableRoles.length);
+    else if (key.downArrow || input === "j")
+      setSelected((current) => (current + 1) % configurableRoles.length);
+    else if (key.leftArrow || key.rightArrow) {
+      setDraft((current) =>
+        cycleAgentReasoningEffort(
+          current,
+          selectedRole,
+          fallbackModel,
+          fallbackReasoningEffort,
+          key.leftArrow ? -1 : 1,
+        ),
+      );
+    } else if (input === "m") setModelInput(draft[selectedRole].model ?? "");
+    else if (input === "x") updateSelected({ model: null });
+    else if (input === "r") updateSelected({ reasoningEffort: null });
+    else if (key.return || input === "s") onApply(draft);
+  });
+
+  return (
+    <Box borderStyle="round" borderColor="cyan" paddingX={2} flexDirection="column">
+      <Text bold color="cyan">
+        AGENT CONFIGURATION
+      </Text>
+      <Text dimColor>Changes apply to new threads only. Existing threads stay pinned.</Text>
+      <Box marginTop={1} flexDirection="column">
+        {configurableRoles.map(({ role, label }, index) => {
+          const next = draft[role];
+          const session = agentSessions[role];
+          const nextModel = next.model ?? fallbackModel ?? "default";
+          const nextReasoning = resolveAgentRoleSettings(
+            {
+              agentSettings: draft,
+              model: fallbackModel,
+              reasoningEffort: fallbackReasoningEffort,
+            },
+            role,
+          ).reasoningEffort;
+          return (
+            <Box key={role} flexDirection="column" marginBottom={1}>
+              <Text
+                {...(index === selected ? { color: "cyan" as const } : {})}
+                bold={index === selected}
+              >
+                {index === selected ? "› " : "  "}
+                {label}
+              </Text>
+              <Text>
+                <Text dimColor> next </Text>
+                {role === selectedRole && modelInput !== null ? `${modelInput}▌` : nextModel}
+                {` · ${nextReasoning}`}
+              </Text>
+              {session.status === "active" ? (
+                <Text
+                  dimColor
+                >{`    active ${session.contract.effective.model ?? "default"} · ${session.contract.effective.reasoningEffort}`}</Text>
+              ) : session.status === "unresolved" ? (
+                <Text dimColor>{`    legacy session pending rotation`}</Text>
+              ) : (
+                <Text dimColor> active —</Text>
+              )}
+            </Box>
+          );
+        })}
+      </Box>
+      <Text dimColor>
+        ↑/↓ role · ←/→ effort · r inherit effort · m edit model · x default model · s/Enter save · p
+        pause · q quit
+      </Text>
+      {modelInput !== null ? (
+        <Text color="yellow">Editing model: Enter accepts · Esc cancels</Text>
+      ) : null}
+      {error ? <Text color="red">Could not save: {error}</Text> : null}
+    </Box>
+  );
+}
 
 function StageLine({ phase }: { phase: RunPhase }) {
   return (
@@ -84,11 +260,45 @@ export function RunView({ engine }: { engine: EpicEngine }) {
   const [events, setEvents] = useState<EngineEvent[]>(() => engine.recentEvents(100));
   const [showDetail, setShowDetail] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [showConfig, setShowConfig] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [controllerError, setControllerError] = useState<string | null>(null);
+  const [controllerBusy, setControllerBusy] = useState(false);
   const [pauseThenExit, setPauseThenExit] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const controllerGate = useRef(new ControllerOperationGate());
   const columns = stdout.columns ?? 100;
   const compact = columns < 84;
   const activityRows = compact ? 7 : 11;
+  const settleController = useCallback(
+    (operation: () => Promise<RunState>) =>
+      controllerGate.current.start(
+        operation,
+        (next) => setState({ ...next }),
+        setControllerError,
+        setControllerBusy,
+      ),
+    [],
+  );
+  const requestControllerPause = () =>
+    performControllerCommand(() => engine.requestPause(), setControllerError);
+  const requestPause = () => {
+    if (canRequestPause(controllerGate.current.busy, state.phase)) requestControllerPause();
+  };
+  const requestInterrupt = () => {
+    if (!controllerGate.current.busy) {
+      exit();
+      return;
+    }
+    setPauseThenExit(true);
+    abortRef.current?.abort(new Error("Interrupted by operator; run remains recoverable"));
+  };
+  const requestQuit = () => {
+    if (!controllerGate.current.busy) exit();
+    else if (requestControllerPause()) {
+      setPauseThenExit(true);
+    }
+  };
 
   useEffect(() => {
     const offEvent = engine.onEvent((event) =>
@@ -96,38 +306,45 @@ export function RunView({ engine }: { engine: EpicEngine }) {
     );
     const offState = engine.onState((next) => setState({ ...next }));
     const controller = new AbortController();
-    abortRef.current = controller;
-    void engine.run(controller.signal).then((next) => setState({ ...next }));
+    if (settleController(() => engine.run(controller.signal))) abortRef.current = controller;
     return () => {
+      abortRef.current?.abort(new Error("TUI closed; run remains recoverable"));
+      abortRef.current = null;
       offEvent();
       offState();
     };
-  }, [engine]);
+  }, [engine, settleController]);
 
   useEffect(() => {
-    if (pauseThenExit && ["paused", "blocked"].includes(state.phase)) exit();
-  }, [exit, pauseThenExit, state.phase]);
+    if (shouldExitAfterController(pauseThenExit, controllerBusy)) exit();
+  }, [controllerBusy, exit, pauseThenExit]);
 
-  useInput((input, key) => {
-    if (key.ctrl && input === "c") {
-      setPauseThenExit(true);
-      abortRef.current?.abort(new Error("Interrupted by operator; run remains recoverable"));
-    } else if (input === "?" || input === "h") setShowHelp((value) => !value);
-    else if (input === "v") setShowDetail((value) => !value);
-    else if (input === "p" && !["paused", "blocked", "complete"].includes(state.phase))
-      engine.requestPause();
-    else if (input === "r" && ["paused", "blocked"].includes(state.phase)) {
-      const controller = new AbortController();
-      abortRef.current = controller;
-      void engine.resumeRun(controller.signal).then((next) => setState({ ...next }));
-    } else if (input === "q") {
-      if (["paused", "blocked", "complete"].includes(state.phase)) exit();
-      else {
-        setPauseThenExit(true);
-        engine.requestPause();
-      }
-    } else if (key.escape) setShowHelp(false);
-  });
+  useInput(
+    (input, key) => {
+      if (key.ctrl && input === "c") {
+        requestInterrupt();
+      } else if (input === "?" || input === "h") setShowHelp((value) => !value);
+      else if (input === "c" && state.phase !== "complete") {
+        setShowHelp(false);
+        setConfigError(null);
+        setShowConfig(true);
+      } else if (input === "v") setShowDetail((value) => !value);
+      else if (input === "p") requestPause();
+      else if (
+        input === "r" &&
+        !controllerGate.current.busy &&
+        ["paused", "blocked"].includes(state.phase)
+      ) {
+        const controller = new AbortController();
+        setControllerError(null);
+        if (settleController(() => engine.resumeRun(controller.signal))) {
+          abortRef.current = controller;
+        }
+      } else if (input === "q") requestQuit();
+      else if (key.escape) setShowHelp(false);
+    },
+    { isActive: !showConfig },
+  );
 
   const percent =
     state.totalTasks === 0 ? 0 : Math.round((state.completedTasks / state.totalTasks) * 100);
@@ -146,10 +363,13 @@ export function RunView({ engine }: { engine: EpicEngine }) {
           <Text bold>r</Text> resume a paused or blocked run
         </Text>
         <Text>
+          <Text bold>c</Text> configure models and reasoning for new threads
+        </Text>
+        <Text>
           <Text bold>v</Text> toggle activity details
         </Text>
         <Text>
-          <Text bold>q</Text> pause then quit; exits immediately when already stopped
+          <Text bold>q</Text> pause then quit; exits immediately when the controller is idle
         </Text>
         <Text>
           <Text bold>?</Text> close this help
@@ -208,6 +428,31 @@ export function RunView({ engine }: { engine: EpicEngine }) {
         <StageLine phase={state.phase} />
       </Box>
 
+      {showConfig ? (
+        <Box marginTop={1}>
+          <AgentConfig
+            initialSettings={state.agentSettings}
+            agentSessions={state.agentSessions}
+            fallbackModel={state.model}
+            fallbackReasoningEffort={state.reasoningEffort}
+            onApply={(settings) => {
+              try {
+                engine.configureFutureAgentSettings(settings);
+                setConfigError(null);
+                setShowConfig(false);
+              } catch (error) {
+                setConfigError(error instanceof Error ? error.message : String(error));
+              }
+            }}
+            onCancel={() => setShowConfig(false)}
+            onInterrupt={requestInterrupt}
+            onPause={requestPause}
+            onQuit={requestQuit}
+            error={configError}
+          />
+        </Box>
+      ) : null}
+
       <Box marginTop={1} gap={1} flexDirection={compact ? "column" : "row"}>
         <Box
           borderStyle="round"
@@ -225,27 +470,20 @@ export function RunView({ engine }: { engine: EpicEngine }) {
           </Text>
           <Text dimColor>{state.currentBeadId ?? "No task selected"}</Text>
           <Box marginTop={1} flexDirection="column">
-            <Text>
-              <Text dimColor>Coordinator </Text>
-              {shortId(state.orchestratorThreadId)}
-              <Text dimColor>
-                {` · ${state.agentSettings.orchestrator.model ?? state.model ?? "default"} · ${state.agentSettings.orchestrator.reasoningEffort}`}
-              </Text>
-            </Text>
-            <Text>
-              <Text dimColor>Implementer </Text>
-              {shortId(state.implementationThreadId)}
-              <Text dimColor>
-                {` · ${state.agentSettings.implementation.model ?? state.model ?? "default"} · ${state.agentSettings.implementation.reasoningEffort}`}
-              </Text>
-            </Text>
-            <Text>
-              <Text dimColor>Reviewer </Text>
-              {shortId(state.reviewThreadId)}
-              <Text dimColor>
-                {` · ${state.agentSettings.review.model ?? state.model ?? "default"} · ${state.agentSettings.review.reasoningEffort}`}
-              </Text>
-            </Text>
+            {configurableRoles.map(({ role, label }) => {
+              const session = state.agentSessions[role];
+              const sessionId = session.status === "inactive" ? null : session.sessionId;
+              const settings = displayedSettings(state, role);
+              return (
+                <Text key={role}>
+                  <Text dimColor>{label} </Text>
+                  {shortId(sessionId)}
+                  <Text dimColor>
+                    {` · ${settings.model ?? "default"} · ${settings.reasoningEffort} · ${sessionId ? "active" : "next"}`}
+                  </Text>
+                </Text>
+              );
+            })}
             <Text>
               <Text dimColor>Revision </Text>
               {shortId(state.candidateRevision)}
@@ -277,7 +515,7 @@ export function RunView({ engine }: { engine: EpicEngine }) {
         </Box>
       </Box>
 
-      {state.lastError ? (
+      {controllerError || state.lastError ? (
         <Box
           marginTop={1}
           borderStyle="round"
@@ -288,15 +526,17 @@ export function RunView({ engine }: { engine: EpicEngine }) {
           <Text bold color="red">
             NEEDS ATTENTION
           </Text>
-          <Text wrap="wrap">{state.lastError}</Text>
+          <Text wrap="wrap">{controllerError ?? state.lastError}</Text>
           <Text dimColor>
-            Resolve the cause, then press r to resume from {state.resumePhase ?? "selection"}.
+            {controllerError
+              ? "Inspect persisted status before retrying; this controller did not continue."
+              : `Resolve the cause, then press r to resume from ${state.resumePhase ?? "selection"}.`}
           </Text>
         </Box>
       ) : null}
 
       <Box marginTop={1} justifyContent="space-between">
-        <Text dimColor> p pause · v details · ? help · q pause & quit </Text>
+        <Text dimColor> p pause · c config · v details · ? help · q pause & quit </Text>
         <Text dimColor>run {shortId(state.runId, 8)}</Text>
       </Box>
     </Box>

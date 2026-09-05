@@ -16,8 +16,11 @@ function isDescendant(epicId: string, candidateId: string): boolean {
 export class BeadsClient {
   constructor(readonly repoPath: string) {}
 
-  private async listIssues(filters: readonly string[]): Promise<Issue[]> {
-    const value = await runJson("br", ["list", ...filters, "--limit", "0", "--json"], {
+  private async queryIssueList(
+    command: "list" | "ready" | "blocked",
+    args: readonly string[] = [],
+  ): Promise<Issue[]> {
+    const value = await runJson("br", [command, ...args, "--limit", "0", "--json"], {
       cwd: this.repoPath,
     });
     return parseIssueList(value);
@@ -32,11 +35,11 @@ export class BeadsClient {
   }
 
   async listAll(): Promise<Issue[]> {
-    return await this.listIssues(["--all"]);
+    return await this.queryIssueList("list", ["--all"]);
   }
 
   async listOpenEpics(): Promise<Issue[]> {
-    return await this.listIssues(["--status=open", "--type=epic"]);
+    return await this.queryIssueList("list", ["--status=open", "--type=epic"]);
   }
 
   async show(id: string): Promise<Issue> {
@@ -46,17 +49,11 @@ export class BeadsClient {
   }
 
   async ready(epicId?: string): Promise<Issue[]> {
-    const args = ["ready", "--limit", "0", "--json"];
-    if (epicId) args.splice(1, 0, "--epic", epicId);
-    const value = await runJson("br", args, { cwd: this.repoPath });
-    return parseIssueList(value);
+    return await this.queryIssueList("ready", epicId ? ["--epic", epicId] : []);
   }
 
   async blocked(): Promise<Issue[]> {
-    const value = await runJson("br", ["blocked", "--limit", "0", "--json"], {
-      cwd: this.repoPath,
-    });
-    return parseIssueList(value);
+    return await this.queryIssueList("blocked");
   }
 
   async triage(): Promise<unknown> {

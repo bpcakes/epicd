@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { HerdrRuntime } from "../src/adapters/herdr.js";
-import type { AgentSession } from "../src/adapters/runtime.js";
-import {
-  DEFAULT_AGENT_SETTINGS,
-  type AgentAccessMode,
-  type AgentSettings,
+import type { AgentSessionSpec, OpenedAgentSession } from "../src/adapters/runtime.js";
+import type {
+  AgentAccessMode,
+  AgentRoleSettings,
+  HerdrAgentSessionContract,
 } from "../src/domain/types.js";
 
 const AGENT_NAMESPACE = "0123456789abcdef0123";
@@ -96,28 +96,92 @@ if (args[0] === "tab" && args[1] === "create") {
 function createRuntime(
   setup: ReturnType<typeof fixture>,
   runId: string,
-  settings: AgentSettings = DEFAULT_AGENT_SETTINGS,
   accessMode: AgentAccessMode = "sandboxed",
 ): HerdrRuntime {
   return new HerdrRuntime({
     repoPath: setup.root,
     runId,
     agentNamespace: AGENT_NAMESPACE,
-    settings,
     herdrPath: setup.herdr,
     accessMode,
   });
 }
 
 describe("HerdrRuntime", () => {
+  it.each(["new", "existing"] as const)(
+    "rejects a foreign %s contract before returning a Herdr handle",
+    async (kind) => {
+      const runtime = createRuntime(fixture(), "foreign-contract");
+      const contract = {
+        runtime: "sdk" as const,
+        requested: { model: "gpt-explicit", reasoningEffort: "high" as const },
+        effective: { model: "gpt-explicit", reasoningEffort: "high" as const },
+      };
+      const spec: AgentSessionSpec<"sdk"> =
+        kind === "new"
+          ? { kind, contract }
+          : { kind, contract, sessionId: `ed-${AGENT_NAMESPACE}-r-existing` };
+      // @ts-expect-error Untyped callers must not produce contradictory runtime discriminants.
+      await expect(runtime.open("review", spec)).rejects.toThrow("runtime");
+    },
+  );
+
+  it("owns and freezes prepared settings independently of its caller", async () => {
+    const runtime = createRuntime(fixture(), "immutable-preparation");
+    const settings: AgentRoleSettings = { model: null, reasoningEffort: "high" };
+    const contract = await runtime.prepareNewSession("review", settings);
+    settings.model = "gpt-changed";
+    settings.reasoningEffort = "low";
+    expect(contract.requested).toEqual({ model: null, reasoningEffort: "high" });
+    expect(contract.effective).toEqual(contract.requested);
+    expect(Reflect.set(contract.effective, "model", "gpt-changed")).toBe(false);
+    expect(Reflect.set(contract.requested, "reasoningEffort", "low")).toBe(false);
+    expect(Reflect.set(contract, "runtime", "sdk")).toBe(false);
+  });
+
+  it.each(["new", "existing"] as const)(
+    "copies and freezes a supplied %s contract before opening",
+    async (kind) => {
+      const runtime = createRuntime(fixture(), "immutable-open");
+      const settings: AgentRoleSettings = { model: null, reasoningEffort: "high" };
+      const contract: HerdrAgentSessionContract = {
+        runtime: "herdr",
+        requested: settings,
+        effective: settings,
+      };
+      const opened = await runtime.open(
+        "review",
+        kind === "new"
+          ? { kind, contract }
+          : { kind, contract, sessionId: `ed-${AGENT_NAMESPACE}-r-existing` },
+      );
+      settings.model = "gpt-changed";
+      expect(opened.contract.effective.model).toBeNull();
+      expect(opened.contract.requested.model).toBeNull();
+      expect(Reflect.set(opened.contract.effective, "model", "gpt-changed")).toBe(false);
+      expect(Reflect.set(opened, "contract", contract)).toBe(false);
+    },
+  );
+
+  it("rejects a session opened by another runtime", async () => {
+    const setup = fixture();
+    const runtime = createRuntime(setup, "foreign-session-run");
+    const foreignSession = { runtime: "sdk" } as OpenedAgentSession;
+
+    // @ts-expect-error Exercise the runtime guard for untyped callers too.
+    await expect(runtime.run(foreignSession, "Review")).rejects.toThrow(
+      "Herdr runtime received a non-Herdr session",
+    );
+  });
+
   it("creates a visible Codex agent and resumes it through an opaque session id", async () => {
     const setup = fixture();
-    const runtime = createRuntime(setup, "12345678-run", {
-      ...DEFAULT_AGENT_SETTINGS,
-      implementation: { model: "gpt-test", reasoningEffort: "ultra" },
-    });
+    const runtime = createRuntime(setup, "12345678-run");
     const events: string[] = [];
-    const session = runtime.start("implementation");
+    const session = await runtime.open("implementation", {
+      kind: "new",
+      settings: { model: "gpt-live", reasoningEffort: "max" },
+    });
     const first = await runtime.run(session, "Do the task", {
       outputSchema: {
         type: "object",
@@ -132,8 +196,18 @@ describe("HerdrRuntime", () => {
     expect(first.sessionId).toMatch(/^ed-0123456789abcdef0123-i-/);
     expect(events).toEqual([first.sessionId]);
 
-    const resumed = runtime.resume(first.sessionId, "implementation");
-    const second = await runtime.run(resumed, "Continue", { outputSchema: { type: "object" } });
+    const resumed = await runtime.open("implementation", {
+      kind: "existing",
+      sessionId: first.sessionId,
+      contract: {
+        runtime: "herdr",
+        requested: { model: "gpt-live", reasoningEffort: "max" },
+        effective: { model: "gpt-live", reasoningEffort: "max" },
+      },
+    });
+    const second = await runtime.run(resumed, "Continue", {
+      outputSchema: { type: "object" },
+    });
     expect(second.sessionId).toBe(first.sessionId);
 
     const calls = readFileSync(setup.log, "utf8")
@@ -144,15 +218,58 @@ describe("HerdrRuntime", () => {
     expect(create).toContain("--no-focus");
     expect(create).toContain("w-test");
     const start = calls.find((args) => args[0] === "agent" && args[1] === "start");
-    expect(start).toContain("gpt-test");
-    expect(start).toContain('model_reasoning_effort="ultra"');
+    expect(start).toContain("gpt-live");
+    expect(start).toContain('model_reasoning_effort="max"');
+    expect(calls.filter((args) => args[0] === "agent" && args[1] === "start")).toHaveLength(1);
     expect(start).toContain("workspace-write");
     expect(calls.some((args) => args[0] === "agent" && args[1] === "get")).toBe(true);
   });
 
-  it("closes a completed session and all remaining run-owned tabs", async () => {
+  it("runs a prepared session through a replacement adapter instance", async () => {
+    const setup = fixture();
+    const firstRuntime = createRuntime(setup, "replacement-adapter-run");
+    const secondRuntime = createRuntime(setup, "replacement-adapter-run");
+    const opened = await firstRuntime.open("implementation", {
+      kind: "new",
+      settings: { model: "gpt-live", reasoningEffort: "high" },
+    });
+
+    const result = await secondRuntime.run(opened, "Do the task", {
+      outputSchema: { type: "object" },
+    });
+
+    expect(result.sessionId).toMatch(/^ed-0123456789abcdef0123-i-/);
+    const calls = readFileSync(setup.log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(calls.find((args) => args[0] === "agent" && args[1] === "start")).toContain("gpt-live");
+  });
+
+  it("delegates model selection to the Herdr-managed Codex agent", async () => {
+    const setup = fixture();
+    const runtime = createRuntime(setup, "delegated-model-run");
+
+    const opened = await runtime.open("review", {
+      kind: "new",
+      settings: { model: null, reasoningEffort: "xhigh" },
+    });
+    await runtime.run(opened, "Review", { outputSchema: { type: "object" } });
+
+    const calls = readFileSync(setup.log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const start = calls.find((args) => args[0] === "agent" && args[1] === "start");
+    expect(start).not.toContain("--model");
+    expect(start).toContain('model_reasoning_effort="xhigh"');
+  });
+
+  it("closes run-owned tabs through the Herdr server outside a managed pane", async () => {
     const setup = fixture();
     process.env.EPICD_HERDR_RUN_PREFIX = AGENT_NAMESPACE;
+    delete process.env.HERDR_ENV;
+    delete process.env.HERDR_WORKSPACE_ID;
     const runtime = createRuntime(setup, "cleanup1-run");
 
     await runtime.release(`ed-${AGENT_NAMESPACE}-i-complete`);
@@ -172,7 +289,11 @@ describe("HerdrRuntime", () => {
     process.env.EPICD_HERDR_MODE = "hang";
     const runtime = createRuntime(setup, "87654321-run");
     const controller = new AbortController();
-    const pending = runtime.run(runtime.start("review"), "Review", {
+    const opened = await runtime.open("review", {
+      kind: "new",
+      settings: { model: "gpt-test", reasoningEffort: "xhigh" },
+    });
+    const pending = runtime.run(opened, "Review", {
       outputSchema: { type: "object" },
       signal: controller.signal,
     });
@@ -191,16 +312,13 @@ describe("HerdrRuntime", () => {
 
   it("forwards the explicit dangerous full-access opt-in to Codex", async () => {
     const setup = fixture();
-    const runtime = createRuntime(
-      setup,
-      "full-access-run",
-      DEFAULT_AGENT_SETTINGS,
-      "danger-full-access",
-    );
+    const runtime = createRuntime(setup, "full-access-run", "danger-full-access");
 
-    await runtime.run(runtime.start("implementation"), "Run Docker", {
-      outputSchema: { type: "object" },
+    const opened = await runtime.open("implementation", {
+      kind: "new",
+      settings: { model: "gpt-test", reasoningEffort: "high" },
     });
+    await runtime.run(opened, "Run Docker", { outputSchema: { type: "object" } });
 
     const calls = readFileSync(setup.log, "utf8")
       .trim()
@@ -217,7 +335,11 @@ describe("HerdrRuntime", () => {
     process.env.EPICD_HERDR_MODE = "invalid-create";
     const runtime = createRuntime(setup, "invalid-envelope");
 
-    await expect(runtime.run(runtime.start("review"), "Review")).rejects.toThrow(
+    const opened = await runtime.open("review", {
+      kind: "new",
+      settings: { model: "gpt-test", reasoningEffort: "xhigh" },
+    });
+    await expect(runtime.run(opened, "Review")).rejects.toThrow(
       "Could not start Herdr review agent",
     );
   });
@@ -226,17 +348,11 @@ describe("HerdrRuntime", () => {
     const setup = fixture();
     delete process.env.HERDR_ENV;
     const runtime = createRuntime(setup, "outside-run");
-    await expect(runtime.run(runtime.start("orchestrator"), "Select")).rejects.toThrow(
-      "HERDR_ENV=1",
-    );
-  });
-
-  it("rejects sessions belonging to another runtime", async () => {
-    const setup = fixture();
-    const runtime = createRuntime(setup, "foreign-session");
-    const foreignSession: AgentSession = { runtime: "sdk", id: null, role: "review" };
-
-    await expect(runtime.run(foreignSession, "Review")).rejects.toThrow("non-Herdr session");
+    const opened = await runtime.open("orchestrator", {
+      kind: "new",
+      settings: { model: "gpt-test", reasoningEffort: "high" },
+    });
+    await expect(runtime.run(opened, "Select")).rejects.toThrow("HERDR_ENV=1");
   });
 
   it("refuses to release a session outside the run namespace", async () => {

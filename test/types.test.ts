@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  createInactiveAgentSessions,
+  AgentSessionContractSchema,
   ImplementationResultSchema,
   IMPLEMENTATION_OUTPUT_SCHEMA,
   IssueSchema,
   ReviewResultSchema,
   REVIEW_OUTPUT_SCHEMA,
+  runAgentSessionId,
+  runRecoveryKind,
+  runNeedsResume,
   SELECTION_OUTPUT_SCHEMA,
   TestExecutionSchema,
 } from "../src/domain/types.js";
@@ -14,6 +19,75 @@ const passedTest = {
   outcome: "passed" as const,
   detail: "all tests passed",
 };
+
+describe("persisted session contracts", () => {
+  it.each(["sdk", "herdr"])(
+    "freezes decoded %s contracts without changing their JSON shape",
+    (runtime) => {
+      const input = {
+        runtime,
+        requested: { model: null, reasoningEffort: "high" },
+        effective: { model: "gpt-pinned", reasoningEffort: "high" },
+      };
+      const decoded = AgentSessionContractSchema.parse(JSON.parse(JSON.stringify(input)));
+      expect(Reflect.set(decoded, "runtime", "changed")).toBe(false);
+      expect(Reflect.set(decoded.requested, "model", "changed")).toBe(false);
+      expect(Reflect.set(decoded.effective, "model", "changed")).toBe(false);
+      expect(JSON.stringify(decoded)).toBe(JSON.stringify(input));
+    },
+  );
+});
+
+describe("run recovery classification", () => {
+  it("distinguishes diagnostics, resource cleanup, workflow, and completed work", () => {
+    const state = {
+      phase: "complete" as const,
+      agentSessions: createInactiveAgentSessions(),
+      pendingAgentCleanup: [],
+      lastError: null as string | null,
+    };
+    expect(runRecoveryKind(state)).toBeNull();
+    expect(runNeedsResume(state)).toBe(false);
+    state.lastError = "Saved diagnostic";
+    expect(runRecoveryKind(state)).toBe("diagnostic");
+    expect(runNeedsResume(state)).toBe(true);
+    expect(
+      runRecoveryKind({ ...state, pendingAgentCleanup: [{ kind: "run", runtime: "herdr" }] }),
+    ).toBe("cleanup");
+    state.agentSessions.review = {
+      status: "unresolved",
+      sessionId: "review",
+      settings: { model: null, reasoningEffort: "high" },
+    };
+    expect(runRecoveryKind(state)).toBe("cleanup");
+    expect(runRecoveryKind({ ...state, phase: "paused" })).toBe("workflow");
+  });
+});
+
+describe("agent session identity", () => {
+  it("exposes IDs for active and unresolved sessions but not inactive sessions", () => {
+    const agentSessions = createInactiveAgentSessions();
+    expect(runAgentSessionId({ agentSessions }, "review")).toBeNull();
+
+    agentSessions.review = {
+      status: "unresolved",
+      sessionId: "unresolved-review",
+      settings: { model: null, reasoningEffort: "xhigh" },
+    };
+    expect(runAgentSessionId({ agentSessions }, "review")).toBe("unresolved-review");
+
+    agentSessions.review = {
+      status: "active",
+      sessionId: "active-review",
+      contract: {
+        runtime: "sdk",
+        requested: { model: "gpt-review", reasoningEffort: "xhigh" },
+        effective: { model: "gpt-review", reasoningEffort: "xhigh" },
+      },
+    };
+    expect(runAgentSessionId({ agentSessions }, "review")).toBe("active-review");
+  });
+});
 
 describe("agent result schemas", () => {
   it("uses the same test-execution contract for implementation and review results", () => {

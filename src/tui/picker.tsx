@@ -1,11 +1,16 @@
 import { useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
-import type { Issue, RunState } from "../domain/types.js";
+import { runNeedsResume, runRecoveryKind, type Issue, type RunState } from "../domain/types.js";
 
 export type PickerItem = {
   epic: Issue;
   run: RunState | null;
+  unavailableReason: string | null;
 };
+
+export function canSelectPickerItem(item: Pick<PickerItem, "unavailableReason">): boolean {
+  return item.unavailableReason === null;
+}
 
 export function EpicPicker({
   items,
@@ -36,7 +41,7 @@ export function EpicPicker({
 
   useInput((input, key) => {
     if (confirm) {
-      if (key.return || input === "y") onSelect(confirm);
+      if (canSelectPickerItem(confirm) && (key.return || input === "y")) onSelect(confirm);
       else if (key.escape || input === "n" || input === "b") setConfirm(null);
       else if (input === "q") exit();
     } else if (searching) {
@@ -59,7 +64,26 @@ export function EpicPicker({
   });
 
   if (confirm) {
-    const resuming = Boolean(confirm.run && confirm.run.phase !== "complete");
+    if (confirm.unavailableReason) {
+      return (
+        <Box flexDirection="column">
+          <Box borderStyle="round" borderColor="red" paddingX={1} flexDirection="column">
+            <Text bold color="red">
+              RUN UNAVAILABLE
+            </Text>
+            <Box marginTop={1} flexDirection="column">
+              <Text bold>{confirm.epic.title}</Text>
+              <Text dimColor>{confirm.epic.id}</Text>
+              <Text>{confirm.unavailableReason}</Text>
+            </Box>
+          </Box>
+          <Box marginTop={1}>
+            <Text dimColor> esc/n/b back · q quit </Text>
+          </Box>
+        </Box>
+      );
+    }
+    const resuming = Boolean(confirm.run && runNeedsResume(confirm.run));
     return (
       <Box flexDirection="column">
         <Box borderStyle="round" borderColor="cyan" paddingX={1} flexDirection="column">
@@ -72,10 +96,18 @@ export function EpicPicker({
           </Box>
           {resuming ? (
             <Box marginTop={1}>
-              <Text>
-                Continue the existing <Text color="yellow">{confirm.run?.phase}</Text> run from its
-                persisted phase.
-              </Text>
+              {confirm.run?.phase === "complete" ? (
+                <Text>
+                  {runRecoveryKind(confirm.run) === "diagnostic"
+                    ? "Clear the existing run's saved diagnostic; no agent cleanup remains."
+                    : "Finish the existing run's pending agent cleanup."}
+                </Text>
+              ) : (
+                <Text>
+                  Continue the existing <Text color="yellow">{confirm.run?.phase}</Text> run from
+                  its persisted phase.
+                </Text>
+              )}
             </Box>
           ) : (
             <Box marginTop={1} flexDirection="column">
@@ -109,9 +141,14 @@ export function EpicPicker({
         {filtered.slice(Math.max(0, safeSelected - 6), safeSelected + 7).map((item) => {
           const index = filtered.indexOf(item);
           const active = index === safeSelected;
-          const runLabel =
-            item.run && item.run.phase !== "complete"
-              ? ` · ${item.run.phase.replaceAll("_", " ")}`
+          const runLabel = item.unavailableReason
+            ? " · invalid saved run"
+            : item.run && runNeedsResume(item.run)
+              ? item.run.phase === "complete"
+                ? runRecoveryKind(item.run) === "diagnostic"
+                  ? " · needs attention"
+                  : " · cleanup pending"
+                : ` · ${item.run.phase.replaceAll("_", " ")}`
               : "";
           return (
             <Box key={item.epic.id}>
@@ -120,7 +157,11 @@ export function EpicPicker({
                 bold={active}
                 inverse={active}
               >{` P${item.epic.priority} ${item.epic.title} `}</Text>
-              <Text color={item.run?.phase === "blocked" ? "red" : "gray"}>{runLabel}</Text>
+              <Text
+                color={item.unavailableReason || item.run?.phase === "blocked" ? "red" : "gray"}
+              >
+                {runLabel}
+              </Text>
             </Box>
           );
         })}

@@ -3,50 +3,112 @@ import type {
   AgentRole,
   AgentRuntime,
   AgentRuntimeBaseOptions,
-  AgentSession,
+  AgentSessionSpec,
+  OpenedAgentSession,
   RunTurnOptions,
-  RuntimeAgentSettings,
   RuntimeEvent,
   SdkAgentSession,
   TurnExecution,
 } from "./runtime.js";
+import {
+  AgentRoleSettingsSchema,
+  SdkAgentSessionContractSchema,
+  type AgentRoleSettings,
+  type ResolvedAgentRoleSettings,
+  type SdkAgentSessionContract,
+} from "../domain/types.js";
+import {
+  codexProcessEnvironment,
+  resolveCodexExecutable,
+  resolveCodexModel,
+} from "./codex-settings.js";
 
 export type CodexRuntimeOptions = AgentRuntimeBaseOptions & {
   codexPath?: string | undefined;
 };
 
-export class CodexRuntime implements AgentRuntime {
-  private readonly codex: Codex;
+export class CodexRuntime implements AgentRuntime<"sdk"> {
+  readonly kind = "sdk";
   private readonly threads = new WeakMap<SdkAgentSession, Thread>();
 
   private readonly repoPath: string;
-  private readonly settings: RuntimeAgentSettings;
+  private readonly codexPath: string | undefined;
   private readonly accessMode: CodexRuntimeOptions["accessMode"];
 
   constructor(options: CodexRuntimeOptions) {
     this.repoPath = options.repoPath;
-    this.settings = options.settings;
+    this.codexPath = options.codexPath;
     this.accessMode = options.accessMode;
-    this.codex = new Codex(
-      options.codexPath ? { codexPathOverride: options.codexPath } : undefined,
-    );
   }
 
-  start(role: AgentRole): SdkAgentSession {
-    const session: SdkAgentSession = { runtime: "sdk", id: null, role };
-    this.threads.set(session, this.codex.startThread(this.threadOptions(role)));
-    return session;
+  private createClient(): Codex {
+    if (this.codexPath === undefined) return new Codex();
+    const executable = resolveCodexExecutable(this.codexPath);
+    return new Codex({
+      codexPathOverride: executable.executablePath,
+      env: codexProcessEnvironment(),
+    });
   }
 
-  resume(threadId: string, role: AgentRole): SdkAgentSession {
-    const session: SdkAgentSession = { runtime: "sdk", id: threadId, role };
-    this.threads.set(session, this.codex.resumeThread(threadId, this.threadOptions(role)));
-    return session;
+  private async resolveDefaultModel(signal?: AbortSignal): Promise<string> {
+    return await resolveCodexModel(this.repoPath, {
+      executable: resolveCodexExecutable(this.codexPath),
+      ...(signal ? { signal } : {}),
+    });
   }
 
-  private threadOptions(role: AgentRole): ThreadOptions {
-    const settings = this.settings[role];
-    const common: ThreadOptions = {
+  async prepareNewSession(
+    _role: AgentRole,
+    settings: AgentRoleSettings,
+    previous?: SdkAgentSessionContract,
+    signal?: AbortSignal,
+  ): Promise<SdkAgentSessionContract> {
+    // Own the requested values before model discovery yields to caller code.
+    const requested = AgentRoleSettingsSchema.parse(settings);
+    const cachedDefault =
+      requested.model === null && previous?.requested.model === null
+        ? previous.effective.model
+        : null;
+    const model = requested.model ?? cachedDefault ?? (await this.resolveDefaultModel(signal));
+    return SdkAgentSessionContractSchema.parse({
+      runtime: "sdk",
+      requested,
+      effective: { ...requested, model },
+    });
+  }
+
+  async open(
+    role: AgentRole,
+    spec: AgentSessionSpec<"sdk">,
+    signal?: AbortSignal,
+  ): Promise<OpenedAgentSession<"sdk">> {
+    const session: SdkAgentSession = {
+      runtime: "sdk",
+      id: spec.kind === "existing" ? spec.sessionId : null,
+      role,
+    };
+    const contract =
+      spec.kind === "new" && "settings" in spec
+        ? await this.prepareNewSession(role, spec.settings, undefined, signal)
+        : SdkAgentSessionContractSchema.parse(spec.contract);
+    const options = this.threadOptions(role, contract.effective);
+    const codex = this.createClient();
+    const thread =
+      spec.kind === "existing"
+        ? codex.resumeThread(spec.sessionId, options)
+        : codex.startThread(options);
+    this.threads.set(session, thread);
+    return Object.freeze({
+      runtime: "sdk",
+      session,
+      contract,
+    });
+  }
+
+  private threadOptions(role: AgentRole, settings: ResolvedAgentRoleSettings): ThreadOptions {
+    return {
+      model: settings.model,
+      modelReasoningEffort: settings.reasoningEffort,
       workingDirectory: this.repoPath,
       approvalPolicy: "never",
       sandboxMode:
@@ -55,21 +117,20 @@ export class CodexRuntime implements AgentRuntime {
           : role === "orchestrator"
             ? "read-only"
             : "workspace-write",
-      modelReasoningEffort: settings.reasoningEffort,
       threadSource: `epicd-${role}`,
       networkAccessEnabled: this.accessMode === "danger-full-access",
     };
-    if (settings.model) common.model = settings.model;
-    return common;
   }
 
   async run(
-    session: AgentSession,
+    opened: OpenedAgentSession<"sdk">,
     prompt: string,
     options: RunTurnOptions = {},
   ): Promise<TurnExecution> {
-    if (session.runtime !== "sdk") throw new Error("Codex runtime received a non-SDK session");
-    const thread = this.threads.get(session);
+    if (opened.runtime !== "sdk") {
+      throw new Error("Codex runtime received a non-SDK session");
+    }
+    const thread = this.threads.get(opened.session);
     if (!thread) throw new Error("Codex runtime received a session it did not create");
     const turnOptions: { outputSchema?: unknown; signal?: AbortSignal } = {};
     if (options.outputSchema !== undefined) turnOptions.outputSchema = options.outputSchema;

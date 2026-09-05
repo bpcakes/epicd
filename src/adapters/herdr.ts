@@ -7,13 +7,18 @@ import type {
   AgentRole,
   AgentRuntime,
   AgentRuntimeBaseOptions,
-  AgentSession,
+  AgentSessionSpec,
   HerdrAgentId,
   HerdrAgentSession,
+  OpenedAgentSession,
   RunTurnOptions,
-  RuntimeAgentSettings,
   TurnExecution,
 } from "./runtime.js";
+import {
+  HerdrAgentSessionContractSchema,
+  type AgentRoleSettings,
+  type HerdrAgentSessionContract,
+} from "../domain/types.js";
 import { CommandError, runCommand, runJson } from "../util/command.js";
 import { redactSensitiveText } from "../util/redact.js";
 
@@ -46,12 +51,12 @@ export type HerdrRuntimeOptions = AgentRuntimeBaseOptions & {
   legacyAgentIds?: readonly string[] | undefined;
 };
 
-export class HerdrRuntime implements AgentRuntime {
+export class HerdrRuntime implements AgentRuntime<"herdr"> {
+  readonly kind = "herdr";
   private readonly resultRoot: string;
   private readonly repoPath: string;
   private readonly runId: string;
   private readonly agentNamespace: string;
-  private readonly settings: RuntimeAgentSettings;
   private readonly herdrPath: string;
   private readonly accessMode: HerdrRuntimeOptions["accessMode"];
   private readonly legacyAgentIds: ReadonlySet<string>;
@@ -60,7 +65,6 @@ export class HerdrRuntime implements AgentRuntime {
     this.repoPath = options.repoPath;
     this.runId = options.runId;
     this.agentNamespace = options.agentNamespace;
-    this.settings = options.settings;
     this.herdrPath = options.herdrPath ?? "herdr";
     this.accessMode = options.accessMode;
     this.legacyAgentIds = new Set(options.legacyAgentIds ?? []);
@@ -68,31 +72,49 @@ export class HerdrRuntime implements AgentRuntime {
     this.resultRoot = join(stateRoot, "epicd", "herdr", safeName(options.runId));
   }
 
-  start(role: AgentRole): HerdrAgentSession {
-    return { runtime: "herdr", id: null, role };
+  async prepareNewSession(
+    _role: AgentRole,
+    settings: AgentRoleSettings,
+  ): Promise<HerdrAgentSessionContract> {
+    return HerdrAgentSessionContractSchema.parse({
+      runtime: "herdr",
+      requested: settings,
+      effective: settings,
+    });
   }
 
-  resume(sessionId: string, role: AgentRole): HerdrAgentSession {
-    return {
+  async open(
+    role: AgentRole,
+    spec: AgentSessionSpec<"herdr">,
+  ): Promise<OpenedAgentSession<"herdr">> {
+    const session: HerdrAgentSession = {
       runtime: "herdr",
-      id: this.ownedAgentId(sessionId),
+      id: spec.kind === "existing" ? this.ownedAgentId(spec.sessionId) : null,
       role,
     };
+    const contract =
+      spec.kind === "new" && "settings" in spec
+        ? await this.prepareNewSession(role, spec.settings)
+        : HerdrAgentSessionContractSchema.parse(spec.contract);
+    return Object.freeze({ runtime: "herdr", session, contract });
   }
 
   async run(
-    session: AgentSession,
+    opened: OpenedAgentSession<"herdr">,
     prompt: string,
     options: RunTurnOptions = {},
   ): Promise<TurnExecution> {
-    if (session.runtime !== "herdr") throw new Error("Herdr runtime received a non-Herdr session");
+    if (opened.runtime !== "herdr") {
+      throw new Error("Herdr runtime received a non-Herdr session");
+    }
+    const session = opened.session;
     this.assertEnvironment();
     await mkdir(this.resultRoot, { recursive: true, mode: 0o700 });
 
     let agentName = session.id;
     if (agentName) await this.assertAgentAvailable(agentName, options.signal);
     else {
-      agentName = await this.createAgent(session.role);
+      agentName = await this.createAgent(session.role, opened.contract.effective);
       session.id = agentName;
       options.onEvent?.({ type: "session.started", sessionId: agentName });
     }
@@ -138,7 +160,6 @@ export class HerdrRuntime implements AgentRuntime {
   }
 
   async release(sessionId: string): Promise<void> {
-    this.assertEnvironment();
     const agentName = this.ownedAgentId(sessionId);
     const listed = await runJson(
       this.herdrPath,
@@ -151,7 +172,6 @@ export class HerdrRuntime implements AgentRuntime {
   }
 
   async releaseAll(): Promise<void> {
-    this.assertEnvironment();
     const prefix = this.agentPrefix();
     const listed = await runJson(
       this.herdrPath,
@@ -217,11 +237,10 @@ export class HerdrRuntime implements AgentRuntime {
     }
   }
 
-  private async createAgent(role: AgentRole): Promise<HerdrAgentId> {
+  private async createAgent(role: AgentRole, settings: AgentRoleSettings): Promise<HerdrAgentId> {
     const workspaceId = process.env.HERDR_WORKSPACE_ID;
     if (!workspaceId) throw new Error("Herdr did not provide HERDR_WORKSPACE_ID");
     const agentName = this.agentName(role);
-    const settings = this.settings[role];
     let paneId: string | undefined;
     try {
       const created = await runJson(
