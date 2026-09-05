@@ -14,6 +14,7 @@ import type {
 } from "../adapters/runtime.js";
 import { StateStore, type RunLease } from "../adapters/store.js";
 import { redactSensitiveText } from "../util/redact.js";
+import { compareIssuesDeepestFirst, isIssueDescendant } from "../domain/issue-hierarchy.js";
 import {
   IMPLEMENTATION_OUTPUT_SCHEMA,
   ImplementationResultSchema,
@@ -1530,12 +1531,10 @@ export class EpicEngine {
         (issue) =>
           issue.issue_type === "epic" && issue.status !== "closed" && issue.status !== "tombstone",
       )
-      .sort((a, b) => b.id.split(".").length - a.id.split(".").length);
+      .sort(compareIssuesDeepestFirst);
     let changed = false;
     for (const container of containers) {
-      const descendants = snapshot.issues.filter((issue) =>
-        issue.id.startsWith(`${container.id}.`),
-      );
+      const descendants = snapshot.issues.filter((issue) => isIssueDescendant(issue, container));
       if (
         descendants.length > 0 &&
         descendants.every((issue) => issue.status === "closed" || issue.status === "tombstone")

@@ -88,6 +88,14 @@ describe.sequential("BeadsClient claim gate", () => {
     expect(commands[2]).not.toContain("--force");
   });
 
+  it.each(["epi", "epic.1"])("refuses a non-descendant claim under %s", async (epicId) => {
+    const fixture = installFakeBr();
+    await expect(new BeadsClient(fixture.root).claim(epicId, "epic.1", "run-1")).rejects.toThrow(
+      "not a descendant",
+    );
+    expect(readFileSync(fixture.log, "utf8")).not.toContain("update ");
+  });
+
   it("atomically adopts unassigned in-progress work", async () => {
     const fixture = installFakeBr();
     process.env.EPICD_TEST_STATUS = "in_progress";

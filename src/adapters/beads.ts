@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { IssueSchema, type EpicSnapshot, type Issue } from "../domain/types.js";
+import { isIssueDescendant } from "../domain/issue-hierarchy.js";
 import { runCommand, runJson } from "../util/command.js";
 
 const IssueListSchema = z.union([z.array(IssueSchema), z.object({ issues: z.array(IssueSchema) })]);
@@ -7,10 +8,6 @@ const IssueListSchema = z.union([z.array(IssueSchema), z.object({ issues: z.arra
 function parseIssueList(value: unknown): Issue[] {
   const parsed = IssueListSchema.parse(value);
   return Array.isArray(parsed) ? parsed : parsed.issues;
-}
-
-function isDescendant(epicId: string, candidateId: string): boolean {
-  return candidateId.startsWith(`${epicId}.`);
 }
 
 export class BeadsClient {
@@ -82,15 +79,16 @@ export class BeadsClient {
     ]);
     if (epic.issue_type !== "epic")
       throw new Error(`${epicId} is a ${epic.issue_type}, not an epic`);
-    const issues = allIssues.filter((issue) => isDescendant(epicId, issue.id));
+    const ancestor = { id: epicId };
+    const issues = allIssues.filter((issue) => isIssueDescendant(issue, ancestor));
     return {
       epic,
       issues,
       openIssues: issues.filter(
         (issue) => issue.status !== "closed" && issue.status !== "tombstone",
       ),
-      readyIssues: readyIssues.filter((issue) => isDescendant(epicId, issue.id)),
-      blockedIssues: blockedIssues.filter((issue) => isDescendant(epicId, issue.id)),
+      readyIssues: readyIssues.filter((issue) => isIssueDescendant(issue, ancestor)),
+      blockedIssues: blockedIssues.filter((issue) => isIssueDescendant(issue, ancestor)),
       triage,
       plan,
       graph,
@@ -108,7 +106,7 @@ export class BeadsClient {
       throw new Error(`${candidateId} is absent from the immediately preceding br ready result`);
 
     const issue = await this.show(candidateId);
-    if (!isDescendant(epicId, issue.id))
+    if (!isIssueDescendant(issue, { id: epicId }))
       throw new Error(`${candidateId} is not a descendant of ${epicId}`);
     if (issue.issue_type === "epic")
       throw new Error(`${candidateId} is an epic container and cannot be claimed`);
@@ -126,7 +124,7 @@ export class BeadsClient {
    */
   async adoptUnownedInProgress(epicId: string, candidateId: string, runId: string): Promise<Issue> {
     const issue = await this.show(candidateId);
-    if (!isDescendant(epicId, issue.id))
+    if (!isIssueDescendant(issue, { id: epicId }))
       throw new Error(`${candidateId} is not a descendant of ${epicId}`);
     if (issue.issue_type === "epic")
       throw new Error(`${candidateId} is an epic container and cannot be adopted`);

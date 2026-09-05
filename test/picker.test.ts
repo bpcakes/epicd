@@ -8,6 +8,36 @@ import { IssueSchema, RunStateSchema } from "../src/domain/types.js";
 afterEach(cleanup);
 
 describe("epic picker selection", () => {
+  it("toggles nested epics without hiding roots that merely share a prefix", async () => {
+    const items = [
+      ["epic.1", "First root"],
+      ["epic.1.child", "Nested child"],
+      ["epic.1.child.deep", "Deep child"],
+      ["epic.10", "Similar prefix root"],
+    ].map(([id, title]) => ({
+      epic: IssueSchema.parse({ id, title, issue_type: "epic", status: "open" }),
+      run: null,
+      unavailableReason: null,
+    }));
+    const view = render(createElement(EpicPicker, { items, onSelect: vi.fn() }));
+    await setImmediate();
+    expect(view.lastFrame()).toContain("First root");
+    expect(view.lastFrame()).toContain("Similar prefix root");
+    expect(view.lastFrame()).not.toContain("Nested child");
+    expect(view.lastFrame()).not.toContain("Deep child");
+
+    view.stdin.write("a");
+    await setImmediate();
+    expect(view.lastFrame()).toContain("Nested child");
+    expect(view.lastFrame()).toContain("Deep child");
+
+    view.stdin.write("a");
+    await setImmediate();
+    expect(view.lastFrame()).toContain("First root");
+    expect(view.lastFrame()).toContain("Similar prefix root");
+    expect(view.lastFrame()).not.toContain("Nested child");
+  });
+
   it("allows valid runs and blocks invalid persisted runs", () => {
     expect(canSelectPickerItem({ unavailableReason: null })).toBe(true);
     expect(canSelectPickerItem({ unavailableReason: "invalid persisted state" })).toBe(false);

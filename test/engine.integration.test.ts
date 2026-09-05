@@ -1204,6 +1204,66 @@ describe.sequential("EpicEngine workflow", () => {
     setup.store.close();
   }, 30_000);
 
+  it("closes satisfied containers deepest first without consuming similarly prefixed work", async () => {
+    const setup = await fixture();
+    try {
+      const statePath = join(setup.repo, ".beads", "state.json");
+      const tracker = JSON.parse(readFileSync(statePath, "utf8")) as {
+        issues: Array<Record<string, unknown>>;
+      };
+      const root = tracker.issues[0]!;
+      tracker.issues = [
+        root,
+        { ...root, id: "demo.1", title: "Parent container" },
+        { ...root, id: "demo.1.2", title: "Child container" },
+        { ...root, id: "demo.1.2.1", issue_type: "task", status: "closed" },
+        { ...root, id: "demo.1.3", issue_type: "task", status: "tombstone" },
+        { ...root, id: "demo.3", title: "Empty container" },
+        {
+          ...root,
+          id: "demo.10",
+          issue_type: "task",
+          status: "in_progress",
+          assignee: "other-agent",
+        },
+      ];
+      writeFileSync(statePath, JSON.stringify(tracker, null, 2));
+      writeFileSync(
+        join(setup.repo, ".beads", "issues.jsonl"),
+        tracker.issues.map((issue) => JSON.stringify(issue)).join("\n") + "\n",
+      );
+      await runCommand("git", ["add", ".beads"], { cwd: setup.repo });
+      await runCommand("git", ["commit", "-qm", "seed nested containers"], { cwd: setup.repo });
+      const engine = await EpicEngine.create(
+        { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+        setup.store,
+      );
+
+      const result = await engine.run();
+
+      expect(result.phase).toBe("blocked");
+      expect(result.lastError).toContain("demo.10 (other-agent)");
+      expect(
+        engine
+          .recentEvents()
+          .filter((event) => event.kind === "beads.container_closed")
+          .map((event) => event.message),
+      ).toEqual(["Closed completed container demo.1.2", "Closed completed container demo.1"]);
+      const persisted = JSON.parse(readFileSync(statePath, "utf8")) as typeof tracker;
+      expect(persisted.issues.map((issue) => [issue.id, issue.status])).toEqual([
+        ["demo", "open"],
+        ["demo.1", "closed"],
+        ["demo.1.2", "closed"],
+        ["demo.1.2.1", "closed"],
+        ["demo.1.3", "tombstone"],
+        ["demo.3", "open"],
+        ["demo.10", "in_progress"],
+      ]);
+    } finally {
+      setup.store.close();
+    }
+  }, 30_000);
+
   it("delivers through Herdr and treats tab cleanup failures as warnings", async () => {
     const setup = await fixture();
     process.env.HERDR_ENV = "1";

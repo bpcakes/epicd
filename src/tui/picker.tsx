@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import { runNeedsResume, runRecoveryKind, type Issue, type RunState } from "../domain/types.js";
+import { isIssueDescendant } from "../domain/issue-hierarchy.js";
 
 export type PickerItem = {
   epic: Issue;
@@ -26,12 +27,7 @@ export function EpicPicker({
   const [confirm, setConfirm] = useState<PickerItem | null>(null);
   const [showNested, setShowNested] = useState(false);
   const roots = items.filter(
-    (item) =>
-      !items.some(
-        (possibleParent) =>
-          possibleParent.epic.id !== item.epic.id &&
-          item.epic.id.startsWith(`${possibleParent.epic.id}.`),
-      ),
+    (item) => !items.some((possibleParent) => isIssueDescendant(item.epic, possibleParent.epic)),
   );
   const visibleItems = showNested ? items : roots;
   const filtered = visibleItems.filter((item) =>
