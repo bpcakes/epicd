@@ -975,6 +975,49 @@ describe.sequential("EpicEngine workflow", () => {
     setup.store.close();
   }, 30_000);
 
+  it.each(["selecting", "claiming"] as const)(
+    "recovers this run's existing claim from %s without claiming or adopting again",
+    async (phase) => {
+      const setup = await fixture();
+      try {
+        const created = await EpicEngine.create(
+          { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
+          setup.store,
+        );
+        const saved = created.snapshot();
+        await seedTaskOwnership(setup.repo, "in_progress", `epicd:${saved.runId}`);
+        if (phase === "claiming") {
+          saved.phase = "claiming";
+          saved.currentBeadId = "demo.1";
+          saved.currentBeadTitle = "Add the feature";
+          saved.baseRevision = await new GitClient(setup.repo).head();
+          setup.store.save(saved);
+        }
+        const engine = EpicEngine.resume(saved.runId, { codexPath: setup.codex }, setup.store);
+
+        const result = await engine.run();
+
+        expect(result.phase, result.lastError ?? undefined).toBe("complete");
+        const kinds = engine.recentEvents().map((event) => event.kind);
+        expect(kinds).toContain("beads.claim_recovered");
+        expect(kinds).not.toContain("beads.claim_gate");
+        expect(kinds).not.toContain("beads.claim_reconciling");
+        const tracker = JSON.parse(
+          readFileSync(join(setup.repo, ".beads", "state.json"), "utf8"),
+        ) as {
+          issues: Array<{ id: string; status: string; assignee?: string }>;
+        };
+        expect(tracker.issues.find((issue) => issue.id === "demo.1")).toMatchObject({
+          status: "closed",
+          assignee: `epicd:${saved.runId}`,
+        });
+      } finally {
+        setup.store.close();
+      }
+    },
+    30_000,
+  );
+
   it("reports a one-time rotation of an unverifiable legacy SDK session", async () => {
     const setup = await fixture();
     const created = await EpicEngine.create(

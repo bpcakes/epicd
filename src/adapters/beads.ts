@@ -5,6 +5,12 @@ import { runCommand, runJson } from "../util/command.js";
 
 const IssueListSchema = z.union([z.array(IssueSchema), z.object({ issues: z.array(IssueSchema) })]);
 
+export type IssueOwnership = { kind: "unassigned" } | { kind: "this-run" | "other"; owner: string };
+
+function actorForRun(runId: string): string {
+  return `epicd:${runId}`;
+}
+
 function parseIssueList(value: unknown): Issue[] {
   const parsed = IssueListSchema.parse(value);
   return Array.isArray(parsed) ? parsed : parsed.issues;
@@ -12,6 +18,13 @@ function parseIssueList(value: unknown): Issue[] {
 
 export class BeadsClient {
   constructor(readonly repoPath: string) {}
+
+  /** Interprets tracker assignees; callers own the resulting workflow decision. */
+  classifyOwnership(issue: Pick<Issue, "assignee">, runId: string): IssueOwnership {
+    const owner = typeof issue.assignee === "string" ? issue.assignee.trim() : "";
+    if (!owner) return { kind: "unassigned" };
+    return { kind: owner === actorForRun(runId) ? "this-run" : "other", owner };
+  }
 
   private async queryIssueList(
     command: "list" | "ready" | "blocked",
@@ -128,10 +141,10 @@ export class BeadsClient {
       throw new Error(`${candidateId} is not a descendant of ${epicId}`);
     if (issue.issue_type === "epic")
       throw new Error(`${candidateId} is an epic container and cannot be adopted`);
-    const assignee = typeof issue.assignee === "string" ? issue.assignee.trim() : "";
-    if (issue.status !== "in_progress" || assignee) {
+    const ownership = this.classifyOwnership(issue, runId);
+    if (issue.status !== "in_progress" || ownership.kind !== "unassigned") {
       throw new Error(
-        `${candidateId} is not unowned in-progress work (status ${issue.status}, owner ${assignee || "none"})`,
+        `${candidateId} is not unowned in-progress work (status ${issue.status}, owner ${ownership.kind === "unassigned" ? "none" : ownership.owner})`,
       );
     }
 
@@ -147,7 +160,7 @@ export class BeadsClient {
         candidateId,
         "--claim",
         "--actor",
-        `epicd:${runId}`,
+        actorForRun(runId),
         "--agent-name",
         "epicd",
         "--harness",

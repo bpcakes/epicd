@@ -40,12 +40,13 @@ if (["list", "ready", "blocked"].includes(cmd) && process.env.EPICD_TEST_QUERY_R
   process.exit(0);
 }
 const type = process.env.EPICD_TEST_TYPE || "task";
-const issue = {id:"epic.1",title:"Concrete work",description:"Implement it",acceptance_criteria:"It works",status:process.env.EPICD_TEST_STATUS || "open",priority:1,issue_type:type,labels:[],assignee:process.env.EPICD_TEST_ASSIGNEE || null};
+const claimedPath = process.env.EPICD_TEST_LOG + ".claim.json";
+const issue = fs.existsSync(claimedPath) ? JSON.parse(fs.readFileSync(claimedPath, "utf8")) : {id:"epic.1",title:"Concrete work",description:"Implement it",acceptance_criteria:"It works",status:process.env.EPICD_TEST_STATUS || "open",priority:1,issue_type:type,labels:[],assignee:process.env.EPICD_TEST_ASSIGNEE || null};
 if (cmd === "ready") console.log(JSON.stringify(process.env.EPICD_TEST_NOT_READY ? [] : [issue]));
 else if (cmd === "blocked") console.log(JSON.stringify([]));
 else if (cmd === "list") console.log(JSON.stringify(process.env.EPICD_TEST_MALFORMED_LIST ? {} : {issues:[issue]}));
 else if (cmd === "show") console.log(JSON.stringify(issue));
-else if (cmd === "update") { const actorIndex = process.argv.indexOf("--actor"); console.log(JSON.stringify({...issue,status:"in_progress",assignee:actorIndex >= 0 ? process.argv[actorIndex + 1] : issue.assignee})); }
+else if (cmd === "update") { const actorIndex = process.argv.indexOf("--actor"); const claimed = {...issue,status:"in_progress",assignee:actorIndex >= 0 ? process.argv[actorIndex + 1] : issue.assignee}; fs.writeFileSync(claimedPath, JSON.stringify(claimed)); console.log(JSON.stringify(claimed)); }
 else if (cmd === "--version") console.log("br test");
 else console.log("{}");
 `,
@@ -57,6 +58,29 @@ else console.log("{}");
 }
 
 describe.sequential("BeadsClient claim gate", () => {
+  it.each(["claim", "adoptUnownedInProgress"] as const)(
+    "recognizes ownership written by %s, including through a replacement client",
+    async (operation) => {
+      const fixture = installFakeBr();
+      if (operation === "adoptUnownedInProgress") process.env.EPICD_TEST_STATUS = "in_progress";
+      const client = new BeadsClient(fixture.root);
+
+      const claimed = await client[operation]("epic", "epic.1", "run-1");
+      const replacement = new BeadsClient(fixture.root);
+      const reread = await replacement.show(claimed.id);
+
+      expect(reread).toMatchObject({ status: "in_progress", assignee: "epicd:run-1" });
+      expect(replacement.classifyOwnership(reread, "run-1")).toEqual({
+        kind: "this-run",
+        owner: "epicd:run-1",
+      });
+      expect(replacement.classifyOwnership(reread, "run-2")).toEqual({
+        kind: "other",
+        owner: "epicd:run-1",
+      });
+    },
+  );
+
   it("uses the shared list contract for all issues and open epics", async () => {
     const fixture = installFakeBr();
     const client = new BeadsClient(fixture.root);
@@ -138,6 +162,24 @@ describe.sequential("BeadsClient claim gate", () => {
     const log = readFileSync(fixture.log, "utf8");
     expect(log).not.toContain("show ");
     expect(log).not.toContain("update ");
+  });
+});
+
+describe("Beads ownership interpretation", () => {
+  const client = new BeadsClient("/unused-for-classification");
+
+  it.each([undefined, null, "", " \t\n"])("treats %j as unassigned", (assignee) => {
+    expect(client.classifyOwnership({ assignee }, "run-1")).toEqual({ kind: "unassigned" });
+  });
+
+  it.each([
+    ["epicd:run-1", "this-run", "epicd:run-1"],
+    ["  epicd:run-1\n", "this-run", "epicd:run-1"],
+    ["epicd:run-10", "other", "epicd:run-10"],
+    ["run-1", "other", "run-1"],
+    [" other-agent ", "other", "other-agent"],
+  ])("classifies %j without prefix matches", (assignee, kind, owner) => {
+    expect(client.classifyOwnership({ assignee }, "run-1")).toEqual({ kind, owner });
   });
 });
 
