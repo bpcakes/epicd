@@ -339,15 +339,13 @@ export class OrchestratorController {
         await new OrchestratorLoop(
           kernel,
           {
-            decide: async (input, turnSignal) => {
-              await admission.assertOwned(turnSignal);
-              return source.decide(input, turnSignal);
-            },
+            decide: (input, turnSignal) => source.decide(input, turnSignal),
             reconcile: (attempt) => source.reconcile(attempt),
           },
           {
             healthIntervalMs: 2000,
             onHealthCheck: (healthSignal) => admission.assertOwned(healthSignal),
+            beforeSourceDispatch: (turnSignal) => admission.assertOwned(turnSignal),
             beforeDecision: async (turnSignal) => {
               await admission.assertOwned(turnSignal);
               const next = await this.coordinator(

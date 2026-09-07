@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
+import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import type { ControlledAgentDriver } from "../kernel/agents.js";
 import type { AgentIdentity } from "../domain/agents.js";
 import { DecisionSourceError, type DecisionSourceAttempt } from "../domain/decision-source.js";
@@ -67,14 +68,27 @@ export class ControlledDecisionSource implements DecisionSource {
         "configuration",
         "Coordinator requires its pinned Astra runtime assignment; no model fallback is allowed",
       );
-    const turn = this.journal.agents.prepareTurn(
-      this.authority,
-      this.agent,
-      input.attemptId,
-      buildDecisionPrompt(input.ticket, input.context),
-      DECISION_OUTPUT_SCHEMA,
-      input.ticket.expectedControlVersion,
-    );
+    let turn;
+    try {
+      turn = this.journal.agents.prepareTurn(
+        this.authority,
+        this.agent,
+        input.attemptId,
+        buildDecisionPrompt(input.ticket, input.context),
+        DECISION_OUTPUT_SCHEMA,
+        input.ticket.expectedControlVersion,
+      );
+    } catch (error) {
+      // These guards reject inside the preparation transaction before creating a
+      // turn. An in-flight action may legitimately supersede this ticket. Do not
+      // extend this catch to binding or runtime dispatch: their stop can be unknown.
+      if (
+        error instanceof AgentCoordinationError &&
+        (error.code === "stale_control" || error.code === "run_not_active")
+      )
+        return null;
+      throw error;
+    }
     this.journal.decisionSource.bindTurn(this.authority, input.attemptId, turn.identity);
     const stopped = await this.runtime.run(this.authority, turn.identity, signal);
     if (!stopped.stopEvidence) throw new Error("Coordinator launcher stop is unconfirmed");

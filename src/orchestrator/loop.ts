@@ -39,6 +39,8 @@ export class OrchestratorLoop {
       healthIntervalMs?: number;
       onHealthCheck?: (signal?: AbortSignal) => Promise<void>;
       beforeDecision?: (signal?: AbortSignal) => Promise<void>;
+      /** Bounded, read-only kernel preflight; must settle its I/O before returning. */
+      beforeSourceDispatch?: (signal?: AbortSignal) => Promise<void>;
     } = {},
   ) {
     if (
@@ -252,6 +254,21 @@ export class OrchestratorLoop {
         await delay(this.options.pollMs ?? 250, undefined, { signal });
         continue;
       }
+      // Repository preflight is not a provider request. In-flight actions can
+      // change control while it awaits I/O; do not record a source attempt until
+      // it settles and the frozen ticket has been rechecked. This also runs on
+      // transport retries, which do not pass through beforeDecision again.
+      if (this.options.beforeSourceDispatch) await this.options.beforeSourceDispatch(signal);
+      signal?.throwIfAborted();
+      this.kernel.assertHealthy();
+      this.kernel.journal.assertAuthority(authority);
+      const dispatchControl = this.kernel.journal.control(authority.runId);
+      if (
+        dispatchControl.status !== "active" ||
+        dispatchControl.controlVersion !== execution.ticket.expectedControlVersion ||
+        dispatchControl.policyDigest !== execution.ticket.policyDigest
+      )
+        return null;
       const attempt = sourceJournal.start(authority, execution.ticket.decisionId);
       let outcome: DecisionSourceOutcome;
       try {
@@ -266,7 +283,10 @@ export class OrchestratorLoop {
         outcome = !decision.success
           ? {
               kind: "invalid_output",
-              detail: `Invalid decision schema: ${decision.error.issues[0]?.message ?? "invalid result"}`,
+              detail:
+                result === null
+                  ? "Coordinator request settled without a decision"
+                  : `Invalid decision schema: ${decision.error.issues[0]?.message ?? "invalid result"}`,
             }
           : decision.data.request.decisionId !== execution.ticket.decisionId
             ? {
@@ -400,7 +420,9 @@ export class OrchestratorLoop {
             control.controlVersion !== input.ticket.expectedControlVersion ||
             control.policyDigest !== input.ticket.policyDigest
           )
-            throw new Error("Coordinator request authority changed before dispatch");
+            // No source call has happened. Settle the superseded attempt; only
+            // an authority change after dispatch requires runtime reconciliation.
+            return null;
           return this.source.decide(input, request.signal);
         }),
         watching,

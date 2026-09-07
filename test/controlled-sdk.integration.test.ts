@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
 import { CodexLaunchSchema } from "../src/domain/codex-launch.js";
@@ -569,6 +569,70 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     expect(turn.prompt.instructions).not.toContain(setup.authority.leaseId);
     expect(await readFile(join(setup.workspace.path, "source.txt"), "utf8")).toBe("red\n");
   });
+
+  it.each(["active", "paused"] as const)(
+    "settles a coordinator preparation race (%s) without launching or escalating the stale attempt",
+    async (status) => {
+      const setup = await fixture("complete", true);
+      const journal = setup.store.orchestration;
+      const kernel = new ActionKernel(journal);
+      const input = decisionInput(setup, kernel);
+      const driver = setup.driver();
+      const launch = vi.spyOn(driver, "run");
+      const source = new ControlledDecisionSource(journal, setup.authority, setup.agent, driver);
+      const prepare = journal.agents.prepareTurn.bind(journal.agents);
+      const hook = vi.spyOn(journal.agents, "prepareTurn").mockImplementationOnce((...args) => {
+        journal.changeStatus(setup.authority, status);
+        return prepare(...args);
+      });
+      let calls = 0;
+      try {
+        const result = await new OrchestratorLoop(
+          kernel,
+          {
+            async decide(next, signal) {
+              calls += 1;
+              if (calls > 1) {
+                expect(launch).not.toHaveBeenCalled();
+                expect(journal.agents.turns(setup.authority.runId)).toHaveLength(0);
+                expect(journal.pendingEscalation(setup.authority.runId)).toBeNull();
+                expect(next.ticket.expectedControlVersion).toBeGreaterThan(
+                  input.ticket.expectedControlVersion,
+                );
+                await setup.setResponse(
+                  decision(next.ticket, {
+                    kind: "escalate",
+                    question: "Authorize the external operation?",
+                    reason: "authority",
+                    evidenceIds: [],
+                  }),
+                );
+              }
+              return source.decide(next, signal);
+            },
+            reconcile: (attempt) => source.reconcile(attempt),
+          },
+          { pollMs: 5 },
+        ).run(setup.authority);
+        expect(result).toBe(status === "paused" ? "paused" : "awaiting_user");
+        expect(calls).toBe(status === "paused" ? 1 : 2);
+        expect(launch).toHaveBeenCalledTimes(status === "paused" ? 0 : 1);
+        expect(journal.decisionSource.unsettled(setup.authority.runId)).toBeNull();
+        expect(
+          journal.decisionSource.execution(setup.authority.runId, input.ticket.decisionId)
+            ?.attempts,
+        ).toMatchObject([{ turnIdentity: null, outcome: { kind: "invalid_output" } }]);
+        expect(
+          journal
+            .actions(setup.authority.runId)
+            .some((action) => action.request.decisionId === input.ticket.decisionId),
+        ).toBe(false);
+      } finally {
+        hook.mockRestore();
+        launch.mockRestore();
+      }
+    },
+  );
 
   it("recovers a journaled decision after a crash between turn completion and decision settlement", async () => {
     const setup = await fixture("complete", true);

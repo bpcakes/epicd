@@ -260,6 +260,14 @@ Build before testing: supervised-process and CLI tests exercise the compiled ent
 
 Normal integration tests use owned temporary repositories and scripted provider results. They exercise real journaling, Git operations, confinement, and process stop; they do not prove model judgment. Authenticated model/native checks are opt-in and recorded separately. See the implementation plan for remaining acceptance scenarios and their live-test commands.
 
+The unscripted SDK delivery acceptance uses the existing Codex authentication cache, installed Beads CLI and a generated one-task epic:
+
+```bash
+EPICD_LIVE_DELIVERY=1 npm test -- test/model-led-delivery.integration.test.ts
+```
+
+It allows up to 20 minutes of actual Astra work and always retains its printed private `/var/tmp/epicd-live-delivery-*` directory for diagnosis. It does not use the project's tracker or modify the user's checkout. This is an unfinished release check: the current recorded run reaches independent review but fails on an approval-contract diagnostic gap. Native Herdr delivery acceptance remains separate.
+
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 
 ```bash

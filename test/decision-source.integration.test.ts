@@ -92,6 +92,133 @@ function advance(ms: number) {
 }
 
 describe("durable coordinator transport attempts", () => {
+  it.each(["active", "paused"] as const)(
+    "rechecks a delayed repository preflight (%s) before recording a source attempt",
+    async (status) => {
+      const setup = fixture();
+      const input = request(setup);
+      let release!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const guard = vi.fn(async () => {
+        if (guard.mock.calls.length === 1) await barrier;
+      });
+      const decide = vi.fn(async (next: Parameters<DecisionSource["decide"]>[0]) => {
+        expect(next.ticket.decisionId).not.toBe(input.ticket.decisionId);
+        expect(next.ticket.expectedControlVersion).toBeGreaterThan(
+          input.ticket.expectedControlVersion,
+        );
+        expect(setup.journal.pendingEscalation(setup.authority.runId)).toBeNull();
+        return response(next);
+      });
+      const running = new OrchestratorLoop(
+        setup.kernel,
+        { decide },
+        {
+          pollMs: 1,
+          beforeSourceDispatch: guard,
+        },
+      ).run(setup.authority);
+      try {
+        await until(() => guard.mock.calls.length === 1);
+        setup.journal.changeStatus(setup.authority, status);
+        await delay(10); // Exceed the source monitor interval while preflight is held.
+        expect(decide).not.toHaveBeenCalled();
+        expect(setup.journal.decisionSource.unsettled(setup.authority.runId)).toBeNull();
+        expect(
+          setup.journal.decisionSource.execution(setup.authority.runId, input.ticket.decisionId)
+            ?.attempts,
+        ).toEqual([]);
+      } finally {
+        release();
+      }
+      expect(await running).toBe(status === "paused" ? "paused" : "awaiting_user");
+      expect(decide).toHaveBeenCalledTimes(status === "paused" ? 0 : 1);
+      expect(guard).toHaveBeenCalledTimes(status === "paused" ? 1 : 2);
+      expect(
+        setup.journal.decisionSource.execution(setup.authority.runId, input.ticket.decisionId)
+          ?.attempts,
+      ).toEqual([]);
+      expect(setup.journal.decisionSource.unsettled(setup.authority.runId)).toBeNull();
+    },
+  );
+
+  it("does not misclassify a failed preflight as an indeterminate model request", async () => {
+    const setup = fixture();
+    const input = request(setup);
+    const decide = vi.fn();
+    await expect(
+      new OrchestratorLoop(
+        setup.kernel,
+        { decide },
+        {
+          beforeSourceDispatch: async () => {
+            throw new Error("Repository ownership changed");
+          },
+        },
+      ).run(setup.authority),
+    ).rejects.toThrow("Repository ownership changed");
+    expect(decide).not.toHaveBeenCalled();
+    expect(
+      setup.journal.decisionSource.execution(setup.authority.runId, input.ticket.decisionId)
+        ?.attempts,
+    ).toEqual([]);
+    expect(setup.journal.decisionSource.unsettled(setup.authority.runId)).toBeNull();
+  });
+
+  it.each(["active", "paused"] as const)(
+    "settles a pre-dispatch control race (%s) without calling the source on the stale ticket",
+    async (status) => {
+      const setup = fixture();
+      const input = request(setup);
+      const start = setup.journal.decisionSource.start.bind(setup.journal.decisionSource);
+      const hook = vi
+        .spyOn(setup.journal.decisionSource, "start")
+        .mockImplementationOnce((...args) => {
+          const attempt = start(...args);
+          // The source is dispatched on the next microtask, after other admitted
+          // actions can update control facts.
+          queueMicrotask(() => setup.journal.changeStatus(setup.authority, status));
+          return attempt;
+        });
+      const decide = vi.fn(async (next: Parameters<DecisionSource["decide"]>[0]) => {
+        expect(next.ticket.decisionId).not.toBe(input.ticket.decisionId);
+        expect(next.ticket.expectedControlVersion).toBeGreaterThan(
+          input.ticket.expectedControlVersion,
+        );
+        expect(setup.journal.pendingEscalation(setup.authority.runId)).toBeNull();
+        return response(next);
+      });
+      try {
+        expect(await new OrchestratorLoop(setup.kernel, { decide }).run(setup.authority)).toBe(
+          status === "paused" ? "paused" : "awaiting_user",
+        );
+        expect(decide).toHaveBeenCalledTimes(status === "paused" ? 0 : 1);
+        expect(setup.journal.decisionSource.unsettled(setup.authority.runId)).toBeNull();
+        expect(
+          setup.journal.decisionSource.execution(setup.authority.runId, input.ticket.decisionId)
+            ?.attempts,
+        ).toMatchObject([
+          {
+            turnIdentity: null,
+            outcome: {
+              kind: "invalid_output",
+              detail: "Coordinator request settled without a decision",
+            },
+          },
+        ]);
+        expect(
+          setup.journal
+            .actions(setup.authority.runId)
+            .some((action) => action.request.decisionId === input.ticket.decisionId),
+        ).toBe(false);
+      } finally {
+        hook.mockRestore();
+      }
+    },
+  );
+
   it("charges one decision for three attempts and freezes the input despite new observations", async () => {
     const setup = fixture();
     const inputs: string[] = [];
@@ -256,7 +383,7 @@ describe("durable coordinator transport attempts", () => {
       abort.signal,
     );
     const rejected = expect(running).rejects.toThrow();
-    await until(() => execution(setup).attempts[0]?.retryNotBefore !== null);
+    await until(() => typeof execution(setup).attempts[0]?.retryNotBefore === "string");
     abort.abort();
     await rejected;
     expect(decide).toHaveBeenCalledTimes(1);
