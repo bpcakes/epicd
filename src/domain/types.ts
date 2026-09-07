@@ -243,7 +243,7 @@ export const RuntimeConfigurationSchema = z.strictObject({
 });
 export type RuntimeConfiguration = z.infer<typeof RuntimeConfigurationSchema>;
 
-/** Immutable run identity and runtime configuration; delivery state lives in the journals. */
+/** Immutable run identity; runtime selection changes only through explicit guarded handoff. */
 export const RunStateSchema = z
   .strictObject({
     stateSchemaVersion: z.literal(RUN_STATE_SCHEMA_VERSION),

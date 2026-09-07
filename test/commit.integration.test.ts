@@ -26,6 +26,32 @@ async function commit(s: Awaited<ReturnType<typeof fixture>>, candidate: Candida
 }
 
 describe.skipIf(process.platform !== "linux")("private commit and actual-SHA verification", () => {
+  it("retains candidate eligibility through healthy writer/reviewer retirement but not later revocation", async () => {
+    const s = await fixture(),
+      run = s.authority.runId;
+    const { candidate, review } = await approved(s);
+    const snapshot = s.journal.delivery.candidate(run, candidate).snapshot!;
+    s.journal.agents.retireStoppedAgent(s.authority, s.writer);
+    s.journal.agents.retireStoppedAgent(s.authority, review.evidence.turnIdentity!);
+    expect(s.journal.reviews.approval(run, candidate)).toBe(review.evidence.evidenceId);
+    const created = await commit(s, candidate);
+    expect(created).toMatchObject({
+      status: "created",
+      fullTree: snapshot.fullTree,
+      sourceIntact: true,
+    });
+    await s.validate(candidate, await s.copy(candidate, created.revision!));
+    const exact = await s.review(candidate, {}, [], created.revision!);
+    s.journal.agents.retireStoppedAgent(s.authority, exact.evidence.turnIdentity!);
+    expect(s.journal.reviews.approval(run, candidate, "exact_revision")).toBe(
+      exact.evidence.evidenceId,
+    );
+    s.journal.agents.revokeAgent(s.authority, s.writer, "Later source ownership violation");
+    expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+    expect(s.journal.reviews.approval(run, candidate, "exact_revision")).toBeNull();
+    expect(s.journal.commits.record(run, created.commitId)).toEqual(created);
+  });
+
   it.each(["sha1", "sha256"] as const)(
     "commits the approved %s tree, ignores staging, then requires fresh exact-SHA evidence",
     async (format) => {

@@ -140,6 +140,74 @@ function fixture() {
 // Real SQLite, private Git copies, SDK event parsing and supervised process stop.
 // Decision content is scripted; green does not establish Astra's delivery competence.
 describe.runIf(process.platform === "linux")("single orchestrator controller bootstrap", () => {
+  it("starts a fresh Astra conversation after an explicit runtime round trip and rebuilds continuity from the journal", async () => {
+    const f = fixture(),
+      run = f.state.runId;
+    await new OrchestratorController(f.store, run, {
+      driver: f.driverFactory([
+        {
+          kind: "record_memory",
+          entry: {
+            kind: "strategy",
+            content: "Investigate the browser failure before independent review",
+            scope: "run",
+            taskId: null,
+            confidence: "hypothesis",
+            observationIds: [],
+            evidenceIds: [],
+            revision: null,
+            environmentGeneration: null,
+            supersedes: null,
+          },
+        },
+        question,
+      ]),
+    }).run();
+    const journal = f.store.orchestration;
+    const prior = journal.agents.instances(run)[0]!;
+    const turns = journal.agents.turns(run),
+      memory = journal.memory(run),
+      used = journal.control(run).decisionsUsed;
+    const lease = f.store.acquireLease(run),
+      authority = { runId: run, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
+    // The native endpoint is deliberately unopened; actual native runtime behavior has its own suite.
+    journal.handoffRuntime(authority, journal.control(run).controlVersion, {
+      runtime: "herdr",
+      executable: f.state.runtimeConfiguration!.executable,
+      herdr: { executable: "/usr/bin/false", sessionName: "unopened", workspaceId: "unopened" },
+    });
+    journal.handoffRuntime(authority, journal.control(run).controlVersion, {
+      runtime: "sdk",
+      executable: f.state.runtimeConfiguration!.executable,
+      herdr: null,
+    });
+    f.store.releaseLease(run, lease.ownerToken);
+    const pending = journal.pendingEscalation(run)!;
+    journal.operatorControl(run, journal.control(run).controlVersion, {
+      kind: "respond",
+      escalationId: pending.escalationId,
+      message: "Continue the same epic after runtime handoff",
+    });
+    await new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run();
+    const agents = journal.agents.instances(run);
+    expect(agents).toHaveLength(2);
+    const fresh = agents.find((agent) => agent.agentId !== prior.agentId)!;
+    expect(journal.agents.instance(run, prior)).toMatchObject({
+      status: "released",
+      provider: prior.provider,
+      contract: prior.contract,
+    });
+    expect(fresh.provider).not.toEqual(prior.provider);
+    expect(fresh.workspaceId).not.toBe(prior.workspaceId);
+    expect(fresh.contract).toMatchObject({
+      runtime: "sdk",
+      effective: { model: "gpt-6-astra", reasoningEffort: "high" },
+    });
+    for (const turn of turns) expect(journal.agents.turn(run, turn.identity)).toEqual(turn);
+    expect(f.observed.at(-1)?.context).toMatchObject({ memory });
+    expect(journal.control(run).decisionsUsed).toBe(used + 1);
+  });
+
   it("invokes registered capabilities from coordinator decisions without a lifecycle dispatcher", async () => {
     const f = fixture();
     const baseline = f.git("rev-parse", "HEAD");

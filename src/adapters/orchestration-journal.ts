@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { RunStateSchema } from "../domain/types.js";
+import type { RuntimeHandoffTarget } from "../domain/runtime-handoff.js";
+import { commitRuntimeHandoff } from "./runtime-handoff.js";
 import type Database from "better-sqlite3";
 import {
   ActionRecordSchema,
@@ -70,7 +72,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 25;
+export const ORCHESTRATION_SCHEMA_VERSION = 26;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -1342,6 +1344,17 @@ export class OrchestrationJournal {
         "UPDATE orchestration_runs SET control_version = control_version + 1 WHERE run_id = ?",
       )
       .run(runId);
+  }
+
+  /** Explicit operator handoff, never an agent-selected runtime fallback. */
+  handoffRuntime(
+    authority: ControllerAuthority,
+    expectedVersion: number,
+    target: RuntimeHandoffTarget,
+  ) {
+    return this.transaction(authority, () =>
+      commitRuntimeHandoff(this.db, this, authority, expectedVersion, target),
+    );
   }
 
   preserveQuarantine(runId: string): void {

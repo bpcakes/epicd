@@ -10,6 +10,47 @@ import type { AdaptiveReviewResult } from "../src/domain/reviews.js";
 import { fixture, check, finding, git, success, target, waitFor } from "./fixtures/review.js";
 
 describe.skipIf(process.platform !== "linux")("independent pre-commit review evidence", () => {
+  it("keeps unresolved findings when a stopped reviewer conversation is retired", async () => {
+    const s = await fixture();
+    const run = s.authority.runId;
+    const candidate = await s.capture(await s.define());
+    const reviewed = await s.review(candidate, {
+      verdict: "changes_requested",
+      findings: [finding],
+    });
+    const findings = s.journal.reviews.openFindings(run, candidate);
+    expect(findings).toHaveLength(1);
+    s.journal.agents.retireStoppedAgent(s.authority, reviewed.evidence.turnIdentity!);
+    expect(s.journal.reviews.openFindings(run, candidate)).toEqual(findings);
+    expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+  });
+
+  it("retires a stopped reviewer for runtime handoff without revoking its independent evidence or findings", async () => {
+    const s = await fixture();
+    const run = s.authority.runId;
+    const candidate = await s.capture(await s.define());
+    await s.validate(candidate, await s.copy(candidate));
+    const reviewed = await s.review(candidate);
+    const identity = reviewed.evidence.turnIdentity!;
+    const turn = s.journal.agents.turn(run, identity);
+    const evidence = s.journal.reviews.evidence(run, reviewed.evidence.evidenceId);
+    const findings = s.journal.reviews.findings(run, "demo.1");
+    expect(s.journal.reviews.approval(run, candidate)).toBe(evidence.evidenceId);
+    s.journal.agents.retireStoppedAgent(s.authority, identity);
+    expect(s.journal.agents.instance(run, identity).status).toBe("released");
+    expect(s.journal.agents.turn(run, identity)).toEqual(turn);
+    expect(s.journal.reviews.evidence(run, evidence.evidenceId)).toEqual(evidence);
+    expect(s.journal.reviews.findings(run, "demo.1")).toEqual(findings);
+    expect(s.journal.reviews.approval(run, candidate)).toBe(evidence.evidenceId);
+    // A later integrity discovery can still revoke a retired conversation's evidence.
+    s.journal.agents.revokeAgent(s.authority, identity, "Later independent contamination finding");
+    expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+    expect(s.journal.agents.turn(run, identity).resultEligible).toBe(false);
+    s.journal.agents.retireStoppedAgent(s.authority, identity);
+    expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+    expect(s.reopen().orchestration.reviews.approval(run, candidate)).toBeNull();
+  });
+
   it("derives persisted approval from an exact confined turn, denies transient source writes and leaves user Git untouched", async () => {
     const s = await fixture();
     const run = s.authority.runId;

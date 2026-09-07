@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { Command, Option } from "commander";
 import { render } from "ink";
 import { StateStore, defaultStatePath } from "./adapters/store.js";
-import { createRun } from "./bootstrap.js";
+import { createRun, handoffRuntime } from "./bootstrap.js";
 import { bindFixtureProvider } from "./adapters/fixtures.js";
 import { FixtureOperationSchema } from "./domain/fixtures.js";
 import { OrchestratorController } from "./controller.js";
@@ -192,6 +192,38 @@ export function createProgram() {
           await launch(store, run.runId, options);
         });
       },
+    );
+  stateOption(
+    program
+      .command("handoff <run-id>")
+      .description(
+        "Explicitly switch a stopped run's runtime without migrating conversations or starting work",
+      ),
+  )
+    .addOption(
+      new Option("--runtime <runtime>", "target native runtime")
+        .choices(RuntimeKindSchema.options)
+        .makeOptionMandatory(),
+    )
+    .requiredOption("--control-version <number>", "version observed in status", versionNumber)
+    .option("--codex-path <path>", "selected native Codex executable")
+    .option("--herdr-path <path>", "Herdr executable for read-only caller discovery")
+    .action(
+      async (
+        runId: string,
+        options: BaseOptions & {
+          runtime: RuntimeKind;
+          controlVersion: number;
+          codexPath?: string;
+          herdrPath?: string;
+        },
+      ) =>
+        withStore(options, async (store) => {
+          const state = await handoffRuntime(store, runId, options);
+          process.stdout.write(
+            `Runtime ${state.runtime} recorded. Stopped conversations are retired; evidence, memory, budgets and resources are retained. No model started and no pending question was answered. Inspect status, then resume this run.\n`,
+          );
+        }),
     );
   stateOption(
     program

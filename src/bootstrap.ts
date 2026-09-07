@@ -20,6 +20,9 @@ import {
   type RuntimeKind,
 } from "./domain/types.js";
 import { runCommand } from "./util/command.js";
+import { assertRuntimeHandoffReady } from "./adapters/runtime-handoff.js";
+import { RuntimeHandoffTargetSchema } from "./domain/runtime-handoff.js";
+import { RepositoryAdmission } from "./kernel/repository-admission.js";
 
 export async function resolveExecutable(value: string): Promise<string> {
   if (!value.trim()) throw new Error("Executable cannot be empty");
@@ -94,6 +97,53 @@ export type CreateRunOptions = {
   authCachePath?: string | null;
   turnTimeoutMs?: number;
 };
+
+/** Explicit operator choice. Preflight is read-only; no model, pane, prompt or service is started. */
+export async function handoffRuntime(
+  store: StateStore,
+  runId: string,
+  options: { runtime: RuntimeKind; controlVersion: number; codexPath?: string; herdrPath?: string },
+  signal?: AbortSignal,
+) {
+  const lease = store.acquireLease(runId);
+  const authority = { runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
+  try {
+    const journal = store.orchestration;
+    assertRuntimeHandoffReady(journal, authority, options.controlVersion);
+    const state = store.get(runId)!;
+    if (!state.runtimeConfiguration) throw new Error("Run has no runtime configuration");
+    signal?.throwIfAborted();
+    const executable = options.codexPath
+      ? await resolveExecutable(options.codexPath)
+      : options.runtime === "sdk"
+        ? await sdkNativeExecutable()
+        : await resolveExecutable("codex");
+    await verifyCodexExecutable(state.repoPath, { executablePath: executable, args: [] });
+    const herdr =
+      options.runtime === "herdr"
+        ? await discoverHerdr(await resolveExecutable(options.herdrPath ?? "herdr"), state.repoPath)
+        : null;
+    const target = RuntimeHandoffTargetSchema.parse({
+      runtime: options.runtime,
+      executable,
+      herdr,
+    });
+    const repository = await new PublicationGit().bind(state.repoPath, signal);
+    if (
+      JSON.stringify(repository.commonDirectory) !==
+      JSON.stringify(state.runtimeConfiguration.commonDirectory)
+    )
+      throw new Error("Repository metadata identity changed before runtime handoff");
+    assertRuntimeHandoffReady(journal, authority, options.controlVersion);
+    const admission = new RepositoryAdmission(store, authority, repository);
+    await admission.enter(signal);
+    await admission.assertOwned(signal);
+    signal?.throwIfAborted();
+    return journal.handoffRuntime(authority, options.controlVersion, target);
+  } finally {
+    store.releaseLease(runId, lease.ownerToken);
+  }
+}
 
 export async function createRun(
   store: StateStore,

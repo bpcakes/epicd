@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 25. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 26. Use a fresh state path; unsupported existing data is left intact.
 
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
@@ -141,6 +141,21 @@ During a run, the orchestrator can invoke `change_agent_settings` within frozen 
 `replace_agent` requires the old worker's confirmed stop and a separately created workspace. It preserves the old copy, retires that generation and reserves a fresh one with the same task/purpose and current permitted settings. The orchestrator supplies handoff instructions and chooses when to continue; independent reviewers still run through `run_review`. Replacement does not erase findings, reuse a contaminated copy or count as completed work.
 
 `create_diagnostic_workspace` gives specialists a writable private copy for experiments. With `candidate` and `revision` both null it copies the frozen epic baseline, even while implementation is active. A candidate identity selects its captured snapshot; an explicit revision must also identify that candidate's kernel-recorded exact commit. Candidate copying requires its source workspace to be stopped. The orchestrator then chooses `start_specialist`, follow-up, inspection or replacement through the selected SDK/native Herdr driver. Diagnostic edits and reports cannot satisfy delivery validation or independent review. Restart can recover a lost creation acknowledgement only from an intact recorded copy with confirmed I/O stop; it never recreates an uncertain copy or discards its delta.
+
+## Explicit runtime handoff
+
+`resume` always uses the recorded runtime. To switch deliberately, pause the run and wait for its controller to detach, then inspect status again for the current control version:
+
+```bash
+node dist/cli.js handoff RUN_ID --state /path/to/private-state/run.sqlite3 \
+  --runtime herdr --control-version VERSION
+```
+
+Use `--runtime sdk` to switch back. `--codex-path` selects a native executable; otherwise SDK uses its pinned binary and Herdr resolves native `codex`. Herdr selection requires a managed caller and read-only discovery of that caller's exact named session and workspace, never the focused pane. `--herdr-path` can select the Herdr executable. Handoff does not create layout, submit prompts or start a model. Inspect status and explicitly resume afterward; an unanswered escalation still requires its correlated response.
+
+The handoff holds a controller lease, verifies physical repository ownership, and rechecks the observed control version before one atomic journal transaction. All turns, launchers, workspace I/O and delivery/fixture operations must have recorded stop and settlement. Pending agent instructions are not discarded. If work is uncertain, reconcile it in its recorded runtime first; a dead controller is not stop proof.
+
+Stopped conversations are retired without copying provider session IDs into another runtime. Existing workspaces, native endpoint identities, exact evidence, findings, memory, policy, grants and budgets remain intact. The next coordinator starts a fresh Astra conversation using durable context. Retirement does not revoke valid historical evidence, but later contamination can still revoke it. No retired conversation can take another turn. Switching runtime never changes repository identity, private storage, authentication paths, worker defaults or permission grants, and does not imply cleanup of old resources.
 
 ## Fixture authority, inspection and creation
 

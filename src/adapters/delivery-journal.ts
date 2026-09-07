@@ -916,7 +916,9 @@ export class DeliveryJournal {
       !writers.active &&
       writers.count === source.taskWriterTurnCount &&
       !agent.activeTurnId &&
-      !["revoked", "released"].includes(agent.status) &&
+      // Stopped healthy retirement preserves this source witness; revocation does not.
+      agent.status !== "revoked" &&
+      agent.revokedReason === null &&
       this.latestSourceTurn(runId, source.assignmentId) === source.turnId
     );
   }

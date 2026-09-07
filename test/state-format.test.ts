@@ -107,7 +107,7 @@ describe("hard-cut state format", () => {
     expect(reopened.get(run.runId)).toEqual(run);
     expect(reopened.orchestration.policy(run.runId).coordinator.model).toBe("gpt-6-astra");
     expect(db.prepare("SELECT * FROM runs").all()).toEqual(before);
-    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 25 }]);
+    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 26 }]);
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE name = 'diagnostic_artifacts'").get(),
     ).toBeDefined();
@@ -118,9 +118,9 @@ describe("hard-cut state format", () => {
     { label: "unmarked", versions: null },
     { label: "empty marker", versions: [] },
     { label: "older format", versions: [23] },
-    { label: "newer format", versions: [26] },
-    { label: "previous format without repository admission", versions: [24] },
-    { label: "multiple format markers", versions: [24, 25] },
+    { label: "newer format", versions: [27] },
+    { label: "previous format without evidence-preserving retirement", versions: [25] },
+    { label: "multiple format markers", versions: [25, 26] },
   ])("refuses $label without migration, backups or deletion", ({ versions }) => {
     const { root, path } = fixture();
     const db = new Database(path);

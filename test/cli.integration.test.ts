@@ -70,7 +70,7 @@ describe("hard-cut CLI", () => {
       "stay in scope",
     );
   });
-  it("rejects runtime switching and obsolete bypass flags at argument parsing", () => {
+  it("rejects implicit runtime switching on resume and obsolete bypass flags at argument parsing", () => {
     const f = fixture();
     for (const args of [
       ["resume", f.state.runId, "--runtime", "herdr"],
@@ -82,6 +82,16 @@ describe("hard-cut CLI", () => {
       expect(result.stderr).toContain("unknown option");
     }
     expect(f.store.list()).toHaveLength(1);
+  });
+  it("requires an explicit target and observed control version for handoff", () => {
+    const f = fixture();
+    const missingRuntime = f.cli("handoff", f.state.runId, "--control-version", "0");
+    expect(missingRuntime.status).not.toBe(0);
+    expect(missingRuntime.stderr).toContain("--runtime");
+    const missingVersion = f.cli("handoff", f.state.runId, "--runtime", "herdr");
+    expect(missingVersion.status).not.toBe(0);
+    expect(missingVersion.stderr).toContain("--control-version");
+    expect(f.store.get(f.state.runId)).toEqual(f.state);
   });
   it("does not change control state or settings when another controller owns the run", () => {
     const f = fixture(),

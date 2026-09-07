@@ -309,6 +309,14 @@ export class AgentJournal {
     );
   }
 
+  workspaces(runId: string): WorkspaceRecord[] {
+    return this.all(
+      WorkspaceRecordSchema,
+      "SELECT record_json FROM workspaces WHERE run_id = ? ORDER BY workspace_id",
+      [runId],
+    );
+  }
+
   /** Synchronous admission shares the same transaction as agent turn admission. */
   beginWorkspaceOperation(
     authority: ControllerAuthority,
@@ -1386,7 +1394,13 @@ export class AgentJournal {
   ): AgentInstance {
     return this.access.transaction(authority, () => {
       const agent = this.instance(authority.runId, identity);
-      if (agent.status === "released" || agent.status === "revoked") return agent;
+      // A healthy conversation may have been retired during runtime handoff.
+      // Retirement preserves evidence, but cannot shield it from later revocation.
+      if (
+        agent.status === "revoked" ||
+        (agent.status === "released" && agent.revokedReason !== null)
+      )
+        return agent;
       agent.status = "revoked";
       agent.revokedReason = safeText(reason, 4000);
       this.saveAgent(agent);
@@ -1428,6 +1442,44 @@ export class AgentJournal {
       agent.status = "released";
       this.saveAgent(agent);
       this.changed(authority, "agent.released", `${identity.agentId}/${identity.agentGeneration}`);
+      return agent;
+    });
+  }
+
+  /** End future conversation authority without revoking historical evidence or deleting resources. */
+  retireStoppedAgent(authority: ControllerAuthority, identity: AgentIdentity): AgentInstance {
+    return this.access.transaction(authority, () => {
+      const agent = this.instance(authority.runId, identity);
+      if (
+        agent.activeTurnId ||
+        this.turns(authority.runId).some(
+          (turn) =>
+            turn.identity.agentId === agent.agentId &&
+            turn.identity.agentGeneration === agent.agentGeneration &&
+            (!turn.stopEvidence || (turn.launch !== null && turn.launch.stop === null)),
+        )
+      )
+        throw new AgentCoordinationError(
+          "agent_not_stopped",
+          "Retirement needs every exact turn and launch stopped",
+        );
+      if (
+        this.messages(authority.runId, identity).some(
+          (message) => !["acknowledged", "superseded"].includes(message.status),
+        )
+      )
+        throw new AgentCoordinationError(
+          "mailbox_pending",
+          "Retirement cannot discard pending instructions",
+        );
+      if (agent.status === "released") return agent;
+      agent.status = "released";
+      this.saveAgent(agent);
+      this.changed(
+        authority,
+        "agent.retired",
+        `${agent.agentId}/${agent.agentGeneration}: conversation retired; evidence and resources retained`,
+      );
       return agent;
     });
   }
