@@ -510,7 +510,12 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       const control = this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, input);
-      const trackerClaim = this.access.assertTaskOwned(authority.runId, input.taskId);
+      // Final review is admitted by the evidence-bound review capability after task closure.
+      // Its epic root is not an implementation task and must not acquire a fabricated claim.
+      const trackerClaim =
+        input.purpose === "final_review"
+          ? undefined
+          : this.access.assertTaskOwned(authority.runId, input.taskId);
       if (workspace.purpose === "delivery")
         throw new AgentCoordinationError(
           "kernel_workspace",
@@ -840,10 +845,9 @@ export class AgentJournal {
       const control = this.active(authority, expectedControlVersion);
       const agent = this.instance(authority.runId, identity);
       const workspace = this.workspace(authority.runId, agent);
-      this.access.assertTaskOwned(
-        authority.runId,
-        this.assignment(authority.runId, agent.assignmentId).taskId,
-      );
+      const assignment = this.assignment(authority.runId, agent.assignmentId);
+      if (assignment.purpose !== "final_review")
+        this.access.assertTaskOwned(authority.runId, assignment.taskId);
       if (
         this.access.publicationPending(authority.runId) &&
         this.assignment(authority.runId, agent.assignmentId).purpose !== "coordination"
@@ -867,8 +871,10 @@ export class AgentJournal {
           "Turn requires a ready agent and exclusively owned workspace",
         );
       const active = this.turns(authority.runId).filter((turn) => !terminal(turn));
-      const assignment = this.assignment(authority.runId, agent.assignmentId);
-      if (reviewContext !== undefined && !["review", "verification"].includes(assignment.purpose))
+      if (
+        reviewContext !== undefined &&
+        !["review", "verification", "final_review"].includes(assignment.purpose)
+      )
         throw new AgentCoordinationError(
           "review_context_role",
           "Only an independent review turn may carry review context",

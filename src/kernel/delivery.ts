@@ -13,6 +13,14 @@ export function registerDeliveryCapabilities(
   workspaces: WorkspaceManager,
 ): void {
   const journal = kernel.journal;
+  kernel.registerLocal("prepare_epic_delivery", ({ authority, record }) => {
+    const candidate = journal.delivery.prepareEpicDelivery(authority, record.actionId);
+    return {
+      kind: "resource",
+      resourceId: candidate.candidateId,
+      generation: candidate.candidateGeneration,
+    };
+  });
   kernel.registerLocal("define_validation_plan", ({ authority, record }) => {
     const plan = journal.delivery.definePlan(authority, record.actionId);
     return { kind: "resource", resourceId: plan.planId, generation: plan.generation };

@@ -42,15 +42,33 @@ export const ValidationPlanSchema = z.strictObject({
   createdAt: At,
 });
 export type ValidationPlan = z.infer<typeof ValidationPlanSchema>;
+export const EpicDeliveryBindingSchema = z.strictObject({
+  publicationId: z.uuid(),
+  trackerSnapshotId: z.uuid(),
+  scopeDigest: z.string().length(64),
+  baselineRevision: Id,
+  closureOperationIds: z.array(z.uuid()).max(1000),
+});
+export type EpicDeliveryBinding = z.infer<typeof EpicDeliveryBindingSchema>;
+export const CandidateSourceSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("implementation"),
+    assignmentId: Id,
+    turnId: Id.nullable(),
+    taskWriterTurnCount: z.number().int().nonnegative(),
+  }),
+  EpicDeliveryBindingSchema.extend({
+    kind: z.literal("published_epic"),
+    writerTurnCount: z.number().int().nonnegative(),
+  }),
+]);
 export const CandidateRecordSchema = CandidateIdentitySchema.extend({
   schemaVersion: z.literal(1),
   runId: Id,
   operationId: Id,
   taskId: Id,
   ...WorkspaceIdentitySchema.shape,
-  sourceAssignmentId: Id,
-  sourceTurnId: Id.nullable(),
-  taskWriterTurnCount: z.number().int().nonnegative(),
+  source: CandidateSourceSchema,
   validationPlanId: Id,
   policyDigest: Id,
   status: z.enum(["capturing", "captured", "failed"]),

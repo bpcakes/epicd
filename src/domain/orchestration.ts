@@ -167,6 +167,12 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
       .max(100),
   }),
   z.strictObject({
+    kind: z.literal("prepare_epic_delivery"),
+    publicationId: z.uuid(),
+    trackerSnapshotId: z.uuid(),
+    validationPlanId: Id,
+  }),
+  z.strictObject({
     kind: z.literal("capture_candidate"),
     taskId: Id,
     ...WorkspaceTarget,

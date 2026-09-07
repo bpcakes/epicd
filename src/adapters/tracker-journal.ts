@@ -461,6 +461,68 @@ export class TrackerJournal {
     if (record.digest !== digestJson(record.graph)) return fail("Tracker snapshot digest changed");
     return record;
   }
+  /** Journal witness, not permission to close: closure must also inspect the live graph. */
+  closedEpicScope(runId: string) {
+    this.assertIdle(runId);
+    const snapshot = this.snapshot(runId);
+    const first = this.db
+      .prepare("SELECT snapshot_id FROM tracker_snapshots WHERE run_id = ? ORDER BY rowid LIMIT 1")
+      .get(runId) as { snapshot_id: string };
+    const initial = this.snapshot(runId, first.snapshot_id).graph;
+    const operations = this.operations(runId);
+    const closures: TrackerOperation[] = [];
+    const preexistingIds: string[] = [];
+    const issues = [...snapshot.graph.issues].sort((a, b) => a.id.localeCompare(b.id));
+    for (const issue of issues) {
+      if (issue.status === "tombstone") return fail("Tombstoned epic scope needs user judgment");
+      if (issue.type === "epic") continue;
+      if (issue.status !== "closed") return fail(`Concrete descendant remains open: ${issue.id}`);
+      const closure = operations.findLast(
+        (entry) =>
+          entry.taskId === issue.id && entry.kind === "close_task" && entry.outcome === "closed",
+      );
+      const witness = closure?.afterSnapshotId
+        ? this.snapshot(runId, closure.afterSnapshotId).graph.issues.find(
+            (item) => item.id === issue.id,
+          )
+        : initial.issues.find((item) => item.id === issue.id);
+      if (
+        !witness ||
+        witness.status !== "closed" ||
+        witness.contentDigest !== issue.contentDigest ||
+        witness.assignee !== issue.assignee ||
+        witness.closedAt !== issue.closedAt ||
+        witness.closeReason !== issue.closeReason ||
+        witness.closedBySession !== issue.closedBySession
+      )
+        return fail(
+          `Closed descendant lacks unchanged run or initial closure provenance: ${issue.id}`,
+        );
+      if (closure) closures.push(closure);
+      else preexistingIds.push(issue.id);
+    }
+    return {
+      snapshot,
+      closures,
+      preexistingIds,
+      digest: digestJson(
+        issues.map((issue) => ({
+          id: issue.id,
+          contentDigest: issue.contentDigest,
+          assignee: issue.assignee,
+          // Container status changes alone do not change delivered requirements.
+          status: issue.type === "epic" ? null : issue.status,
+          closedAt: issue.type === "epic" ? null : issue.closedAt,
+          closeReason: issue.type === "epic" ? null : issue.closeReason,
+          closedBySession: issue.type === "epic" ? null : issue.closedBySession,
+          // Dependencies outside this epic are also part of the observed environment.
+          externalDependencies: issue.dependencies
+            .filter((edge) => !issues.some((item) => item.id === edge.id))
+            .sort((a, b) => a.id.localeCompare(b.id) || a.type.localeCompare(b.type)),
+        })),
+      ),
+    };
+  }
   summary(runId: string) {
     if (!this.configured(runId)) return { configured: false as const };
     const row = this.db

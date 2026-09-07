@@ -38,6 +38,7 @@ export async function trackerAction(
 export async function closureFixture(
   format: "sha1" | "sha256" = "sha1",
   claimBeforeImplementation = true,
+  secondTask: boolean | "preclosed" = false,
 ) {
   let transport!: KernelBeads,
     adapter!: ReturnType<typeof registerTrackerCapabilities>,
@@ -59,6 +60,19 @@ export async function closureFixture(
           closed_at: null,
           close_reason: null,
           closed_by_session: null,
+          other_tasks: secondTask
+            ? [
+                {
+                  id: "demo.2",
+                  status: secondTask === "preclosed" ? "closed" : "open",
+                  assignee: null,
+                  description: "Retain green and deliver integration behavior",
+                  closed_at: secondTask === "preclosed" ? new Date().toISOString() : null,
+                  close_reason: secondTask === "preclosed" ? "Completed before this run" : null,
+                  closed_by_session: secondTask === "preclosed" ? "before-run" : null,
+                },
+              ]
+            : [],
         }),
       );
       return { epicId: "demo", taskId: "demo.1" };
@@ -76,15 +90,18 @@ with (directory/'commands.jsonl').open('a') as log: log.write(json.dumps(args)+'
 x = json.loads((directory/'data.json').read_text())
 def row(id):
     common = {'id':id,'title':id,'priority':1,'description':'Deliver green behavior','acceptance_criteria':'The check passes','labels':[]}
-    if id == 'demo': return {**common,'status':'open','issue_type':'epic','dependencies':[], 'dependents':[{'id':'demo.1','dependency_type':'parent-child','status':x['status']}] if x['parent'] else []}
-    return {**common, **x, 'issue_type':'task','dependencies':[{'id':'demo','dependency_type':'parent-child','status':'open'}] if x['parent'] else [], 'dependents':[]}
+    if id == 'demo': return {**common,'description':x.get('epic_description',common['description']),'status':x.get('epic_status','open'),'issue_type':'epic','dependencies':[], 'dependents':([{'id':'demo.1','dependency_type':'parent-child','status':x['status']}] if x['parent'] else []) + [{'id':y['id'],'dependency_type':'parent-child','status':y['status']} for y in x.get('other_tasks',[])] + [{'id':id,'dependency_type':'parent-child','status':'open'} for id in x.get('new_children',[])]}
+    if id in x.get('new_children',[]): return {**common,'status':'open','issue_type':'task','dependencies':[{'id':'demo','dependency_type':'parent-child','status':x.get('epic_status','open')}], 'dependents':[]}
+    y = x if id == 'demo.1' else next(y for y in x['other_tasks'] if y['id'] == id)
+    return {**common, **y, 'issue_type':'task','dependencies':[{'id':'demo','dependency_type':'parent-child','status':x.get('epic_status','open')}] if x['parent'] else [], 'dependents':[]}
 if args[0] == 'show': print(json.dumps([row(id) for id in args[1:args.index('--db')]]))
-elif args[0] == 'ready': print(json.dumps([row('demo.1')] if x['parent'] and x['status'] == 'open' and not x['assignee'] else []))
+elif args[0] == 'ready': print(json.dumps([row(y.get('id','demo.1')) for y in [x,*x.get('other_tasks',[])] if x['parent'] and y['status'] == 'open' and not y['assignee']]))
 elif args[0] == 'update':
-    if x['assignee']: sys.exit('already owned')
-    x['status'], x['assignee'] = 'in_progress', args[args.index('--actor')+1]
+    y = x if args[1] == 'demo.1' else next(y for y in x['other_tasks'] if y['id'] == args[1])
+    if y['assignee']: sys.exit('already owned')
+    y['status'], y['assignee'] = 'in_progress', args[args.index('--actor')+1]
     (directory/'data.json').write_text(json.dumps(x))
-    print(json.dumps([row('demo.1')]))
+    print(json.dumps([row(args[1])]))
 elif args[0] == 'close':
     if x.get('blocked_close'):
         print(json.dumps({'closed':[], 'skipped':[{'id':'demo.1','reason':'Policy requires an additional gate'}]})); sys.exit(0)
@@ -92,11 +109,12 @@ elif args[0] == 'close':
         subprocess.Popen(['/usr/bin/python3','-c',"import time; time.sleep(1.2); open('/workspace/.beads/late-close','w').write('bad')"],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         while True: time.sleep(1)
-    if x['status'] == 'closed': print('[]'); sys.exit(0)
-    x['status'], x['closed_at'] = 'closed', datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
-    x['close_reason'], x['closed_by_session'] = args[args.index('--reason')+1], args[args.index('--session')+1]
+    y = x if args[1] == 'demo.1' else next(y for y in x['other_tasks'] if y['id'] == args[1])
+    if y['status'] == 'closed': print('[]'); sys.exit(0)
+    y['status'], y['closed_at'] = 'closed', datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+    y['close_reason'], y['closed_by_session'] = args[args.index('--reason')+1], args[args.index('--session')+1]
     (directory/'data.json').write_text(json.dumps(x))
-    print(json.dumps([row('demo.1')]))
+    print(json.dumps([row(args[1])]))
 else: sys.exit('unsupported')
 `,
       );
@@ -148,22 +166,34 @@ else: sys.exit('unsupported')
   };
 }
 
-export async function publishVerified(s: Awaited<ReturnType<typeof fixture>>) {
-  const candidate = await s.capture(await s.define());
-  await s.validate(candidate, await s.copy(candidate));
+export async function publishVerified(
+  s: Awaited<ReturnType<typeof fixture>>,
+  suppliedCandidate?: import("../../src/domain/delivery.js").CandidateIdentity,
+) {
+  const candidate = suppliedCandidate ?? (await s.capture(await s.define()));
+  const checks = s.journal.delivery.plan(
+    s.authority.runId,
+    s.journal.delivery.candidate(s.authority.runId, candidate).validationPlanId,
+  ).checks;
+  const before = await s.copy(candidate);
+  for (const check of checks.filter((item) => item.stage !== "exact_revision"))
+    await s.validate(candidate, before, check.id);
   await s.review(candidate);
   const commitId = resource(
     await s.dispatch({ kind: "request_commit", ...candidate, subject: "Verified green behavior" }),
   ).resourceId;
   const commit = s.journal.commits.record(s.authority.runId, commitId);
-  await s.validate(candidate, await s.copy(candidate, commit.revision));
+  const exact = await s.copy(candidate, commit.revision);
+  for (const check of checks.filter((item) => item.stage !== "pre_commit"))
+    await s.validate(candidate, exact, check.id);
   await s.review(candidate, {}, [], commit.revision);
   const publicationId = resource(
     await s.dispatch({
       kind: "request_publish",
       ...candidate,
       revision: commit.revision!,
-      expectedPreviousRevision: s.head,
+      expectedPreviousRevision:
+        s.journal.publications.repository(s.authority.runId)?.publishedRevision ?? s.head,
     }),
   ).resourceId;
   return {

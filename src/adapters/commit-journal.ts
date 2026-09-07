@@ -65,6 +65,11 @@ export class CommitJournal {
       )
         throw new DeliveryError("commit_action_stale", "Commit needs its current admitted action");
       const candidate = this.access.delivery.candidate(authority.runId, action.request.action);
+      if (candidate.source.kind !== "implementation")
+        throw new DeliveryError(
+          "commit_source",
+          "A published epic target is read-only; repairs need a separately reviewed implementation candidate",
+        );
       const approved = this.access.reviews.approval(authority.runId, candidate);
       if (!approved || !candidate.snapshot)
         throw new DeliveryError(

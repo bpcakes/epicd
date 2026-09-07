@@ -112,6 +112,15 @@ export class KernelBeads {
         const issue = TrackerIssueSchema.parse({
           ...content,
           workDigest: digestJson(work),
+          contentDigest: digestJson({
+            ...work,
+            dependencies: work.dependencies
+              .map(({ status: _status, ...edge }) => edge)
+              .sort((a, b) => a.id.localeCompare(b.id) || a.type.localeCompare(b.type)),
+            dependents: work.dependents
+              .map(({ status: _status, ...edge }) => edge)
+              .sort((a, b) => a.id.localeCompare(b.id) || a.type.localeCompare(b.type)),
+          }),
           closedAt: input.closed_at ?? null,
           closeReason: input.close_reason ?? null,
           closedBySession: input.closed_by_session ?? null,

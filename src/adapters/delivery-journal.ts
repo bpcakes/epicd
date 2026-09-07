@@ -33,6 +33,7 @@ import {
 import type { AgentJournal } from "./agent-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
 import type { CommitRecord } from "../domain/commits.js";
+import type { EpicDeliveryTarget } from "./epic-delivery.js";
 
 export const DELIVERY_TABLES = [
   "validation_plans",
@@ -103,6 +104,8 @@ type Access = {
   reviewChecks(runId: string, taskId: string): z.infer<typeof RequiredCheckSchema>[];
   exactCommit(runId: string, candidate: CandidateIdentity, revision: string): CommitRecord;
   assertPublicationIdle(runId: string): void;
+  epicTarget(runId: string): EpicDeliveryTarget;
+  epicId(runId: string): string;
 };
 export class DeliveryError extends Error {
   constructor(
@@ -138,9 +141,14 @@ export class DeliveryJournal {
       if (new Set(checks.map((check) => check.id)).size !== checks.length)
         throw new DeliveryError("duplicate_check", "Validation check IDs must be unique");
       const requirements = new Map<string, z.infer<typeof RequiredCheckSchema>>();
+      const epic =
+        action.taskId === this.access.epicId(authority.runId)
+          ? this.access.epicTarget(authority.runId)
+          : null;
       for (const required of [
         ...policy.requiredChecks,
         ...this.access.reviewChecks(authority.runId, action.taskId),
+        ...(epic?.checks ?? []),
       ]) {
         const previous = requirements.get(required.id);
         if (previous && digestJson({ ...previous, stage: required.stage }) !== digestJson(required))
@@ -165,6 +173,10 @@ export class DeliveryJournal {
           checks[index] = required;
         }
       }
+      if (epic)
+        checks.forEach((check) => {
+          check.stage = "both";
+        });
       const bindings = new Set([
         ...policy.fixtures.map((fixture) => fixture.environmentBinding),
         ...policy.validationServices.map((service) => service.id),
@@ -286,9 +298,12 @@ export class DeliveryJournal {
         taskId: action.taskId,
         workspaceId: workspace.workspaceId,
         workspaceGeneration: workspace.workspaceGeneration,
-        sourceAssignmentId: assignment.assignmentId,
-        sourceTurnId: this.latestSourceTurn(authority.runId, assignment.assignmentId),
-        taskWriterTurnCount: writers.count,
+        source: {
+          kind: "implementation",
+          assignmentId: assignment.assignmentId,
+          turnId: this.latestSourceTurn(authority.runId, assignment.assignmentId),
+          taskWriterTurnCount: writers.count,
+        },
         validationPlanId: plan.planId,
         policyDigest: record.policyDigest,
         status: "capturing",
@@ -313,6 +328,97 @@ export class DeliveryJournal {
       this.changed(authority, "candidate.capture_reserved", candidate.candidateId);
       return candidate;
     });
+  }
+
+  /** No Git/tracker mutation or invented implementation turn: bind existing published custody. */
+  prepareEpicDelivery(authority: ControllerAuthority, actionId: string): CandidateRecord {
+    return this.access.transaction(authority, () => {
+      const { record, action } = this.action(authority, actionId, "prepare_epic_delivery");
+      const previousOperation = this.byOperation(
+        CandidateRecordSchema,
+        "candidates",
+        authority.runId,
+        record.operationId,
+      );
+      if (previousOperation) return previousOperation;
+      const target = this.access.epicTarget(authority.runId);
+      const plan = this.plan(authority.runId, action.validationPlanId);
+      const writers = this.taskWriters(authority.runId, null);
+      if (
+        !target.epicOpen ||
+        action.publicationId !== target.binding.publicationId ||
+        action.trackerSnapshotId !== target.binding.trackerSnapshotId ||
+        target.context.requirements.find((issue) => issue.id === target.taskId)?.type !== "epic"
+      )
+        throw new DeliveryError(
+          "epic_target_stale",
+          "Use the latest published revision and observed epic graph",
+        );
+      if (
+        plan.taskId !== target.taskId ||
+        this.latestPlan(authority.runId, target.taskId)?.planId !== plan.planId ||
+        plan.policyDigest !== record.policyDigest ||
+        plan.checks.some((check) => check.stage !== "both") ||
+        target.checks.some(
+          (required) => !plan.checks.some((check) => digestJson(check) === digestJson(required)),
+        )
+      )
+        throw new DeliveryError(
+          "epic_plan_stale",
+          "Final validation must retain every delivered task and reviewer-required check at the actual SHA",
+        );
+      if (writers.active)
+        throw new DeliveryError(
+          "epic_writer_active",
+          "Stop all epic writers before preparing final delivery",
+        );
+      const previous = this.latestCandidate(authority.runId, target.taskId);
+      if (previous?.status === "capturing")
+        throw new DeliveryError(
+          "capture_uncertain",
+          "Reconcile the earlier epic candidate capture",
+        );
+      const candidate = CandidateRecordSchema.parse({
+        schemaVersion: 1,
+        runId: authority.runId,
+        operationId: record.operationId,
+        candidateId: randomUUID(),
+        candidateGeneration: (previous?.candidateGeneration ?? 0) + 1,
+        taskId: target.taskId,
+        workspaceId: target.snapshot.workspaceId,
+        workspaceGeneration: target.snapshot.workspaceGeneration,
+        source: { kind: "published_epic", ...target.binding, writerTurnCount: writers.count },
+        validationPlanId: plan.planId,
+        policyDigest: record.policyDigest,
+        status: "captured",
+        snapshot: target.snapshot,
+        failure: null,
+        createdAt: now(),
+        capturedAt: now(),
+      });
+      this.db
+        .prepare("INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(
+          candidate.candidateId,
+          authority.runId,
+          record.operationId,
+          candidate.candidateGeneration,
+          candidate.taskId,
+          plan.planId,
+          candidate.workspaceId,
+          candidate.workspaceGeneration,
+          JSON.stringify(candidate),
+        );
+      this.changed(authority, "candidate.epic_prepared", candidate.candidateId);
+      return candidate;
+    });
+  }
+
+  epicReviewContext(runId: string, identity: CandidateIdentity) {
+    const candidate = this.candidate(runId, identity);
+    return candidate.source.kind === "published_epic"
+      ? this.access.epicTarget(runId).context
+      : null;
   }
 
   finishCapture(
@@ -718,9 +824,36 @@ export class DeliveryJournal {
   }
   candidateCurrent(runId: string, identity: CandidateIdentity): boolean {
     const candidate = this.candidate(runId, identity);
+    if (
+      candidate.status !== "captured" ||
+      this.latestCandidate(runId, candidate.taskId)?.candidateId !== candidate.candidateId ||
+      this.latestPlan(runId, candidate.taskId)?.planId !== candidate.validationPlanId ||
+      candidate.policyDigest !== this.access.control(runId).policyDigest
+    )
+      return false;
+    const source = candidate.source;
+    if (source.kind === "published_epic") {
+      try {
+        const target = this.access.epicTarget(runId);
+        const writers = this.taskWriters(runId, null);
+        return (
+          !writers.active &&
+          writers.count === source.writerTurnCount &&
+          target.binding.publicationId === source.publicationId &&
+          target.binding.scopeDigest === source.scopeDigest &&
+          target.binding.baselineRevision === source.baselineRevision &&
+          digestJson(target.binding.closureOperationIds) ===
+            digestJson(source.closureOperationIds) &&
+          digestJson(target.snapshot) === digestJson(candidate.snapshot)
+        );
+      } catch (error) {
+        if (error instanceof DeliveryError) return false;
+        throw error;
+      }
+    }
     const agent = this.access.agents
       .instances(runId)
-      .find((item) => item.assignmentId === candidate.sourceAssignmentId);
+      .find((item) => item.assignmentId === source.assignmentId);
     const writers = this.taskWriters(runId, candidate.taskId);
     return (
       candidate.status === "captured" &&
@@ -729,10 +862,10 @@ export class DeliveryJournal {
       candidate.policyDigest === this.access.control(runId).policyDigest &&
       !!agent &&
       !writers.active &&
-      writers.count === candidate.taskWriterTurnCount &&
+      writers.count === source.taskWriterTurnCount &&
       !agent.activeTurnId &&
       !["revoked", "released"].includes(agent.status) &&
-      this.latestSourceTurn(runId, candidate.sourceAssignmentId) === candidate.sourceTurnId
+      this.latestSourceTurn(runId, source.assignmentId) === source.turnId
     );
   }
   satisfiesCheck(runId: string, evidenceId: string): boolean {
@@ -869,6 +1002,14 @@ export class DeliveryJournal {
     const candidate = this.candidate(runId, identity);
     if (!candidate.snapshot)
       throw new DeliveryError("candidate_not_captured", "Candidate has no immutable snapshot");
+    if (candidate.source.kind === "published_epic") {
+      if (revision !== candidate.snapshot.snapshotRevision)
+        throw new DeliveryError(
+          "epic_revision_required",
+          "Final epic review and validation require the actual published SHA, never a pre-commit snapshot",
+        );
+      return candidate.snapshot;
+    }
     if (revision === null) return candidate.snapshot;
     const commit = this.access.exactCommit(runId, identity, revision);
     if (
@@ -889,12 +1030,12 @@ export class DeliveryJournal {
         .findLast((turn) => turn.identity.assignmentId === assignmentId)?.identity.turnId ?? null
     );
   }
-  private taskWriters(runId: string, taskId: string) {
+  private taskWriters(runId: string, taskId: string | null) {
     const turns = this.access.agents
       .turns(runId)
       .filter(
         (turn) =>
-          turn.prompt.assignment.taskId === taskId &&
+          (taskId === null || turn.prompt.assignment.taskId === taskId) &&
           ["implementation", "epic_repair"].includes(turn.prompt.assignment.purpose),
       );
     return { count: turns.length, active: turns.some((turn) => turn.stopEvidence === null) };

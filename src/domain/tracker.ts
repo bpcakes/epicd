@@ -38,13 +38,16 @@ export const TrackerIssueSchema = z.strictObject({
   priority: z.number().int().min(0).max(4),
   assignee: z.string().max(1024).nullable(),
   instructions: z.string().max(32768).nullable(),
-  // Optional keeps historical snapshot JSON and digests unchanged.
-  closedAt: z.iso.datetime().nullable().optional(),
-  closeReason: z.string().max(32768).nullable().optional(),
-  closedBySession: z.string().max(1024).nullable().optional(),
-  updatedAt: z.iso.datetime().nullable().optional(),
+  // Missing tracker fields are normalized to null by the transport.
+  closedAt: z.iso.datetime().nullable(),
+  closeReason: z.string().max(32768).nullable(),
+  closedBySession: z.string().max(1024).nullable(),
+  updatedAt: z.iso.datetime().nullable(),
   // Raw work before redaction, excluding task status, assignee and close/update metadata.
   workDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  // Raw requirements and relation identities, without relation status. Expected container
+  // closure changes status, not the work covered by an epic-level review.
+  contentDigest: z.string().regex(/^[0-9a-f]{64}$/),
   dependencies: z.array(TrackerRelationSchema).max(1000),
   dependents: z.array(TrackerRelationSchema).max(1000),
 });

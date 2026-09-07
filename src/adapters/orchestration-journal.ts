@@ -56,8 +56,9 @@ import {
 } from "./diagnostic-journal.js";
 
 import { FixtureJournal, FIXTURE_TABLES, createFixturesSchema } from "./fixture-journal.js";
+import { observeEpicDelivery } from "./epic-delivery.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 19;
+export const ORCHESTRATION_SCHEMA_VERSION = 20;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -280,6 +281,8 @@ export class OrchestrationJournal {
       reviewChecks: (runId, taskId) => this.reviews.requiredChecks(runId, taskId),
       exactCommit: (runId, candidate, revision) => this.commits.exact(runId, candidate, revision),
       assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
+      epicTarget: (runId) => observeEpicDelivery(this, runId),
+      epicId: (runId) => this.runObjective(runId).epicId,
     });
     this.reviews = new ReviewJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -335,7 +338,12 @@ export class OrchestrationJournal {
           );
         const commit = this.commits.exact(runId, publication, revision);
         const candidate = this.delivery.candidate(runId, publication);
-        const assignment = this.agents.assignment(runId, candidate.sourceAssignmentId);
+        if (candidate.source.kind !== "implementation")
+          throw new DeliveryError(
+            "closure_claim_mismatch",
+            "Task closure requires an implementation candidate",
+          );
+        const assignment = this.agents.assignment(runId, candidate.source.assignmentId);
         if (
           commit.taskId !== taskId ||
           candidate.taskId !== taskId ||
