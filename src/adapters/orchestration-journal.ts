@@ -40,8 +40,14 @@ import {
 } from "./delivery-journal.js";
 import { ReviewJournal, REVIEW_TABLES, migrateReviews } from "./review-journal.js";
 import { CommitJournal, COMMIT_TABLES, migrateCommits } from "./commit-journal.js";
+import {
+  PublicationJournal,
+  PUBLICATION_TABLES,
+  migratePublication,
+} from "./publication-journal.js";
+import { concurrentWithPublication } from "../domain/publication.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 9;
+export const ORCHESTRATION_SCHEMA_VERSION = 10;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -55,6 +61,7 @@ export const ORCHESTRATION_TABLES = [
   ...DELIVERY_TABLES,
   ...REVIEW_TABLES,
   ...COMMIT_TABLES,
+  ...PUBLICATION_TABLES,
 ] as const;
 
 /** Called inside StateStore's single forward-migration transaction. */
@@ -117,6 +124,7 @@ export function migrateOrchestration(db: Database.Database): void {
   migrateDelivery(db);
   migrateReviews(db);
   migrateCommits(db);
+  migratePublication(db);
   migrateDecisionSource(db);
 }
 
@@ -174,6 +182,7 @@ export class OrchestrationJournal {
   readonly delivery: DeliveryJournal;
   readonly reviews: ReviewJournal;
   readonly commits: CommitJournal;
+  readonly publications: PublicationJournal;
   readonly decisionSource: DecisionJournal;
 
   constructor(private readonly db: Database.Database) {
@@ -189,6 +198,8 @@ export class OrchestrationJournal {
       control: (runId) => this.control(runId),
       policy: (runId) => this.policy(runId),
       observe: (authority, input) => this.appendObservation(authority, input),
+      publicationPending: (runId) => this.publications.pending(runId),
+      deliveryRepository: (runId) => this.publications.repository(runId),
     });
     this.delivery = new DeliveryJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -199,6 +210,7 @@ export class OrchestrationJournal {
       agents: this.agents,
       reviewChecks: (runId, taskId) => this.reviews.requiredChecks(runId, taskId),
       exactCommit: (runId, candidate, revision) => this.commits.exact(runId, candidate, revision),
+      assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
     });
     this.reviews = new ReviewJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -216,6 +228,18 @@ export class OrchestrationJournal {
       agents: this.agents,
       delivery: this.delivery,
       reviews: this.reviews,
+      assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
+      deliveryRepository: (runId) => this.publications.repository(runId),
+    });
+    this.publications = new PublicationJournal(db, {
+      transaction: (authority, body) => this.transaction(authority, body),
+      control: (runId) => this.control(runId),
+      action: (runId, actionId) => this.action(runId, actionId),
+      observe: (authority, input) => this.appendObservation(authority, input),
+      agents: this.agents,
+      delivery: this.delivery,
+      reviews: this.reviews,
+      commits: this.commits,
     });
   }
 
@@ -406,6 +430,14 @@ export class OrchestrationJournal {
         ];
       else if (pending.policy_digest !== control.policyDigest)
         denial = ["stale_policy", "The effective policy changed"];
+      else if (
+        !concurrentWithPublication(decision.request.action.kind) &&
+        this.publications.pending(authority.runId)
+      )
+        denial = [
+          "publication_unsettled",
+          "Publication I/O/evidence must settle before further mutations",
+        ];
       const actionId = randomUUID();
       if (!pending) return this.rejection(authority.runId, actionId, denial![0], denial![1]);
       // A cancelled/settled ticket cannot be repurposed, even when it never created an action.

@@ -75,7 +75,7 @@ export class WorkspaceManager {
       {
         root: canonicalRoot,
         purpose,
-        sourceMode: ["coordinator", "review", "verification"].includes(purpose)
+        sourceMode: ["coordinator", "review", "verification", "delivery"].includes(purpose)
           ? "immutable"
           : "mutable",
         baselineRevision: revision,
@@ -253,9 +253,10 @@ export class WorkspaceManager {
     commit: CommitRecord,
     creationOperationId: string,
     signal?: AbortSignal,
+    sourceIdentity: WorkspaceIdentity = commit,
   ) {
-    return this.exclusive(authority, commit, "copy_source", async () => {
-      const source = await this.owned(authority, commit);
+    return this.exclusive(authority, sourceIdentity, "copy_source", async () => {
+      const source = await this.owned(authority, sourceIdentity);
       const git = new KernelGit(source.path);
       await this.assertPrivateGit(git, signal);
       if (
@@ -276,6 +277,54 @@ export class WorkspaceManager {
         creationOperationId,
       );
     });
+  }
+
+  /** Publication owns an existing exclusion; never create a nested operation or trust a model path. */
+  async inspectPublicationWorkspace(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    signal?: AbortSignal,
+  ) {
+    const workspace = await this.owned(authority, identity);
+    this.assertStopped(workspace);
+    const operation = this.journal.agents.activeWorkspaceOperation(authority.runId, identity);
+    const publication = this.journal.publications.pending(authority.runId);
+    if (
+      !publication ||
+      !operation ||
+      !publication.workspaceOperations.includes(operation.operationId) ||
+      operation.controllerLeaseId !== authority.leaseId
+    )
+      throw new WorkspaceError(
+        "publication_workspace_unowned",
+        "Publication workspace inspection needs its owned exclusion",
+      );
+    const git = new KernelGit(workspace.path);
+    await this.assertPrivateGit(git, signal);
+    if (
+      (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() !==
+      workspace.baselineRevision
+    )
+      throw new WorkspaceError("publication_workspace_changed", "Publication source HEAD changed");
+    const files = await this.scan(git, workspace.baselineRevision, signal);
+    const expected =
+      workspace.purpose === "delivery"
+        ? workspace.baselineFingerprint
+        : this.journal.commits.record(authority.runId, publication.commitId).fingerprint;
+    if (digestJson(files.map((file) => file.entry)) !== expected)
+      throw new WorkspaceError("publication_workspace_changed", "Publication source bytes changed");
+    if (workspace.purpose !== "delivery") {
+      const commit = this.journal.commits.record(authority.runId, publication.commitId);
+      if (
+        (await git.text(["cat-file", "commit", commit.revision!], optionalSignal(signal))) !==
+        commit.objectContent
+      )
+        throw new WorkspaceError(
+          "publication_object_changed",
+          "Publication object differs from its verified commit intent",
+        );
+    }
+    return workspace;
   }
 
   /** Construct only the approved object and a private retention ref; never advance a checkout or public branch. */

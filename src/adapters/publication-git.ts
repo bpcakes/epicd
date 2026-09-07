@@ -14,6 +14,7 @@ import {
 import { KernelGit } from "./kernel-git.js";
 
 const MAX_PACK = 64 * 1024 * 1024;
+export const PUBLICATION_LOCK_REF = "refs/epicd/publication-lock";
 type Guard = (signal: AbortSignal) => Promise<void>;
 type Head = { ref: string; raw: string; target: string | null; revision: string | null };
 export class PublicationGitError extends Error {
@@ -46,9 +47,85 @@ export const publicationKeepMessage = (pack: PublicationPack) =>
  * Trusted plumbing, NOT a model capability or a durable publication controller.
  * The caller owns leases, exact verification, quiescence and write-once dispatch.
  * No method changes a checkout/index, rewrites a user's branch, retries an effect,
- * deletes an object/keep/ref, or treats matching refs as evidence of stopped I/O.
+ * deletes an object/keep/delivery ref, or treats matching refs as evidence of stopped I/O.
+ * Ownership-ref release requires an exact-object compare-and-swap and caller stop proof.
  */
 export class PublicationGit {
+  /** Read-only planning: persist the returned ownership blob identity before either write. */
+  async planLock(repository: PublicationRepository, content: string, signal?: AbortSignal) {
+    if (Buffer.byteLength(content) > 4096) conflict("Publication ownership record is too large");
+    await this.assertBinding(repository, signal);
+    return (
+      await gitFor(repository).text(["hash-object", "--stdin"], {
+        input: content,
+        ...optionalSignal(signal),
+      })
+    ).trim();
+  }
+  async acquireLock(
+    repository: PublicationRepository,
+    revision: string,
+    content: string,
+    guard: Guard,
+    signal: AbortSignal,
+  ) {
+    if ((await this.planLock(repository, content, signal)) !== revision)
+      conflict("Publication lock object differs from its intent");
+    await this.directRef(repository, PUBLICATION_LOCK_REF, signal);
+    if ((await refValue(gitFor(repository), PUBLICATION_LOCK_REF, signal)) !== null)
+      throw new PublicationGitError(
+        "publication_lock_busy",
+        "Another publication owns the repository lock ref",
+      );
+    await guard(signal);
+    signal.throwIfAborted();
+    const git = gitFor(repository);
+    if (
+      (await git.text(["hash-object", "-w", "--stdin"], { input: content, signal })).trim() !==
+      revision
+    )
+      conflict("Publication ownership object changed");
+    await git.text(["update-ref", "--stdin"], {
+      input: `start\noption no-deref\ncreate ${PUBLICATION_LOCK_REF} ${revision}\nprepare\n`,
+      signal,
+      beforeRefCommit: async (lockedSignal) => {
+        await this.assertBinding(repository, lockedSignal);
+        await this.directRef(repository, PUBLICATION_LOCK_REF, lockedSignal);
+        await guard(lockedSignal);
+        lockedSignal.throwIfAborted();
+      },
+    });
+  }
+  async inspectLock(repository: PublicationRepository, signal?: AbortSignal) {
+    await this.assertBinding(repository, signal);
+    await this.directRef(repository, PUBLICATION_LOCK_REF, signal);
+    return refValue(gitFor(repository), PUBLICATION_LOCK_REF, signal);
+  }
+  /** CAS release cannot delete a newer owner's ref, even if ownership changes after inspection. */
+  async releaseLock(
+    repository: PublicationRepository,
+    revision: string,
+    guard: Guard,
+    signal: AbortSignal,
+  ): Promise<"removed" | "absent" | "other_owner"> {
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(revision)) conflict("Invalid lock object identity");
+    const current = await this.inspectLock(repository, signal);
+    if (current === null) return "absent";
+    if (current !== revision) return "other_owner";
+    await guard(signal);
+    signal.throwIfAborted();
+    await gitFor(repository).text(["update-ref", "--stdin"], {
+      input: `start\noption no-deref\ndelete ${PUBLICATION_LOCK_REF} ${revision}\nprepare\n`,
+      signal,
+      beforeRefCommit: async (lockedSignal) => {
+        await this.assertBinding(repository, lockedSignal);
+        await this.directRef(repository, PUBLICATION_LOCK_REF, lockedSignal);
+        await guard(lockedSignal);
+        lockedSignal.throwIfAborted();
+      },
+    });
+    return "removed";
+  }
   async bind(path: string, signal?: AbortSignal): Promise<PublicationRepository> {
     if (!isAbsolute(path) || (await realpath(path)) !== path)
       conflict("Selected repository must have a canonical absolute path");
@@ -222,6 +299,31 @@ export class PublicationGit {
   }
 
   /** CAS only a run-owned branch plus a unique operation receipt. Objects must already exist. */
+  async inspectImportedPack(
+    destination: PublicationRepository,
+    input: PublicationPack,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const record = PublicationPackSchema.parse(input);
+    await this.assertBinding(destination, signal);
+    if (record.objectFormat !== destination.objectFormat) conflict("Object formats differ");
+    const prefix = `objects/pack/pack-${record.packHash}`;
+    for (const extension of ["pack", "idx", "keep"])
+      await safeEntry(destination.commonDirectory.path, `${prefix}.${extension}`);
+    if (
+      decode(await regular(join(destination.commonDirectory.path, `${prefix}.keep`))) !==
+      `${publicationKeepMessage(record)}\n`
+    )
+      conflict("Retained pack belongs to a different operation");
+    const git = gitFor(destination);
+    await git.text(
+      ["verify-pack", join(destination.commonDirectory.path, `${prefix}.idx`)],
+      optionalSignal(signal),
+    );
+    await assertCommit(git, record.revision, signal);
+  }
+
+  /** CAS only a run-owned branch plus a unique operation receipt. Objects must already exist. */
   async updateRefs(
     input: PublicationRefIntent,
     assertWritable: Guard,
@@ -366,19 +468,25 @@ export class PublicationGit {
   }
 
   private async refSafety(intent: PublicationRefIntent, signal?: AbortSignal): Promise<void> {
-    const git = gitFor(intent.repository);
-    for (const ref of Object.values(publicationRefs(intent))) {
-      await git.text(["check-ref-format", ref], optionalSignal(signal));
-      await safeEntry(intent.repository.commonDirectory.path, ref);
-      await safeEntry(intent.repository.commonDirectory.path, `logs/${ref}`);
-      const symref = (
-        await git.text(["symbolic-ref", "--quiet", "--no-recurse", ref], {
-          allowedExitCodes: [0, 1],
-          ...optionalSignal(signal),
-        })
-      ).trim();
-      if (symref) conflict("Publication cannot replace or follow a symbolic branch or receipt");
-    }
+    for (const ref of Object.values(publicationRefs(intent)))
+      await this.directRef(intent.repository, ref, signal);
+  }
+  private async directRef(
+    repository: PublicationRepository,
+    ref: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const git = gitFor(repository);
+    await git.text(["check-ref-format", ref], optionalSignal(signal));
+    await safeEntry(repository.commonDirectory.path, ref);
+    await safeEntry(repository.commonDirectory.path, `logs/${ref}`);
+    const symref = (
+      await git.text(["symbolic-ref", "--quiet", "--no-recurse", ref], {
+        allowedExitCodes: [0, 1],
+        ...optionalSignal(signal),
+      })
+    ).trim();
+    if (symref) conflict("Publication cannot replace or follow a symbolic branch or receipt");
   }
 
   private async heads(

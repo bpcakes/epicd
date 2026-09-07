@@ -18,6 +18,7 @@ export function registerCommitCapabilities(kernel: ActionKernel, workspaces: Wor
             base.commit,
             record.operationId,
             signal,
+            base.sourceWorkspace ?? base.commit,
           )
         : await workspaces.create(
             authority,

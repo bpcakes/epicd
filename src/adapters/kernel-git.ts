@@ -69,7 +69,9 @@ export class KernelGit {
         options.input
           .split("\n")
           .slice(1, -2)
-          .some((line) => !/^(?:option no-deref|(?:create|update|verify) [^\r\n]+)$/.test(line)))
+          .some(
+            (line) => !/^(?:option no-deref|(?:create|update|verify|delete) [^\r\n]+)$/.test(line),
+          ))
     )
       throw new Error(
         "Prepared transaction guard requires a single explicit update-ref transaction",

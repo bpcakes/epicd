@@ -11,6 +11,7 @@ import { ActionKernel } from "../../src/kernel/actions.js";
 import { registerAgentCapabilities } from "../../src/kernel/agents.js";
 import { registerDeliveryCapabilities } from "../../src/kernel/delivery.js";
 import { registerCommitCapabilities } from "../../src/kernel/commits.js";
+import { registerPublicationCapabilities } from "../../src/kernel/publication.js";
 import { registerReviewCapabilities } from "../../src/kernel/reviews.js";
 import { RepositoryPolicySchema, RequiredCheckSchema } from "../../src/domain/repository-policy.js";
 import { SdkAgentSessionContractSchema } from "../../src/domain/types.js";
@@ -131,6 +132,7 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
   const kernel = new ActionKernel(journal);
   registerDeliveryCapabilities(kernel, manager);
   registerCommitCapabilities(kernel, manager);
+  const publication = registerPublicationCapabilities(kernel, manager);
   registerAgentCapabilities(kernel, driver, () => contract);
   registerReviewCapabilities(kernel, manager, driver, () => contract);
   const decision = (action: KernelAction) => {
@@ -295,6 +297,7 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
     head,
     journal,
     manager,
+    publication,
     workspace,
     writer,
     kernel,

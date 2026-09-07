@@ -100,6 +100,7 @@ type Access = {
   agents: AgentJournal;
   reviewChecks(runId: string, taskId: string): z.infer<typeof RequiredCheckSchema>[];
   exactCommit(runId: string, candidate: CandidateIdentity, revision: string): CommitRecord;
+  assertPublicationIdle(runId: string): void;
 };
 export class DeliveryError extends Error {
   constructor(
@@ -121,6 +122,7 @@ export class DeliveryJournal {
 
   definePlan(authority: ControllerAuthority, actionId: string): ValidationPlan {
     return this.access.transaction(authority, () => {
+      this.access.assertPublicationIdle(authority.runId);
       const { record, action } = this.action(authority, actionId, "define_validation_plan");
       const prior = this.byOperation(
         ValidationPlanSchema,

@@ -363,7 +363,9 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
     const db = new Database(s.path);
     try {
       const original = db.prepare("SELECT record_json FROM review_evidence").get();
-      db.exec("DROP TABLE delivery_commits; UPDATE orchestration_schema SET version = 8");
+      db.exec(
+        "DROP TABLE publications; DROP TABLE delivery_repositories; DROP TABLE delivery_commits; UPDATE orchestration_schema SET version = 8",
+      );
       const upgraded = new StateStore(s.path);
       try {
         expect(upgraded.orchestration.reviews.evidence(run, review.evidence.evidenceId)).toEqual(
@@ -373,7 +375,7 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
         upgraded.close();
       }
       expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 9,
+        version: 10,
       });
       const file = readdirSync(s.root).find((name) => name.includes("before-orchestration"))!;
       const snapshot = new Database(join(s.root, file), { readonly: true });

@@ -41,6 +41,8 @@ type Access = {
   agents: AgentJournal;
   delivery: DeliveryJournal;
   reviews: ReviewJournal;
+  assertPublicationIdle(runId: string): void;
+  deliveryRepository(runId: string): import("../domain/publication.js").DeliveryRepository | null;
 };
 const at = () => new Date().toISOString();
 
@@ -51,6 +53,7 @@ export class CommitJournal {
   ) {}
   reserve(authority: ControllerAuthority, actionId: string): CommitRecord {
     return this.access.transaction(authority, () => {
+      this.access.assertPublicationIdle(authority.runId);
       const action = this.access.action(authority.runId, actionId);
       const control = this.access.control(authority.runId);
       if (
@@ -265,7 +268,13 @@ export class CommitJournal {
   implementationBase(
     runId: string,
     commitId: string | null,
-  ): { revision: string; sourcePath: string; commit: CommitRecord | null } {
+  ): {
+    revision: string;
+    sourcePath: string;
+    commit: CommitRecord | null;
+    sourceWorkspace: import("../domain/agents.js").WorkspaceIdentity | null;
+  } {
+    this.access.assertPublicationIdle(runId);
     if (this.records(runId).some((record) => ["preparing", "writing"].includes(record.status)))
       throw new DeliveryError(
         "commit_unsettled",
@@ -277,19 +286,31 @@ export class CommitJournal {
         "implementation_base_stale",
         "New work must extend the latest private commit, never rewrite or fork completed work",
       );
-    if (latest)
+    if (latest) {
+      const custody = this.access.deliveryRepository(runId);
+      const sourceWorkspace =
+        custody?.workspace && custody.privateRevision === latest.revision
+          ? custody.workspace
+          : null;
       return {
         revision: latest.revision!,
-        sourcePath: this.access.agents.workspace(runId, latest).path,
+        sourcePath: this.access.agents.workspace(runId, sourceWorkspace ?? latest).path,
         commit: latest,
+        sourceWorkspace,
       };
+    }
     const row = this.db.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as
       { state_json: string } | undefined;
     if (!row) throw new DeliveryError("unknown_run", "Run baseline is unavailable");
     const run = RunStateSchema.parse(JSON.parse(row.state_json));
     if (!run.epicBaseRevision)
       throw new DeliveryError("missing_baseline", "Run needs an exact initial baseline");
-    return { revision: run.epicBaseRevision, sourcePath: run.repoPath, commit: null };
+    return {
+      revision: run.epicBaseRevision,
+      sourcePath: run.repoPath,
+      commit: null,
+      sourceWorkspace: null,
+    };
   }
   summaries(runId: string) {
     return this.records(runId)

@@ -19,6 +19,7 @@ import {
   PublicationGit,
   publicationRefs,
   publicationKeepMessage,
+  PUBLICATION_LOCK_REF,
 } from "../src/adapters/publication-git.js";
 import {
   PublicationRefIntentSchema,
@@ -97,6 +98,67 @@ async function fixture(format: "sha1" | "sha256" = "sha1", linked = false) {
 }
 
 describe("publication Git transport (physical facts, not approval or durable dispatch)", () => {
+  it.each(["sha1", "sha256"] as const)(
+    "acquires and releases a unique %s publication owner by compare-and-swap",
+    async (format) => {
+      const f = await fixture(format);
+      const content = `${JSON.stringify({ publicationId: f.intent.publicationId, nonce: randomUUID() })}\n`;
+      const revision = await f.transport.planLock(f.repository, content);
+      expect(await f.transport.inspectLock(f.repository)).toBeNull();
+      expect(() => git(f.user, "cat-file", "blob", revision)).toThrow();
+      await f.transport.acquireLock(f.repository, revision, content, guard, signal());
+      expect(await f.transport.inspectLock(f.repository)).toBe(revision);
+      expect(git(f.user, "cat-file", "blob", revision)).toBe(content.trim());
+      await expect(
+        f.transport.acquireLock(f.repository, revision, content, guard, signal()),
+      ).rejects.toThrow("Another publication");
+      expect(await f.transport.releaseLock(f.repository, f.base, guard, signal())).toBe(
+        "other_owner",
+      );
+      expect(await f.transport.inspectLock(f.repository)).toBe(revision);
+      expect(await f.transport.releaseLock(f.repository, revision, guard, signal())).toBe(
+        "removed",
+      );
+      expect(await f.transport.releaseLock(f.repository, revision, guard, signal())).toBe("absent");
+      expect(await f.transport.inspectLock(f.repository)).toBeNull();
+      expect(git(f.user, "rev-parse", "HEAD")).toBe(f.base);
+    },
+  );
+
+  it("does not remove a replacement publication owner between inspection and release", async () => {
+    const f = await fixture();
+    const content = `owner:${randomUUID()}`;
+    const revision = await f.transport.planLock(f.repository, content);
+    await f.transport.acquireLock(f.repository, revision, content, guard, signal());
+    await expect(
+      f.transport.releaseLock(
+        f.repository,
+        revision,
+        async () => {
+          git(f.user, "update-ref", "--no-deref", PUBLICATION_LOCK_REF, f.base, revision);
+        },
+        signal(),
+      ),
+    ).rejects.toThrow();
+    expect(await f.transport.inspectLock(f.repository)).toBe(f.base);
+    expect(git(f.user, "rev-parse", "HEAD")).toBe(f.base);
+  });
+
+  it("rejects a symbolic publication lock without following or removing its target", async () => {
+    const f = await fixture();
+    const content = `owner:${randomUUID()}`;
+    const revision = await f.transport.planLock(f.repository, content);
+    git(f.user, "symbolic-ref", PUBLICATION_LOCK_REF, "refs/heads/main");
+    await expect(
+      f.transport.acquireLock(f.repository, revision, content, guard, signal()),
+    ).rejects.toThrow("symbolic");
+    await expect(f.transport.releaseLock(f.repository, f.base, guard, signal())).rejects.toThrow(
+      "symbolic",
+    );
+    expect(git(f.user, "symbolic-ref", PUBLICATION_LOCK_REF)).toBe("refs/heads/main");
+    expect(git(f.user, "rev-parse", "HEAD")).toBe(f.base);
+  });
+
   it.each(["sha1", "sha256"] as const)(
     "imports identical %s objects and publishes without changing dirty checkout/index/HEAD",
     async (format) => {

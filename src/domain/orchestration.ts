@@ -206,6 +206,8 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
     revision: Id,
     expectedPreviousRevision: Id,
   }),
+  z.strictObject({ kind: z.literal("inspect_publication"), publicationId: Id }),
+  z.strictObject({ kind: z.literal("reconcile_publication"), publicationId: Id }),
   z.strictObject({
     kind: z.literal("request_beads_transition"),
     transition: z.enum(["claim", "adopt", "close_task", "close_container", "close_epic"]),

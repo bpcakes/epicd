@@ -118,6 +118,7 @@ export class ActionKernel {
         delivery: journal.delivery.summaries(authority.runId),
         reviews: journal.reviews.summaries(authority.runId),
         commits: journal.commits.summaries(authority.runId),
+        publications: journal.publications.summaries(authority.runId),
         memory: journal
           .memory(authority.runId)
           .slice(-20)

@@ -132,6 +132,8 @@ type Access = {
   control(runId: string): ControlState;
   policy(runId: string): RepositoryPolicy;
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
+  publicationPending(runId: string): import("../domain/publication.js").PublicationRecord | null;
+  deliveryRepository(runId: string): import("../domain/publication.js").DeliveryRepository | null;
 };
 export class AgentCoordinationError extends Error {
   constructor(
@@ -193,6 +195,19 @@ export class AgentJournal {
   ): WorkspaceRecord {
     return this.access.transaction(authority, () => {
       this.active(authority, expectedControlVersion);
+      const publication = this.access.publicationPending(authority.runId);
+      if (
+        publication &&
+        !(
+          input.purpose === "delivery" &&
+          input.creationOperationId ===
+            this.access.deliveryRepository(authority.runId)?.creationOperationId
+        )
+      )
+        throw new AgentCoordinationError(
+          "publication_unsettled",
+          "Publication excludes new worker workspaces",
+        );
       if (
         input.creationOperationId &&
         this.workspaceForOperation(authority.runId, input.creationOperationId)
@@ -288,6 +303,21 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       if (kind !== "inspect_materialization") this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, identity);
+      const publication = this.access.publicationPending(authority.runId);
+      if (
+        publication &&
+        kind !== "inspect_materialization" &&
+        !(
+          workspace.purpose === "delivery" &&
+          workspace.creationOperationId ===
+            this.access.deliveryRepository(authority.runId)?.creationOperationId &&
+          (kind === "materialize" || kind === "publication")
+        )
+      )
+        throw new AgentCoordinationError(
+          "publication_unsettled",
+          "Publication excludes other workspace mutations",
+        );
       const allowed =
         kind === "materialize"
           ? workspace.status === "reserved"
@@ -480,6 +510,16 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       const control = this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, input);
+      if (workspace.purpose === "delivery")
+        throw new AgentCoordinationError(
+          "kernel_workspace",
+          "Canonical delivery custody is never assigned to an agent",
+        );
+      if (this.access.publicationPending(authority.runId) && input.purpose !== "coordination")
+        throw new AgentCoordinationError(
+          "publication_unsettled",
+          "Publication excludes new worker assignments",
+        );
       if (
         workspace.status !== "ready" ||
         workspace.activeTurnId ||
@@ -798,6 +838,14 @@ export class AgentJournal {
       const control = this.active(authority, expectedControlVersion);
       const agent = this.instance(authority.runId, identity);
       const workspace = this.workspace(authority.runId, agent);
+      if (
+        this.access.publicationPending(authority.runId) &&
+        this.assignment(authority.runId, agent.assignmentId).purpose !== "coordination"
+      )
+        throw new AgentCoordinationError(
+          "publication_unsettled",
+          "Publication excludes new worker turns",
+        );
       const available =
         (agent.status === "ready" && agent.provider !== null) ||
         (agent.status === "reserved" && agent.provider === null);
