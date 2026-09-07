@@ -59,6 +59,7 @@ type Access = {
   delivery: DeliveryJournal;
   reviews: ReviewJournal;
   commits: CommitJournal;
+  assertTrackerIdle(runId: string): void;
 };
 const fail = (code: string, message: string): never => {
   throw new DeliveryError(code, message);
@@ -566,6 +567,7 @@ export class PublicationJournal {
       );
   }
   private quiescent(runId: string, operationId: string) {
+    this.access.assertTrackerIdle(runId);
     const actions = this.db
       .prepare(
         "SELECT operation_id, request_json FROM actions WHERE run_id = ? AND status IN ('accepted', 'running', 'indeterminate')",

@@ -46,8 +46,10 @@ import {
   migratePublication,
 } from "./publication-journal.js";
 import { concurrentWithPublication } from "../domain/publication.js";
+import { TrackerJournal, TRACKER_TABLES, migrateTracker } from "./tracker-journal.js";
+import { concurrentWithTracker } from "../domain/tracker.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 10;
+export const ORCHESTRATION_SCHEMA_VERSION = 11;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -62,6 +64,7 @@ export const ORCHESTRATION_TABLES = [
   ...REVIEW_TABLES,
   ...COMMIT_TABLES,
   ...PUBLICATION_TABLES,
+  ...TRACKER_TABLES,
 ] as const;
 
 /** Called inside StateStore's single forward-migration transaction. */
@@ -125,6 +128,7 @@ export function migrateOrchestration(db: Database.Database): void {
   migrateReviews(db);
   migrateCommits(db);
   migratePublication(db);
+  migrateTracker(db);
   migrateDecisionSource(db);
 }
 
@@ -183,6 +187,7 @@ export class OrchestrationJournal {
   readonly reviews: ReviewJournal;
   readonly commits: CommitJournal;
   readonly publications: PublicationJournal;
+  readonly tracker: TrackerJournal;
   readonly decisionSource: DecisionJournal;
 
   constructor(private readonly db: Database.Database) {
@@ -200,6 +205,7 @@ export class OrchestrationJournal {
       observe: (authority, input) => this.appendObservation(authority, input),
       publicationPending: (runId) => this.publications.pending(runId),
       deliveryRepository: (runId) => this.publications.repository(runId),
+      assertTaskOwned: (runId, taskId) => this.tracker.assertTaskOwned(runId, taskId),
     });
     this.delivery = new DeliveryJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -240,6 +246,14 @@ export class OrchestrationJournal {
       delivery: this.delivery,
       reviews: this.reviews,
       commits: this.commits,
+      assertTrackerIdle: (runId) => this.tracker.assertIdle(runId),
+    });
+    this.tracker = new TrackerJournal(db, {
+      transaction: (authority, body) => this.transaction(authority, body),
+      control: (runId) => this.control(runId),
+      action: (runId, actionId) => this.action(runId, actionId),
+      observe: (authority, input) => this.appendObservation(authority, input),
+      assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
     });
   }
 
@@ -438,6 +452,11 @@ export class OrchestrationJournal {
           "publication_unsettled",
           "Publication I/O/evidence must settle before further mutations",
         ];
+      else if (
+        !concurrentWithTracker(decision.request.action.kind) &&
+        this.tracker.pending(authority.runId)
+      )
+        denial = ["tracker_unsettled", "Reconcile tracker I/O/evidence before further mutations"];
       const actionId = randomUUID();
       if (!pending) return this.rejection(authority.runId, actionId, denial![0], denial![1]);
       // A cancelled/settled ticket cannot be repurposed, even when it never created an action.

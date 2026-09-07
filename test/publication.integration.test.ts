@@ -574,7 +574,7 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     const db = new Database(s.path);
     try {
       db.exec(
-        "DROP TABLE publications; DROP TABLE delivery_repositories; UPDATE orchestration_schema SET version = 9",
+        "DROP TABLE tracker_snapshots; DROP TABLE tracker_operations; DROP TABLE tracker_roots; DROP TABLE publications; DROP TABLE delivery_repositories; UPDATE orchestration_schema SET version = 9",
       );
       const raw = db
         .prepare("SELECT record_json FROM delivery_commits WHERE commit_id = ?")
@@ -583,7 +583,7 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
       const upgraded = new StateStore(s.path);
       upgraded.close();
       expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 10,
+        version: 11,
       });
       expect(
         db

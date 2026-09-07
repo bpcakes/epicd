@@ -134,6 +134,7 @@ type Access = {
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
   publicationPending(runId: string): import("../domain/publication.js").PublicationRecord | null;
   deliveryRepository(runId: string): import("../domain/publication.js").DeliveryRepository | null;
+  assertTaskOwned(runId: string, taskId: string | null): void;
 };
 export class AgentCoordinationError extends Error {
   constructor(
@@ -510,6 +511,7 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       const control = this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, input);
+      this.access.assertTaskOwned(authority.runId, input.taskId);
       if (workspace.purpose === "delivery")
         throw new AgentCoordinationError(
           "kernel_workspace",
@@ -838,6 +840,10 @@ export class AgentJournal {
       const control = this.active(authority, expectedControlVersion);
       const agent = this.instance(authority.runId, identity);
       const workspace = this.workspace(authority.runId, agent);
+      this.access.assertTaskOwned(
+        authority.runId,
+        this.assignment(authority.runId, agent.assignmentId).taskId,
+      );
       if (
         this.access.publicationPending(authority.runId) &&
         this.assignment(authority.runId, agent.assignmentId).purpose !== "coordination"
