@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { ADAPTIVE_ORCHESTRATOR_MODEL, AstraReasoningEffortSchema } from "./types.js";
+import { ORCHESTRATOR_MODEL, AstraReasoningEffortSchema } from "./types.js";
 
 const RelativePath = z
   .string()
@@ -29,14 +29,14 @@ export const RepositoryPolicySchema = z
     schemaVersion: z.literal(1),
     coordinator: z
       .strictObject({
-        model: z.literal(ADAPTIVE_ORCHESTRATOR_MODEL).default(ADAPTIVE_ORCHESTRATOR_MODEL),
+        model: z.literal(ORCHESTRATOR_MODEL).default(ORCHESTRATOR_MODEL),
         reasoningEfforts: z
           .array(AstraReasoningEffortSchema)
           .min(1)
           .default(["low", "medium", "high", "xhigh", "max"]),
       })
       .default({
-        model: ADAPTIVE_ORCHESTRATOR_MODEL,
+        model: ORCHESTRATOR_MODEL,
         reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
       }),
     requiredChecks: z.array(RequiredCheckSchema).max(100).default([]),

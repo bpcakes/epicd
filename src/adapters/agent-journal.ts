@@ -27,11 +27,7 @@ import {
   type ObservationInput,
   type TurnIdentity,
 } from "../domain/orchestration.js";
-import {
-  ADAPTIVE_ORCHESTRATOR_MODEL,
-  type AgentRole,
-  type AgentSessionContract,
-} from "../domain/types.js";
+import { ORCHESTRATOR_MODEL, type AgentRole, type AgentSessionContract } from "../domain/types.js";
 import { digestJson, type RepositoryPolicy } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { WorkspaceOperationSchema, type WorkspaceOperation } from "../domain/workspaces.js";
@@ -1388,8 +1384,8 @@ export class AgentJournal {
       );
     if (agent.role === "orchestrator") {
       if (
-        agent.contract.effective.model !== ADAPTIVE_ORCHESTRATOR_MODEL ||
-        agent.contract.requested.model !== ADAPTIVE_ORCHESTRATOR_MODEL ||
+        agent.contract.effective.model !== ORCHESTRATOR_MODEL ||
+        agent.contract.requested.model !== ORCHESTRATOR_MODEL ||
         !policy.coordinator.reasoningEfforts.some(
           (effort) => effort === agent.contract.effective.reasoningEffort,
         )

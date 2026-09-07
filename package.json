@@ -15,7 +15,7 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
-    "dev": "tsx src/cli.tsx",
+    "dev": "npm run build && node dist/cli.js",
     "format": "prettier --write src test README.md package.json tsconfig.json tsconfig.test.json vitest.config.ts",
     "format:check": "prettier --check src test README.md package.json tsconfig.json tsconfig.test.json vitest.config.ts",
     "start": "node dist/cli.js",

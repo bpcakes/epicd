@@ -25,7 +25,7 @@ function fixture(budget = 100 * 1024 * 1024) {
   const path = join(root, "state.sqlite3");
   let store = new StateStore(path);
   cleanups.push(() => store.close());
-  const state = store.createAdaptive(
+  const state = store.create(
     initialRun(),
     RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { artifactBytes: budget } }),
   );
@@ -335,7 +335,7 @@ describe("retained diagnostic artifacts", () => {
     const original = s.db.prepare("SELECT * FROM observations").all();
     s.reopen();
     expect(s.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-      version: 13,
+      version: 15,
     });
     expect(s.db.prepare("SELECT * FROM observations").all()).toEqual(original);
     expect(

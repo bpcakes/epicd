@@ -9,6 +9,7 @@ import type { RepositoryPolicy } from "../domain/repository-policy.js";
 import { actionContextRecord } from "../kernel/action-context.js";
 
 export type OrchestratorContext = {
+  objective: ReturnType<ActionKernel["journal"]["runObjective"]>;
   control: ControlState;
   observationCursor: number;
   observations: Observation[];
@@ -35,6 +36,7 @@ export function buildOrchestratorContext(kernel: ActionKernel, runId: string): O
   const observations = kernel.journal.observations(runId, control.observationCursor, 100);
   const policy = kernel.journal.policy(runId);
   const context: OrchestratorContext = {
+    objective: kernel.journal.runObjective(runId),
     control,
     observationCursor: observations.at(-1)?.id ?? control.observationCursor,
     observations,

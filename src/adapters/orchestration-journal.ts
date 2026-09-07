@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { RunStateSchema } from "../domain/types.js";
 import type Database from "better-sqlite3";
 import {
   ActionRecordSchema,
@@ -54,7 +55,7 @@ import {
   createDiagnosticsSchema,
 } from "./diagnostic-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 13;
+export const ORCHESTRATION_SCHEMA_VERSION = 15;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -87,6 +88,8 @@ export function createOrchestrationSchema(db: Database.Database): void {
       decisions_used INTEGER NOT NULL DEFAULT 0 CHECK(decisions_used >= 0),
       max_decisions INTEGER NOT NULL CHECK(max_decisions > 0)
     ) STRICT;
+    CREATE TRIGGER control_status_projection AFTER UPDATE OF status ON orchestration_runs
+      BEGIN UPDATE runs SET phase = NEW.status WHERE run_id = NEW.run_id; END;
     CREATE TABLE IF NOT EXISTS decisions (
       decision_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
       observation_cursor INTEGER NOT NULL, control_version INTEGER NOT NULL, policy_digest TEXT NOT NULL,
@@ -317,16 +320,28 @@ export class OrchestrationJournal {
     );
   }
 
-  /** Creation is part of the parent StateStore.createAdaptive transaction, not a conversion API. */
+  runObjective(runId: string) {
+    const row = this.db.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as
+      { state_json: string } | undefined;
+    const state = RunStateSchema.parse(row ? JSON.parse(row.state_json) : null);
+    if (state.runId !== runId) throw new Error("Run identity mismatch");
+    return {
+      epicId: state.epicId,
+      title: state.epicTitle,
+      baselineRevision: state.epicBaseRevision,
+      runtime: state.runtime,
+    };
+  }
+
+  /** Creation is part of the parent StateStore.create transaction. */
   initialize(runId: string, policyInput: RepositoryPolicy, taskCount: number): void {
     if (!this.db.inTransaction)
       throw new Error("Adaptive initialization requires a creation transaction");
     const policy = RepositoryPolicySchema.parse(policyInput);
     const row = this.db.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as
       { state_json: string } | undefined;
-    const state = row ? JSON.parse(row.state_json) : null;
-    if (state?.stateSchemaVersion !== 2 || state.orchestrationMode !== "adaptive")
-      throw new Error("Expected a newly created adaptive run");
+    const state = RunStateSchema.parse(row ? JSON.parse(row.state_json) : null);
+    if (state.runId !== runId) throw new Error("Run identity mismatch");
     const maxDecisions = policy.budgets.epicDecisions + policy.budgets.taskDecisions * taskCount;
     if (!Number.isSafeInteger(maxDecisions) || maxDecisions <= 0)
       throw new Error("Invalid adaptive decision budget");
@@ -336,6 +351,10 @@ export class OrchestrationJournal {
       VALUES (?, 0, ?, ?, 'active', ?)`,
       )
       .run(runId, digestJson(policy), JSON.stringify(policy), maxDecisions);
+    // Configured delivery runs require tracker claims from their first action,
+    // before the model chooses when to refresh the graph.
+    if (state.runtimeConfiguration !== null)
+      this.db.prepare("INSERT INTO tracker_roots VALUES (?, NULL)").run(runId);
   }
 
   control(runId: string): ControlState {
@@ -373,9 +392,8 @@ export class OrchestrationJournal {
       .get(authority.runId, authority.ownerToken, authority.leaseId) as
       { state_json: string } | undefined;
     if (!row) throw new Error("Adaptive controller lease was lost or replaced");
-    const state = JSON.parse(row.state_json);
-    if (state.stateSchemaVersion !== 2 || state.orchestrationMode !== "adaptive")
-      throw new Error("Run is not in adaptive mode");
+    const state = RunStateSchema.parse(JSON.parse(row.state_json));
+    if (state.runId !== authority.runId) throw new Error("Run identity mismatch");
     this.policy(authority.runId);
   }
 
@@ -724,15 +742,19 @@ export class OrchestrationJournal {
   }
 
   appendObservation(authority: ControllerAuthority, input: ObservationInput): Observation {
+    return this.transaction(authority, () => this.recordObservation(authority.runId, input));
+  }
+
+  private recordObservation(runId: string, input: ObservationInput): Observation {
     const parsed = ObservationInputSchema.parse(input);
-    if (parsed.identity && parsed.identity.runId !== authority.runId)
+    if (parsed.identity && parsed.identity.runId !== runId)
       throw new Error("Observation belongs to a different run");
-    return this.transaction(authority, () => {
+    {
       const previous = this.db
         .prepare(
           "SELECT * FROM observations WHERE run_id = ? AND source = ? AND source_event_id = ?",
         )
-        .get(authority.runId, parsed.source, parsed.sourceEventId) as ObservationRow | undefined;
+        .get(runId, parsed.source, parsed.sourceEventId) as ObservationRow | undefined;
       if (previous) {
         if (previous.input_digest !== digestJson(parsed))
           throw new Error("Observation source ID was reused with different content");
@@ -746,7 +768,7 @@ export class OrchestrationJournal {
         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
-          authority.runId,
+          runId,
           parsed.source,
           parsed.sourceEventId,
           digestJson(parsed),
@@ -755,7 +777,7 @@ export class OrchestrationJournal {
           parsed.wakesOrchestrator ? 1 : 0,
         );
       return ObservationSchema.parse({ ...value, id: Number(row.lastInsertRowid), at });
-    });
+    }
   }
 
   observations(runId: string, afterCursor = 0, limit = 100, wakeOnly = false): Observation[] {
@@ -916,6 +938,77 @@ export class OrchestrationJournal {
         .run(status, authority.runId);
       this.audit(authority.runId, "orchestrator.status_changed", status);
     });
+  }
+
+  pendingEscalation(runId: string) {
+    const row = this.db
+      .prepare(
+        "SELECT escalation_id, question, reason, created_at FROM escalations WHERE run_id = ? AND status = 'pending'",
+      )
+      .get(runId) as
+      { escalation_id: string; question: string; reason: string; created_at: string } | undefined;
+    return row
+      ? {
+          escalationId: row.escalation_id,
+          question: row.question,
+          reason: row.reason,
+          createdAt: row.created_at,
+        }
+      : null;
+  }
+
+  /** Trusted CLI/TUI operator boundary. Agents never receive access to this database API. */
+  operatorControl(
+    runId: string,
+    expectedVersion: number,
+    command:
+      | { kind: "pause" }
+      | { kind: "resume" }
+      | { kind: "respond"; escalationId: string; message: string },
+  ): ControlState {
+    return this.db
+      .transaction(() => {
+        const control = this.control(runId);
+        if (control.controlVersion !== expectedVersion)
+          throw new Error("Control changed; inspect the run before retrying");
+        if (control.status === "complete")
+          throw new Error("A completed run cannot resume delivery");
+        const pending = this.pendingEscalation(runId);
+        if (command.kind === "resume" && (control.status !== "paused" || pending))
+          throw new Error(
+            "Only a paused run without a pending question can resume; respond to its exact escalation first",
+          );
+        if (command.kind === "respond") {
+          if (!pending || pending.escalationId !== command.escalationId)
+            throw new Error("Escalation changed; inspect the pending question before responding");
+          if (!command.message.trim() || Buffer.byteLength(command.message) > 7000)
+            throw new Error("Response must contain 1–7000 bytes");
+          const message = redactSensitiveText(command.message, 7000);
+          this.db
+            .prepare(
+              "UPDATE escalations SET status = 'answered', response = ?, answered_at = ? WHERE run_id = ? AND escalation_id = ? AND status = 'pending'",
+            )
+            .run(message, now(), runId, command.escalationId);
+          this.recordObservation(runId, {
+            source: "operator",
+            sourceEventId: randomUUID(),
+            kind: "operator.response",
+            identity: null,
+            summary: `Response to ${command.escalationId}: ${message}\nAuthority: instruction only; no environment or destructive-action grant.`,
+            artifactIds: [],
+            wakesOrchestrator: true,
+          });
+        }
+        const status = command.kind === "pause" ? "paused" : "active";
+        this.db
+          .prepare(
+            "UPDATE orchestration_runs SET status = ?, control_version = control_version + 1 WHERE run_id = ?",
+          )
+          .run(status, runId);
+        this.audit(runId, `operator.${command.kind}`, status);
+        return this.control(runId);
+      })
+      .immediate();
   }
 
   /** Called only inside an already-authorized StateStore settings transaction. */

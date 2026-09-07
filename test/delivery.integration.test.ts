@@ -63,7 +63,7 @@ async function fixture(policyInput: Partial<RepositoryPolicy> = {}) {
   stores.push(store);
   const initial = initialRun();
   initial.repoPath = source;
-  const state = store.createAdaptive(
+  const state = store.create(
     initial,
     RepositoryPolicySchema.parse({ schemaVersion: 1, requiredChecks: [check], ...policyInput }),
   );

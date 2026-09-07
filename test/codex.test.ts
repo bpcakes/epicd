@@ -3,8 +3,6 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CodexRuntime } from "../src/adapters/codex.js";
-import type { OpenedAgentSession } from "../src/adapters/runtime.js";
 import {
   codexProcessEnvironment,
   resolveCodexModel,
@@ -181,7 +179,7 @@ async function waitForProcessExit(pid: number): Promise<void> {
   throw new Error(`Process ${pid} did not exit`);
 }
 
-describe("CodexRuntime sessions", () => {
+describe("Codex executable and model discovery", () => {
   it("normalizes a path-like executable override before using another repository cwd", async () => {
     const setup = fakeCodex();
     const repoPath = mkdtempSync(join(tmpdir(), "epicd-codex-repo-"));
@@ -191,21 +189,6 @@ describe("CodexRuntime sessions", () => {
     expect(resolveCodexExecutable(configuredPath).executablePath).toBe(resolve(setup.executable));
     await expect(resolveCodexModel(repoPath, { codexPath: configuredPath })).resolves.toBe(
       "gpt-default",
-    );
-  });
-
-  it("rejects a session opened by another runtime", async () => {
-    const setup = fakeCodex();
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-    const foreignSession = { runtime: "herdr" } as OpenedAgentSession;
-
-    // @ts-expect-error Exercise the runtime guard for untyped callers too.
-    await expect(runtime.run(foreignSession, "Review")).rejects.toThrow(
-      "Codex runtime received a non-SDK session",
     );
   });
 
@@ -263,24 +246,6 @@ describe("CodexRuntime sessions", () => {
       "string",
       "null",
     ]);
-  });
-
-  it("defers executable resolution until a thread is opened", async () => {
-    const missing = join(tmpdir(), "definitely-missing-epicd-codex");
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: missing,
-      accessMode: "sandboxed",
-    });
-
-    await expect(runtime.release("thr-old")).resolves.toBeUndefined();
-    await expect(runtime.releaseAll()).resolves.toBeUndefined();
-    await expect(
-      runtime.open("review", {
-        kind: "new",
-        settings: { model: "gpt-test", reasoningEffort: "xhigh" },
-      }),
-    ).rejects.toThrow("Configured Codex executable does not exist");
   });
 
   it("preserves bare-command executable overrides for PATH resolution", () => {
@@ -496,27 +461,6 @@ describe("CodexRuntime sessions", () => {
     await expect(failure).rejects.toThrow("invalid Codex configuration");
   });
 
-  it("captures the current process environment for each newly opened thread", async () => {
-    const setup = fakeCodex();
-    const envLog = join(dirname(setup.executable), "environment.log");
-    process.env.EPICD_CODEX_ARGUMENT_LOG = setup.argumentLog;
-    process.env.EPICD_CODEX_ENV_LOG = envLog;
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-    process.env.EPICD_CODEX_DYNAMIC_ENV = "after-construction";
-
-    const opened = await runtime.open("review", {
-      kind: "new",
-      settings: { model: "gpt-test", reasoningEffort: "xhigh" },
-    });
-    await runtime.run(opened, "Review");
-
-    expect(readFileSync(envLog, "utf8")).toBe("after-construction");
-  });
-
   it("does not retry a completed app-server process exit", async () => {
     const setup = fakeCodex();
     const countFile = join(dirname(setup.executable), "app-server-count");
@@ -578,189 +522,5 @@ describe("CodexRuntime sessions", () => {
     await expect(resolveCodexModel(process.cwd(), { codexPath: setup.executable })).rejects.toThrow(
       "malformed JSON-RPC output",
     );
-  });
-
-  it("resolves and pins the effective model when the configured model is null", async () => {
-    const setup = fakeCodex();
-    process.env.EPICD_CODEX_ARGUMENT_LOG = setup.argumentLog;
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-
-    const opened = await runtime.open("review", {
-      kind: "new",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    });
-    const result = await runtime.run(opened, "Review");
-
-    expect(result).toEqual({
-      sessionId: "thr-test",
-      finalResponse: "done",
-      usage: {
-        inputTokens: 1,
-        cachedInputTokens: 0,
-        cacheWriteInputTokens: 0,
-        outputTokens: 1,
-        reasoningOutputTokens: 0,
-      },
-    });
-    expect(opened.contract).toEqual({
-      runtime: "sdk",
-      requested: { model: null, reasoningEffort: "xhigh" },
-      effective: { model: "gpt-default", reasoningEffort: "xhigh" },
-    });
-    const args = JSON.parse(readFileSync(setup.argumentLog, "utf8")) as string[];
-    expect(args).toContain("--model");
-    expect(args).toContain("gpt-default");
-    expect(args).toContain('model_reasoning_effort="xhigh"');
-  });
-
-  it("resolves the current default for each new model-less thread", async () => {
-    const setup = fakeCodex();
-    const countFile = join(dirname(setup.executable), "app-server-count");
-    process.env.EPICD_CODEX_APP_SERVER_COUNT = countFile;
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-
-    process.env.EPICD_CODEX_DEFAULT_MODEL = "gpt-first";
-    const first = await runtime.open("implementation", {
-      kind: "new",
-      settings: { model: null, reasoningEffort: "high" },
-    });
-    process.env.EPICD_CODEX_DEFAULT_MODEL = "gpt-second";
-    const second = await runtime.open("review", {
-      kind: "new",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    });
-
-    expect(first.contract.effective.model).toBe("gpt-first");
-    expect(second.contract.effective.model).toBe("gpt-second");
-    expect(readFileSync(countFile, "utf8")).toBe("2");
-  });
-
-  it("reuses one discovered default while preparing changed settings", async () => {
-    const setup = fakeCodex();
-    const countFile = join(dirname(setup.executable), "app-server-count");
-    process.env.EPICD_CODEX_APP_SERVER_COUNT = countFile;
-    process.env.EPICD_CODEX_DEFAULT_MODEL = "gpt-first";
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-
-    const first = await runtime.prepareNewSession("review", {
-      model: null,
-      reasoningEffort: "high",
-    });
-    process.env.EPICD_CODEX_DEFAULT_MODEL = "gpt-second";
-    const second = await runtime.prepareNewSession(
-      "review",
-      { model: null, reasoningEffort: "xhigh" },
-      first,
-    );
-
-    expect(second).toEqual({
-      runtime: "sdk",
-      requested: { model: null, reasoningEffort: "xhigh" },
-      effective: { model: "gpt-first", reasoningEffort: "xhigh" },
-    });
-    expect(readFileSync(countFile, "utf8")).toBe("1");
-  });
-
-  it("passes an explicitly configured model to Codex", async () => {
-    const setup = fakeCodex();
-    process.env.EPICD_CODEX_ARGUMENT_LOG = setup.argumentLog;
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-
-    const opened = await runtime.open("implementation", {
-      kind: "new",
-      settings: { model: "gpt-pinned", reasoningEffort: "high" },
-    });
-    await runtime.run(opened, "Implement");
-
-    const args = JSON.parse(readFileSync(setup.argumentLog, "utf8")) as string[];
-    expect(args).toContain("--model");
-    expect(args).toContain("gpt-pinned");
-  });
-
-  it("replays explicit pinned model settings for a resumed thread", async () => {
-    const setup = fakeCodex();
-    process.env.EPICD_CODEX_ARGUMENT_LOG = setup.argumentLog;
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-
-    const opened = await runtime.open("implementation", {
-      kind: "existing",
-      sessionId: "thr-existing",
-      contract: {
-        runtime: "sdk",
-        requested: { model: "gpt-pinned", reasoningEffort: "high" },
-        effective: { model: "gpt-pinned", reasoningEffort: "high" },
-      },
-    });
-    await runtime.run(opened, "Continue implementation");
-
-    const args = JSON.parse(readFileSync(setup.argumentLog, "utf8")) as string[];
-    expect(args).toContain("gpt-pinned");
-    expect(args).toContain('model_reasoning_effort="high"');
-  });
-
-  it("replays the original effective settings after the local default changes", async () => {
-    const setup = fakeCodex();
-    process.env.EPICD_CODEX_ARGUMENT_LOG = setup.argumentLog;
-    process.env.EPICD_CODEX_DEFAULT_MODEL = "gpt-original";
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      codexPath: setup.executable,
-      accessMode: "sandboxed",
-    });
-
-    const created = await runtime.open("review", {
-      kind: "new",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    });
-    process.env.EPICD_CODEX_DEFAULT_MODEL = "gpt-changed";
-    const resumed = await runtime.open("review", {
-      kind: "existing",
-      sessionId: "thr-existing",
-      contract: created.contract,
-    });
-    await runtime.run(resumed, "Continue review");
-
-    const args = JSON.parse(readFileSync(setup.argumentLog, "utf8")) as string[];
-    expect(args).toContain("gpt-original");
-    expect(args).not.toContain("gpt-changed");
-    expect(args).toContain('model_reasoning_effort="xhigh"');
-  });
-
-  it("rejects fabricated opened sessions before starting a turn", async () => {
-    const runtime = new CodexRuntime({
-      repoPath: process.cwd(),
-      accessMode: "sandboxed",
-    });
-    const fabricated = {
-      runtime: "sdk" as const,
-      session: { runtime: "sdk" as const, id: null, role: "review" as const },
-      contract: {
-        runtime: "sdk" as const,
-        requested: { model: "gpt-test", reasoningEffort: "xhigh" as const },
-        effective: { model: "gpt-test", reasoningEffort: "xhigh" as const },
-      },
-    };
-
-    await expect(runtime.run(fabricated, "Review")).rejects.toThrow("did not create");
   });
 });

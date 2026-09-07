@@ -492,7 +492,7 @@ export class TrackerJournal {
     };
   }
   assertTaskOwned(runId: string, taskId: string | null): TaskClaimBinding | undefined {
-    // Unconfigured compositions are component-test/legacy scaffolding, never adaptive admission.
+    // Component-only records cannot launch a controller. Configured runs require claims from creation.
     if (!this.configured(runId) || taskId === null) return;
     this.assertIdle(runId);
     return this.claimBinding(runId, taskId, this.snapshot(runId).graph);

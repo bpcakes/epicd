@@ -26,10 +26,7 @@ function fixture() {
   roots.push(root);
   const store = new StateStore(join(root, "state.sqlite3"));
   stores.push(store);
-  const state = store.createAdaptive(
-    initialRun(),
-    RepositoryPolicySchema.parse({ schemaVersion: 1 }),
-  );
+  const state = store.create(initialRun(), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
   const lease = store.acquireLease(state.runId);
   const authority: ControllerAuthority = {
     runId: state.runId,
@@ -172,7 +169,7 @@ describe("always engaged action loop", () => {
         store.orchestration.actions(authority.runId).map((action) => action.request.action.kind),
       ).toEqual(sequence.map((action) => action.kind));
       expect(store.orchestration.memory(authority.runId)[0]?.content).toBe(memory.content);
-      expect(store.get(authority.runId)?.phase).toBe("selecting"); // A display phase never scheduled these actions.
+      expect(store.get(authority.runId)).not.toHaveProperty("phase"); // No persisted lifecycle phase schedules these actions.
     },
   );
 

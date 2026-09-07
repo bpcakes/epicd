@@ -1,542 +1,301 @@
 #!/usr/bin/env node
-import process from "node:process";
+import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
-import { Command, InvalidArgumentError, Option } from "commander";
+import { Command, Option } from "commander";
 import { render } from "ink";
-import React from "react";
-import { BeadsClient } from "./adapters/beads.js";
-import { agentOptions, type AgentOptionValues } from "./agent-options.js";
-import { GitClient } from "./adapters/git.js";
+import { StateStore, defaultStatePath } from "./adapters/store.js";
+import { createRun } from "./bootstrap.js";
+import { OrchestratorController } from "./controller.js";
 import {
-  runStateDecodeDetail,
-  StateStore,
-  type StoredRunInspection,
-  unsupportedRunStateVersion,
-} from "./adapters/store.js";
-import { runDoctor } from "./doctor.js";
-import { assertResumeOptionsAllowed, EpicEngine } from "./engine/engine.js";
-import type { EpicEngineOptions } from "./engine/engine.js";
-import { EpicdApp } from "./tui/app.js";
-import { RunView } from "./tui/run-view.js";
-import {
+  AgentRoleSchema,
+  ModelIdSchema,
   ReasoningEffortSchema,
-  type DoctorCheck,
-  type ReasoningEffort,
-  type RunState,
+  RuntimeKindSchema,
   type RuntimeKind,
 } from "./domain/types.js";
-import type { PickerItem } from "./tui/picker.js";
 import { humanRunStatus, runStatusView } from "./status.js";
-import { epicRunConflictMessage, launchHeadlessController } from "./controller.js";
-import { modelOption } from "./cli-options.js";
-import { resolveRunPreflight } from "./preflight.js";
+import { RunView } from "./tui/run-view.js";
+import { runDoctor } from "./doctor.js";
+import { redactSensitiveText } from "./util/redact.js";
 
-function requireValidInspection(
-  inspected: StoredRunInspection | null,
-  epicId?: string,
-): RunState | null {
-  if (!inspected) return null;
-  if (inspected.kind === "invalid") {
-    throw new Error(
-      `Run ${inspected.runId}${epicId ? ` for ${epicId}` : ""} has invalid persisted state: ${runStateDecodeDetail(inspected.error)}; inspect it with epicd status ${inspected.epicId}`,
-      { cause: inspected.error },
-    );
-  }
-  return inspected.state;
-}
-
-function recoverableRun(store: StateStore, repoPath: string, epicId: string): RunState | null {
-  return requireValidInspection(store.inspectRecoverable(repoPath, epicId), epicId);
-}
-
-function pickerRun(store: StateStore, repoPath: string, epicId: string) {
-  const inspected = store.inspectRecoverable(repoPath, epicId);
-  if (!inspected) return { run: null, unavailableReason: null };
-  if (inspected.kind === "invalid") {
-    return {
-      run: null,
-      unavailableReason: `Run ${inspected.runId} has invalid persisted state: ${runStateDecodeDetail(inspected.error)}; inspect it with epicd status ${epicId}`,
-    };
-  }
-  return { run: inspected.state, unavailableReason: null };
-}
-
-async function withStateStore<Result>(
-  operation: (store: StateStore) => Promise<Result> | Result,
-): Promise<Result> {
-  const store = new StateStore();
+type BaseOptions = { state: string };
+type LaunchOptions = BaseOptions & { headless?: boolean };
+const stateOption = (command: Command) =>
+  command.option("--state <path>", "current-format SQLite state path", defaultStatePath());
+const runtimeOption = (command: Command) =>
+  command.addOption(
+    new Option("--runtime <runtime>", "native Herdr TUI or supervised SDK")
+      .choices(RuntimeKindSchema.options)
+      .default("sdk"),
+  );
+const versionNumber = (value: string) => {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0)
+    throw new Error("Expected a nonnegative integer");
+  return number;
+};
+async function withStore<T>(
+  options: BaseOptions,
+  body: (store: StateStore) => T | Promise<T>,
+): Promise<T> {
+  const store = new StateStore(resolve(options.state));
   try {
-    return await operation(store);
+    return await body(store);
   } finally {
     store.close();
   }
 }
-
-function invalidRunRecovery(
-  runId: string,
-  error: StoredRunInspection & { kind: "invalid" },
-): string {
-  const version = unsupportedRunStateVersion(error.error);
-  return version === null
-    ? `after inspection, recover with: epicd quarantine ${runId} --force`
-    : `upgrade Epicd to a version that supports state schema ${version}; do not quarantine this run`;
-}
-
-type CommonOptions = AgentOptionValues & {
-  repo: string;
-  runtime?: RuntimeKind;
-  codexPath?: string;
-  maxReviewPasses?: number;
-  dangerouslyBypassApprovalsAndSandbox?: boolean;
-};
-
-function commonOptions(command: Command): CommonOptions {
-  const options = command.optsWithGlobals<CommonOptions>();
-  return options;
-}
-
-function reviewLoopOptions(options: CommonOptions): Pick<EpicEngineOptions, "maxReviewPasses"> {
-  return options.maxReviewPasses === undefined ? {} : { maxReviewPasses: options.maxReviewPasses };
-}
-
-function permissionOptions(options: CommonOptions): Pick<EpicEngineOptions, "accessMode"> {
-  return options.dangerouslyBypassApprovalsAndSandbox === undefined
-    ? {}
-    : {
-        accessMode: options.dangerouslyBypassApprovalsAndSandbox
-          ? "danger-full-access"
-          : "sandboxed",
-      };
-}
-
-function resumeEngine(
-  state: NonNullable<ReturnType<StateStore["get"]>>,
-  options: CommonOptions,
-  store: StateStore,
-): EpicEngine {
-  const requestedOptions = engineOptionOverrides(options);
-  assertResumeOptionsAllowed(state, requestedOptions);
-  return EpicEngine.resume(state.runId, requestedOptions, store);
-}
-
-function engineOptionOverrides(
-  options: CommonOptions,
-): Pick<
-  EpicEngineOptions,
-  | "model"
-  | "reasoningEffort"
-  | "agentSettings"
-  | "maxReviewPasses"
-  | "accessMode"
-  | "runtime"
-  | "codexPath"
-> {
-  return {
-    ...agentOptions(options),
-    ...reviewLoopOptions(options),
-    ...permissionOptions(options),
-    ...(options.runtime ? { runtime: options.runtime } : {}),
-    ...(options.codexPath ? { codexPath: options.codexPath } : {}),
-  };
-}
-
-function assertResumeOptions(state: RunState, options: CommonOptions): void {
-  assertResumeOptionsAllowed(state, engineOptionOverrides(options));
-}
-
-function assertLaunchChecks(checks: readonly DoctorCheck[]): void {
-  const failed = checks.filter((check) => check.status === "fail");
-  if (failed.length > 0)
-    throw new Error(failed.map((check) => `${check.name}: ${check.message}`).join("\n"));
-}
-
-async function launchEngine(engine: EpicEngine, interactive = process.stdout.isTTY): Promise<void> {
-  if (interactive) {
-    await render(<RunView engine={engine} />, { exitOnCtrlC: false }).waitUntilExit();
-    return;
-  }
-  await launchHeadlessController(engine);
-}
-
-async function createOrReject(
-  epicId: string,
-  options: CommonOptions,
-  store: StateStore,
-): Promise<EpicEngine> {
-  const repoPath = resolve(options.repo);
-  const root = await new GitClient(repoPath).root();
-  const workflowOwner = requireValidInspection(store.inspectWorkflowOwner(root));
-  if (workflowOwner) {
-    throw new Error(
-      `An existing ${workflowOwner.phase} run still owns this repository. Use: epicd resume ${workflowOwner.epicId} --repo ${root}`,
-    );
-  }
-  const existing = recoverableRun(store, root, epicId);
-  if (existing) {
-    throw new Error(epicRunConflictMessage(existing, root));
-  }
-  return await EpicEngine.create(
-    {
-      ...engineOptionOverrides(options),
-      repoPath: root,
-      epicId,
-      runtime: options.runtime ?? "sdk",
-    },
-    store,
-  );
-}
-
-async function defaultTui(epicId: string | undefined, options: CommonOptions): Promise<void> {
-  const root = await new GitClient(resolve(options.repo)).root();
-  await withStateStore(async (store) => {
-    const directRun = epicId ? recoverableRun(store, root, epicId) : null;
-    const workflowOwner = epicId ? requireValidInspection(store.inspectWorkflowOwner(root)) : null;
-    if (epicId && !directRun && workflowOwner) {
-      throw new Error(
-        `An existing ${workflowOwner.phase} run still owns this repository. Use: epicd resume ${workflowOwner.epicId} --repo ${root}`,
-      );
-    }
-    if (directRun) assertResumeOptions(directRun, options);
-    const preflight = resolveRunPreflight(directRun, options.runtime);
-    const doctor = await runDoctor(root, preflight.runtime, {
-      mode: epicId ? preflight.mode : "selection",
-      ...(options.codexPath ? { codexPath: options.codexPath } : {}),
-    });
-    assertLaunchChecks(doctor.checks);
-    if (epicId) {
-      const existing = directRun;
-      const engine = existing
-        ? resumeEngine(existing, options, store)
-        : await EpicEngine.create(
-            {
-              ...engineOptionOverrides(options),
-              repoPath: doctor.repoPath,
-              epicId,
-              runtime: preflight.runtime,
-            },
-            store,
-          );
-      await launchEngine(engine);
-      return;
-    }
-
-    if (!process.stdout.isTTY) throw new Error("An epic ID is required when stdout is not a TTY");
-    const epics = await new BeadsClient(doctor.repoPath).listOpenEpics();
-    const items: PickerItem[] = epics.map((epic) => ({
-      epic,
-      ...pickerRun(store, doctor.repoPath, epic.id),
-    }));
-    if (items.length === 0) throw new Error("No open Beads epics were found in this repository");
-    await render(
-      <EpicdApp
-        items={items}
-        loadEngine={async (item) => {
-          const selectedRun = recoverableRun(store, doctor.repoPath, item.epic.id);
-          if (item.run && !selectedRun) {
-            throw new Error(
-              `${item.epic.id} no longer needs recovery; return to the picker to refresh its status`,
-            );
+async function launch(store: StateStore, runId: string, options: LaunchOptions) {
+  const controller = new OrchestratorController(store, runId);
+  const request = new AbortController();
+  const stop = () => request.abort(new Error("Operator requested stop"));
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  const ui =
+    !options.headless && process.stdout.isTTY && process.stdin.isTTY
+      ? render(<RunView controller={controller} stop={stop} />, { exitOnCtrlC: false })
+      : null;
+  let cursor = store.events(runId, 1).at(-1)?.id ?? 0;
+  const timer = ui
+    ? null
+    : setInterval(() => {
+        try {
+          for (const event of store.events(runId, 100)) {
+            if ((event.id ?? 0) <= cursor) continue;
+            cursor = event.id!;
+            process.stdout.write(`${event.at} ${event.kind}: ${event.message}\n`);
           }
-          if (selectedRun) assertResumeOptions(selectedRun, options);
-          const selectedPreflight = resolveRunPreflight(selectedRun, options.runtime);
-          const selectedDoctor = await runDoctor(doctor.repoPath, selectedPreflight.runtime, {
-            mode: selectedPreflight.mode,
-            ...(options.codexPath ? { codexPath: options.codexPath } : {}),
-          });
-          assertLaunchChecks(selectedDoctor.checks);
-          if (selectedRun) return resumeEngine(selectedRun, options, store);
-          return await EpicEngine.create(
-            {
-              ...engineOptionOverrides(options),
-              repoPath: selectedDoctor.repoPath,
-              epicId: item.epic.id,
-              runtime: selectedPreflight.runtime,
-            },
-            store,
-          );
-        }}
-      />,
-      { exitOnCtrlC: false },
-    ).waitUntilExit();
-  });
-}
-
-function reasoningOption(flags: string, description: string): Option {
-  return new Option(flags, description).choices(ReasoningEffortSchema.options);
-}
-
-function inheritOption(flags: string, description: string, conflictsWith: string): Option {
-  return new Option(flags, description).conflicts(conflictsWith);
-}
-
-function positiveInteger(value: string): number {
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new InvalidArgumentError("must be a positive integer");
-  }
-  return parsed;
-}
-
-const program = new Command();
-program
-  .name("epicd")
-  .description("Deliver Beads epics through persistent SDK or Herdr agent sessions")
-  .version("0.1.0")
-  .argument("[epic-id]", "open this epic directly; omit to choose in the TUI")
-  .option("-C, --repo <path>", "repository containing .beads", process.cwd())
-  .option("--codex-path <path>", "use a specific local Codex executable instead of the SDK runtime")
-  .addOption(modelOption("--model <model>", "model fallback for all agent roles"))
-  .addOption(
-    inheritOption(
-      "--model-inherit",
-      "reset the run-wide model fallback to the provider default",
-      "model",
-    ),
-  )
-  .addOption(reasoningOption("--reasoning <effort>", "reasoning fallback for all agent roles"))
-  .addOption(
-    inheritOption(
-      "--reasoning-inherit",
-      "reset the run-wide reasoning fallback to built-in role defaults",
-      "reasoning",
-    ),
-  )
-  .addOption(modelOption("--orchestrator-model <model>", "orchestrator model override"))
-  .addOption(
-    inheritOption(
-      "--orchestrator-model-inherit",
-      "reset orchestrator model to the run-wide fallback",
-      "orchestratorModel",
-    ),
-  )
-  .addOption(
-    reasoningOption("--orchestrator-reasoning <effort>", "orchestrator reasoning override"),
-  )
-  .addOption(
-    inheritOption(
-      "--orchestrator-reasoning-inherit",
-      "reset orchestrator reasoning to the run-wide fallback",
-      "orchestratorReasoning",
-    ),
-  )
-  .addOption(modelOption("--implementation-model <model>", "implementation model override"))
-  .addOption(
-    inheritOption(
-      "--implementation-model-inherit",
-      "reset implementation model to the run-wide fallback",
-      "implementationModel",
-    ),
-  )
-  .addOption(
-    reasoningOption("--implementation-reasoning <effort>", "implementation reasoning override"),
-  )
-  .addOption(
-    inheritOption(
-      "--implementation-reasoning-inherit",
-      "reset implementation reasoning to the run-wide fallback",
-      "implementationReasoning",
-    ),
-  )
-  .addOption(modelOption("--review-model <model>", "review model override"))
-  .addOption(
-    inheritOption(
-      "--review-model-inherit",
-      "reset review model to the run-wide fallback",
-      "reviewModel",
-    ),
-  )
-  .addOption(reasoningOption("--review-reasoning <effort>", "review reasoning override"))
-  .addOption(
-    inheritOption(
-      "--review-reasoning-inherit",
-      "reset review reasoning to the run-wide fallback",
-      "reviewReasoning",
-    ),
-  )
-  .addOption(
-    new Option(
-      "--max-review-passes <count>",
-      "maximum fix passes per review cycle for new runs (default: 3)",
-    ).argParser(positiveInteger),
-  )
-  .option(
-    "--dangerously-bypass-approvals-and-sandbox",
-    "give all agents unsandboxed host access without approvals (DANGEROUS)",
-  )
-  .addOption(
-    new Option("--runtime <runtime>", "agent runtime for new runs").choices([
-      "sdk",
-      "herdr",
-    ] as const),
-  )
-  .action(
-    async (epicId: string | undefined, options: CommonOptions) => await defaultTui(epicId, options),
-  );
-program.configureHelp({ showGlobalOptions: true });
-
-program
-  .command("run")
-  .description("start a new epic run")
-  .argument("<epic-id>")
-  .option("--no-tui", "stream line-oriented events")
-  .action(async (epicId: string, options: { tui: boolean }, command: Command) => {
-    const common = commonOptions(command);
-    const doctor = await runDoctor(common.repo, common.runtime ?? "sdk", {
-      ...(common.codexPath ? { codexPath: common.codexPath } : {}),
-    });
-    assertLaunchChecks(doctor.checks);
-    await withStateStore(async (store) => {
-      const engine = await createOrReject(epicId, common, store);
-      await launchEngine(engine, options.tui && process.stdout.isTTY);
-    });
-  });
-
-program
-  .command("resume")
-  .description("resume the latest recoverable run for an epic")
-  .argument("<epic-id>")
-  .option("--no-tui", "stream line-oriented events")
-  .action(async (epicId: string, options: { tui: boolean }, command: Command) => {
-    const common = commonOptions(command);
-    const root = await new GitClient(resolve(common.repo)).root();
-    await withStateStore(async (store) => {
-      const state = recoverableRun(store, root, epicId);
-      if (!state) {
-        const latest = requireValidInspection(store.inspectLatest(root, epicId), epicId);
-        if (latest) throw new Error(`${epicId} is already complete`);
-        throw new Error(`No epicd run found for ${epicId}`);
-      }
-      assertResumeOptions(state, common);
-      const preflight = resolveRunPreflight(state, common.runtime);
-      const doctor = await runDoctor(root, preflight.runtime, {
-        mode: preflight.mode,
-        ...(common.codexPath ? { codexPath: common.codexPath } : {}),
-      });
-      assertLaunchChecks(doctor.checks);
-      const engine = resumeEngine(state, common, store);
-      await launchEngine(engine, options.tui && process.stdout.isTTY);
-    });
-  });
-
-program
-  .command("status")
-  .description("show persisted epic run status")
-  .argument("[epic-id]")
-  .option("--json", "emit machine-readable JSON")
-  .action(async (epicId: string | undefined, options: { json?: boolean }, command: Command) => {
-    const common = commonOptions(command);
-    const repoPath = await new GitClient(resolve(common.repo)).root();
-    await withStateStore((store) => {
-      const current = epicId ? store.inspectCurrent(repoPath, epicId) : null;
-      const inspected = epicId ? (current ? [current] : []) : store.inspect(repoPath);
-      const valid = inspected.flatMap((entry) => (entry.kind === "valid" ? [entry.state] : []));
-      const invalid = inspected.filter((entry) => entry.kind === "invalid");
-      for (const entry of invalid) {
-        process.stderr.write(
-          `epicd: run ${entry.runId} has invalid persisted state: ${runStateDecodeDetail(entry.error)}${options.json ? "; omitted from JSON status" : ""}; ${invalidRunRecovery(entry.runId, entry)}\n`,
-        );
-      }
-      if (options.json && invalid.length > 0) process.exitCode = 1;
-      if (options.json)
-        process.stdout.write(
-          `${JSON.stringify(
-            valid.map((state) => runStatusView(state, store.controllerLease(state.runId))),
-            null,
-            2,
-          )}\n`,
-        );
-      else if (inspected.length === 0) process.stdout.write("No epicd runs found.\n");
-      else {
-        for (const entry of inspected) {
-          if (entry.kind === "invalid") {
-            const lease = store.controllerLease(entry.runId);
-            const controller = lease
-              ? `\n  controller pid ${lease.pid} · lease ${lease.leaseId} · ${lease.alive ? "alive" : "stale"}`
-              : "";
-            process.stdout.write(
-              `${entry.epicId} (${entry.runId})\n  invalid persisted state (${runStateDecodeDetail(entry.error)}) · recorded phase ${entry.phase} · updated ${entry.updatedAt}${controller}\n  ${invalidRunRecovery(entry.runId, entry)}\n`,
-            );
-            continue;
-          }
-          const state = entry.state;
-          process.stdout.write(`${humanRunStatus(state, store.controllerLease(state.runId))}\n`);
+        } catch {
+          stop();
         }
-      }
-    });
-  });
+      }, 500);
+  try {
+    await controller.run(request.signal);
+  } finally {
+    if (timer) clearInterval(timer);
+    ui?.unmount();
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
+  const status = controller.status();
+  process.stdout.write(humanRunStatus(status) + "\n");
+  if (["blocked", "awaiting_user"].includes(status.control.status)) process.exitCode = 2;
+}
 
-program
-  .command("unlock")
-  .description("force-release a run controller lease after verifying its reported owner")
-  .argument("<run-id>")
-  .requiredOption("--owner-pid <pid>", "current owner PID reported by epicd", positiveInteger)
-  .requiredOption("--lease-id <id>", "opaque lease identity reported by epicd")
-  .requiredOption("--force", "acknowledge that this can allow a second controller")
-  .action(async (runId: string, options: { ownerPid: number; leaseId: string }) => {
-    await withStateStore((store) => {
-      const released = store.forceReleaseLease(runId, options.ownerPid, options.leaseId);
-      process.stdout.write(
-        released
-          ? `Released the controller lease for ${runId}. This did not stop process ${options.ownerPid}.\n`
-          : `Run ${runId} has no controller lease.\n`,
-      );
-    });
-  });
-
-program
-  .command("cleanup")
-  .description("explicitly abandon agent cleanup that cannot be completed")
-  .argument("<run-id>")
-  .requiredOption("--abandon", "acknowledge that external agent resources may remain open")
-  .action(async (runId: string) => {
-    await withStateStore((store) => {
-      const result = store.abandonAgentCleanup(runId);
-      process.stdout.write(
-        result.abandonedActions > 0
-          ? `Abandoned ${result.abandonedActions} cleanup action(s) for ${runId}. External agent resources may remain open.\n`
-          : `Cleared the completed cleanup diagnostic for ${runId}.\n`,
-      );
-    });
-  });
-
-program
-  .command("quarantine")
-  .description("quarantine an invalid persisted run so it no longer owns its epic or repository")
-  .argument("<run-id>")
-  .requiredOption(
-    "--force",
-    "acknowledge that invalid state cannot be used to clean up external agent resources",
+export function createProgram() {
+  const program = new Command()
+    .name("epicd")
+    .description("Persistent Astra engineering lead under a Git and Beads safety kernel")
+    .version("0.1.0");
+  runtimeOption(
+    stateOption(
+      program
+        .command("run <epic-id>")
+        .description("Create a fresh run and engage the orchestrator"),
+    ),
   )
-  .action(async (runId: string) => {
-    await withStateStore((store) => {
-      const result = store.quarantineInvalidRun(runId);
+    .option("--repo <path>", "repository containing .epicd/policy.json", process.cwd())
+    .option("--codex-path <path>", "selected native Codex executable")
+    .option("--tracker-path <path>", "selected br executable")
+    .option(
+      "--worker-model <model>",
+      "concrete worker default; otherwise resolve the selected Codex default once",
+    )
+    .option("--auth-cache <path>", "existing token cache to project into private runtime storage")
+    .option("--headless", "print events without the status UI")
+    .action(
+      async (
+        epicId: string,
+        options: LaunchOptions & {
+          repo: string;
+          runtime: RuntimeKind;
+          codexPath?: string;
+          trackerPath?: string;
+          workerModel?: string;
+          authCache?: string;
+        },
+      ) => {
+        await withStore(options, async (store) => {
+          const run = await createRun(store, {
+            repoPath: options.repo,
+            epicId,
+            runtime: options.runtime,
+            ...(options.codexPath ? { codexPath: options.codexPath } : {}),
+            ...(options.trackerPath ? { trackerPath: options.trackerPath } : {}),
+            ...(options.workerModel ? { model: ModelIdSchema.parse(options.workerModel) } : {}),
+            ...(options.authCache ? { authCachePath: options.authCache } : {}),
+          });
+          process.stdout.write(`Created run ${run.runId}\n`);
+          await launch(store, run.runId, options);
+        });
+      },
+    );
+  stateOption(
+    program
+      .command("resume <run-id>")
+      .description("Resume this format's recorded runtime and owned work"),
+  )
+    .option("--headless", "print events without the status UI")
+    .action(async (runId: string, options: LaunchOptions) =>
+      withStore(options, async (store) => {
+        // Do not resume or change control state owned by another live controller.
+        const lease = store.controllerLease(runId);
+        if (lease?.alive) throw new Error(`Run is already controlled by process ${lease.pid}`);
+        const control = store.orchestration.control(runId);
+        if (control.status === "paused")
+          store.orchestration.operatorControl(runId, control.controlVersion, { kind: "resume" });
+        await launch(store, runId, options);
+      }),
+    );
+  stateOption(
+    program
+      .command("status [run-id]")
+      .description("Inspect durable control, actions, evidence and pending questions"),
+  )
+    .option("--json", "machine-readable journal projection")
+    .action(async (runId: string | undefined, options: BaseOptions & { json?: boolean }) =>
+      withStore(options, (store) => {
+        const runs = runId ? [runId] : store.list().map((run) => run.runId);
+        const statuses = runs.map((id) => runStatusView(store, id));
+        process.stdout.write(
+          options.json
+            ? JSON.stringify(runId ? statuses[0] : statuses, null, 2) + "\n"
+            : statuses.map(humanRunStatus).join("\n\n") + "\n",
+        );
+      }),
+    );
+  stateOption(
+    program
+      .command("pause <run-id>")
+      .description("Durably stop admission and interrupt owned work"),
+  )
+    .requiredOption("--control-version <number>", "version observed in status", versionNumber)
+    .action(async (runId: string, options: BaseOptions & { controlVersion: number }) =>
+      withStore(options, (store) => {
+        store.orchestration.operatorControl(runId, options.controlVersion, { kind: "pause" });
+        process.stdout.write(
+          "Pause recorded. External work is not considered stopped until its runtime receipt confirms it.\n",
+        );
+      }),
+    );
+  stateOption(
+    program
+      .command("respond <run-id> <escalation-id> <message>")
+      .description("Answer one pending question; this does not grant environment authority"),
+  )
+    .requiredOption(
+      "--control-version <number>",
+      "version observed with the pending question",
+      versionNumber,
+    )
+    .action(
+      async (
+        runId: string,
+        escalationId: string,
+        message: string,
+        options: BaseOptions & { controlVersion: number },
+      ) =>
+        withStore(options, (store) => {
+          store.orchestration.operatorControl(runId, options.controlVersion, {
+            kind: "respond",
+            escalationId,
+            message,
+          });
+          process.stdout.write(
+            `Response recorded. Run epicd resume ${runId} --state ${options.state} to attach a controller.\n`,
+          );
+        }),
+    );
+  stateOption(
+    program
+      .command("settings <run-id>")
+      .description(
+        "Change one role's future-thread preferences while no live controller owns the run",
+      ),
+  )
+    .addOption(new Option("--role <role>").choices(AgentRoleSchema.options).makeOptionMandatory())
+    .option("--model <model>", "concrete model; orchestrator must be gpt-6-astra")
+    .addOption(new Option("--reasoning <effort>").choices(ReasoningEffortSchema.options))
+    .action(
+      async (
+        runId: string,
+        options: BaseOptions & { role: string; model?: string; reasoning?: string },
+      ) =>
+        withStore(options, (store) => {
+          const state = store.get(runId);
+          if (!state) throw new Error("Unknown run");
+          if (!options.model && !options.reasoning)
+            throw new Error("Supply --model or --reasoning");
+          const role = AgentRoleSchema.parse(options.role);
+          const settings = structuredClone(state.agentSettings);
+          if (options.model) settings[role].model = ModelIdSchema.parse(options.model);
+          if (options.reasoning)
+            settings[role].reasoningEffort = ReasoningEffortSchema.parse(options.reasoning);
+          store.updateAgentSettings(runId, settings);
+          process.stdout.write(
+            "Future-thread settings recorded. Existing assignments remain immutable.\n",
+          );
+        }),
+    );
+  stateOption(
+    program
+      .command("unlock <run-id>")
+      .description(
+        "Fence one explicitly identified controller lease; does not prove its agents stopped",
+      ),
+  )
+    .requiredOption("--owner-pid <number>", "observed PID", versionNumber)
+    .requiredOption("--lease-id <id>", "observed lease ID")
+    .requiredOption("--force", "explicitly revoke this exact lease")
+    .action(async (runId: string, options: BaseOptions & { ownerPid: number; leaseId: string }) =>
+      withStore(options, (store) => {
+        process.stdout.write(
+          store.forceReleaseLease(runId, options.ownerPid, options.leaseId)
+            ? "Lease fenced; resume reconciles recorded external work.\n"
+            : "No lease to release.\n",
+        );
+      }),
+    );
+  stateOption(
+    program
+      .command("quarantine <run-id>")
+      .description("Preserve an invalid run's raw records without deriving cleanup actions"),
+  )
+    .requiredOption("--force", "explicitly quarantine this invalid record")
+    .action(async (runId: string, options: BaseOptions) =>
+      withStore(options, (store) => {
+        const result = store.quarantineInvalidRun(runId);
+        process.stdout.write(
+          `Quarantined ${result.runId}; raw records retained. External resources were not removed.\n`,
+        );
+      }),
+    );
+  runtimeOption(program.command("doctor").description("Read-only executable and endpoint checks"))
+    .option("--repo <path>", "repository path", process.cwd())
+    .option("--codex-path <path>", "selected native executable")
+    .action(async (options: { repo: string; runtime: RuntimeKind; codexPath?: string }) => {
       process.stdout.write(
-        `Quarantined invalid run ${runId} (${result.reason}). Its raw state and events remain in the local state database; external agent resources may remain open.\n`,
+        JSON.stringify(
+          await runDoctor({
+            repoPath: options.repo,
+            runtime: options.runtime,
+            ...(options.codexPath ? { codexPath: options.codexPath } : {}),
+          }),
+          null,
+          2,
+        ) + "\n",
       );
     });
-  });
+  return program;
+}
 
-program
-  .command("doctor")
-  .description("check repository, Beads, Git, and selected runtime prerequisites")
-  .option("--json", "emit machine-readable JSON")
-  .action(async (options: { json?: boolean }, command: Command) => {
-    const common = commonOptions(command);
-    const result = await runDoctor(common.repo, common.runtime ?? "sdk", {
-      probeModelDiscovery: true,
-      ...(common.codexPath ? { codexPath: common.codexPath } : {}),
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  createProgram()
+    .parseAsync()
+    .catch((error) => {
+      process.stderr.write(
+        `epicd: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}\n`,
+      );
+      process.exitCode = 1;
     });
-    if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    else {
-      for (const check of result.checks) {
-        const symbol = check.status === "pass" ? "✓" : check.status === "warn" ? "!" : "×";
-        process.stdout.write(`${symbol} ${check.name}: ${check.message}\n`);
-      }
-    }
-    if (result.checks.some((check) => check.status === "fail")) process.exitCode = 1;
-  });
-
-await program.parseAsync(process.argv).catch((error: unknown) => {
-  process.stderr.write(`epicd: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+}

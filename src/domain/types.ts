@@ -87,38 +87,12 @@ export const ImplementationResultSchema = z.object({
 
 export type ImplementationResult = z.infer<typeof ImplementationResultSchema>;
 
-export const SelectionResultSchema = z.object({
-  candidateId: z.string(),
-  rationale: z.string(),
-  dependencyNotes: z.array(z.string()),
-  riskNotes: z.array(z.string()),
-});
-
-export type SelectionResult = z.infer<typeof SelectionResultSchema>;
-
 export const RuntimeKindSchema = z.enum(["sdk", "herdr"]);
 export type RuntimeKind = z.infer<typeof RuntimeKindSchema>;
 
 export const AgentRoleSchema = z.enum(["orchestrator", "implementation", "review"]);
 export type AgentRole = z.infer<typeof AgentRoleSchema>;
 export const AGENT_ROLES = AgentRoleSchema.options;
-
-export const AgentAccessModeSchema = z.enum(["sandboxed", "danger-full-access"]);
-export type AgentAccessMode = z.infer<typeof AgentAccessModeSchema>;
-
-export const AgentCleanupActionSchema = z.discriminatedUnion("kind", [
-  z.strictObject({
-    kind: z.literal("session"),
-    runtime: RuntimeKindSchema,
-    role: AgentRoleSchema,
-    sessionId: z.string().min(1),
-  }),
-  z.object({
-    kind: z.literal("run"),
-    runtime: RuntimeKindSchema,
-  }),
-]);
-export type AgentCleanupAction = z.infer<typeof AgentCleanupActionSchema>;
 
 export const ReasoningEffortSchema = z.enum([
   "minimal",
@@ -159,8 +133,6 @@ export const DEFAULT_AGENT_PREFERENCES = {
   review: { model: null, reasoningEffort: null },
 } as const satisfies Record<AgentRole, AgentRolePreferences>;
 
-export const DEFAULT_MAX_REVIEW_PASSES = 3;
-
 export const AgentSettingsSchema = z.object({
   orchestrator: AgentRoleSettingsSchema,
   implementation: AgentRoleSettingsSchema,
@@ -181,16 +153,29 @@ export type AgentSettingsSource = {
   agentSettings: AgentPreferences;
 };
 
-/** Resolves the one inheritance contract used by execution, status, and the TUI. */
+export const ORCHESTRATOR_MODEL = "gpt-6-astra";
+export const AstraReasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
+
+/** The coordinator never inherits a worker model or silently falls back. */
 export function resolveAgentRoleSettings(
   source: AgentSettingsSource,
   role: AgentRole,
 ): AgentRoleSettings {
-  const preferences = source.agentSettings[role];
+  const preference = source.agentSettings[role];
+  if (role === "orchestrator") {
+    if (preference.model !== null && preference.model !== ORCHESTRATOR_MODEL)
+      throw new Error(`Orchestration requires ${ORCHESTRATOR_MODEL}`);
+    const effort = preference.reasoningEffort ?? "high";
+    if (!AstraReasoningEffortSchema.safeParse(effort).success)
+      throw new Error(
+        `${ORCHESTRATOR_MODEL} supports reasoning efforts: ${AstraReasoningEffortSchema.options.join(", ")}`,
+      );
+    return { model: ORCHESTRATOR_MODEL, reasoningEffort: effort };
+  }
   return AgentRoleSettingsSchema.parse({
-    model: preferences.model ?? source.model,
+    model: preference.model ?? source.model,
     reasoningEffort:
-      preferences.reasoningEffort ??
+      preference.reasoningEffort ??
       source.reasoningEffort ??
       DEFAULT_AGENT_SETTINGS[role].reasoningEffort,
   });
@@ -200,28 +185,6 @@ export function resolveAgentSettings(source: AgentSettingsSource): AgentSettings
   return AgentSettingsSchema.parse(
     Object.fromEntries(AGENT_ROLES.map((role) => [role, resolveAgentRoleSettings(source, role)])),
   );
-}
-
-export const ADAPTIVE_ORCHESTRATOR_MODEL = "gpt-6-astra";
-export const AstraReasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
-
-/** Adaptive coordination has a required model, not a run-wide worker fallback. */
-export function resolveAdaptiveAgentRoleSettings(
-  source: AgentSettingsSource,
-  role: AgentRole,
-): AgentRoleSettings {
-  if (role !== "orchestrator") return resolveAgentRoleSettings(source, role);
-  const preference = source.agentSettings.orchestrator;
-  if (preference.model !== null && preference.model !== ADAPTIVE_ORCHESTRATOR_MODEL) {
-    throw new Error(`Adaptive orchestration requires ${ADAPTIVE_ORCHESTRATOR_MODEL}`);
-  }
-  const settings = resolveAgentRoleSettings(source, role);
-  if (!AstraReasoningEffortSchema.safeParse(settings.reasoningEffort).success) {
-    throw new Error(
-      `${ADAPTIVE_ORCHESTRATOR_MODEL} supports reasoning efforts: ${AstraReasoningEffortSchema.options.join(", ")}`,
-    );
-  }
-  return { model: ADAPTIVE_ORCHESTRATOR_MODEL, reasoningEffort: settings.reasoningEffort };
 }
 
 export const ResolvedAgentRoleSettingsSchema = AgentRoleSettingsSchema.extend({
@@ -253,247 +216,72 @@ export const AgentSessionContractSchema = z.discriminatedUnion("runtime", [
 ]);
 export type AgentSessionContract = z.infer<typeof AgentSessionContractSchema>;
 
-export const AgentSessionStateSchema = z.discriminatedUnion("status", [
-  z.strictObject({ status: z.literal("inactive") }),
-  z.strictObject({
-    status: z.literal("active"),
-    sessionId: z.string().min(1),
-    contract: AgentSessionContractSchema,
-  }),
-]);
-export type AgentSessionState = z.infer<typeof AgentSessionStateSchema>;
+export const RUN_STATE_SCHEMA_VERSION = 3;
 
-export const AgentSessionsSchema = z.strictObject({
-  orchestrator: AgentSessionStateSchema,
-  implementation: AgentSessionStateSchema,
-  review: AgentSessionStateSchema,
+export const CommonGitDirectorySchema = z.strictObject({
+  path: z.string().startsWith("/"),
+  device: z.string().regex(/^\d+$/),
+  inode: z.string().regex(/^\d+$/),
 });
-export type AgentSessions = z.infer<typeof AgentSessionsSchema>;
+export type CommonGitDirectory = z.infer<typeof CommonGitDirectorySchema>;
 
-export function createInactiveAgentSessions(): AgentSessions {
-  return {
-    orchestrator: { status: "inactive" },
-    implementation: { status: "inactive" },
-    review: { status: "inactive" },
-  };
-}
-
-export const RunPhaseSchema = z.enum([
-  "preparing",
-  "selecting",
-  "claiming",
-  "implementing",
-  "reviewing",
-  "fixing",
-  "committing",
-  "verifying",
-  "closing",
-  "final_review",
-  "paused",
-  "blocked",
-  "complete",
-]);
-
-export type RunPhase = z.infer<typeof RunPhaseSchema>;
-
-export const RUN_STATE_SCHEMA_VERSION = 2;
-
-const RunStateBaseSchema = z.strictObject({
-  stateSchemaVersion: z.literal(RUN_STATE_SCHEMA_VERSION),
-  orchestrationMode: z.enum(["legacy", "adaptive"]),
-  runId: z.string(),
-  agentNamespace: z.string().regex(/^[a-f0-9]{20}$/),
-  repoPath: z.string(),
-  epicId: z.string(),
-  epicTitle: z.string(),
-  model: ModelIdSchema.nullable(),
-  reasoningEffort: ReasoningEffortSchema.nullable(),
-  runtime: RuntimeKindSchema,
-  agentSettings: AgentPreferencesSchema,
-  agentAccessMode: AgentAccessModeSchema,
-  maxReviewPasses: z.number().int().positive(),
-  phase: RunPhaseSchema,
-  currentBeadId: z.string().nullable(),
-  currentBeadTitle: z.string().nullable(),
-  agentSessions: AgentSessionsSchema,
-  pendingAgentCleanup: z.array(AgentCleanupActionSchema),
-  baseRevision: z.string().nullable(),
-  epicBaseRevision: z.string(),
-  candidateRevision: z.string().nullable(),
-  reviewBaselineFingerprint: z.string().nullable(),
-  reviewedFingerprint: z.string().nullable(),
-  reviewedTree: z.string().nullable(),
-  completedTasks: z.number().int().nonnegative(),
-  totalTasks: z.number().int().nonnegative(),
-  reviewPass: z.number().int().nonnegative(),
-  pendingFindings: z.array(ReviewFindingSchema),
-  recentOutcomes: z.array(
-    z.object({
-      beadId: z.string(),
-      title: z.string(),
-      verifiedRevision: z.string(),
-      reviewSummary: z.string(),
-    }),
-  ),
-  lastReviewSummary: z.string().nullable(),
-  resumePhase: RunPhaseSchema.nullable(),
-  lastError: z.string().nullable(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+export const RuntimeConfigurationSchema = z.strictObject({
+  commonDirectory: CommonGitDirectorySchema,
+  executable: z.string().startsWith("/"),
+  trackerExecutable: z.string().startsWith("/"),
+  runtimeRoot: z.string().startsWith("/"),
+  workspaceRoot: z.string().startsWith("/"),
+  authCachePath: z.string().startsWith("/").nullable(),
+  turnTimeoutMs: z.number().int().min(1).max(21_600_000),
+  herdr: z
+    .strictObject({
+      executable: z.string().startsWith("/"),
+      sessionName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/),
+      workspaceId: z.string().min(1).max(256),
+    })
+    .nullable(),
 });
+export type RuntimeConfiguration = z.infer<typeof RuntimeConfigurationSchema>;
 
-type RequiredRunStateField =
-  "currentBeadId" | "baseRevision" | "candidateRevision" | "reviewedFingerprint" | "reviewedTree";
-
-const requiredFieldsByPhase: Partial<Record<RunPhase, readonly RequiredRunStateField[]>> = {
-  claiming: ["currentBeadId", "baseRevision"],
-  implementing: ["currentBeadId", "baseRevision"],
-  reviewing: ["currentBeadId", "baseRevision"],
-  fixing: ["currentBeadId", "baseRevision"],
-  committing: ["currentBeadId", "baseRevision", "reviewedFingerprint", "reviewedTree"],
-  verifying: ["currentBeadId", "baseRevision", "candidateRevision"],
-  closing: ["currentBeadId", "baseRevision", "candidateRevision"],
-};
-
-export const RunStateSchema = RunStateBaseSchema.superRefine((state, context) => {
-  if (state.orchestrationMode === "adaptive") {
-    if (state.agentAccessMode !== "sandboxed") {
-      context.addIssue({
-        code: "custom",
-        path: ["orchestrationMode"],
-        message: "Adaptive runs require version 2 and confined access",
-      });
-    }
+/** Immutable run identity and runtime configuration; delivery state lives in the journals. */
+export const RunStateSchema = z
+  .strictObject({
+    stateSchemaVersion: z.literal(RUN_STATE_SCHEMA_VERSION),
+    runId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/),
+    repoPath: z.string().startsWith("/"),
+    epicId: z.string().min(1),
+    epicTitle: z.string().min(1),
+    epicBaseRevision: z.string().min(1),
+    model: ModelIdSchema.nullable(),
+    reasoningEffort: ReasoningEffortSchema.nullable(),
+    runtime: RuntimeKindSchema,
+    agentSettings: AgentPreferencesSchema,
+    runtimeConfiguration: RuntimeConfigurationSchema.nullable(),
+    totalTasks: z.number().int().nonnegative(),
+    createdAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+  })
+  .superRefine((state, context) => {
     try {
-      resolveAdaptiveAgentRoleSettings(state, "orchestrator");
+      resolveAgentRoleSettings(state, "orchestrator");
     } catch (error) {
       context.addIssue({
         code: "custom",
         path: ["agentSettings", "orchestrator"],
-        message: error instanceof Error ? error.message : "Invalid adaptive settings",
+        message: error instanceof Error ? error.message : "Invalid coordinator settings",
       });
     }
-  }
-  const activePhase =
-    state.phase === "paused" || state.phase === "blocked" ? state.resumePhase : state.phase;
-  if (activePhase && state.orchestrationMode !== "adaptive") {
-    const requiredFields: readonly RequiredRunStateField[] =
-      requiredFieldsByPhase[activePhase] ?? [];
-    for (const field of requiredFields) {
-      if (!state[field]) {
-        context.addIssue({
-          code: "custom",
-          path: [field],
-          message: `${field} is required while the run is ${activePhase}`,
-        });
-      }
-    }
-    if (activePhase === "fixing" && state.pendingFindings.length === 0) {
+    if (
+      state.runtimeConfiguration &&
+      (state.runtime === "herdr") !== (state.runtimeConfiguration.herdr !== null)
+    )
       context.addIssue({
         code: "custom",
-        path: ["pendingFindings"],
-        message: "pendingFindings must not be empty while the run is fixing",
+        path: ["runtimeConfiguration"],
+        message: "Native endpoint must match the selected runtime",
       });
-    }
-  }
-  const activeSessionIds = new Set(
-    AGENT_ROLES.flatMap((role) => {
-      const session = state.agentSessions[role];
-      return session.status === "inactive" ? [] : [session.sessionId];
-    }),
-  );
-  for (const role of AGENT_ROLES) {
-    const session = state.agentSessions[role];
-    if (session.status === "active" && session.contract.runtime !== state.runtime) {
-      context.addIssue({
-        code: "custom",
-        path: ["agentSessions", role, "contract", "runtime"],
-        message: `${role} session runtime must match the run runtime`,
-      });
-    }
-  }
-  const cleanupKeys = new Set<string>();
-  for (const [index, action] of state.pendingAgentCleanup.entries()) {
-    const key =
-      action.kind === "run"
-        ? `run:${action.runtime}`
-        : `session:${action.runtime}:${action.sessionId}`;
-    if (cleanupKeys.has(key)) {
-      context.addIssue({
-        code: "custom",
-        path: ["pendingAgentCleanup", index],
-        message: "pendingAgentCleanup must not contain duplicate actions",
-      });
-    }
-    cleanupKeys.add(key);
-    if (action.kind === "session" && activeSessionIds.has(action.sessionId)) {
-      context.addIssue({
-        code: "custom",
-        path: ["pendingAgentCleanup", index, "sessionId"],
-        message: "a session cannot be active and pending cleanup at the same time",
-      });
-    }
-  }
-});
-
+  });
 export type RunState = z.infer<typeof RunStateSchema>;
-
-/** Returns the persisted session identity for every non-inactive lifecycle state. */
-export function runAgentSessionId(
-  state: Pick<RunState, "agentSessions">,
-  role: AgentRole,
-): string | null {
-  const session = state.agentSessions[role];
-  return session.status === "inactive" ? null : session.sessionId;
-}
-
-/** A run owns recoverable work until workflow, sessions, and durable cleanup are complete. */
-export function runRecoveryKind(
-  state: Pick<RunState, "phase" | "agentSessions" | "pendingAgentCleanup"> &
-    Partial<Pick<RunState, "lastError">>,
-): "workflow" | "cleanup" | "diagnostic" | null {
-  if (state.phase !== "complete") return "workflow";
-  if (
-    state.pendingAgentCleanup.length > 0 ||
-    AGENT_ROLES.some((role) => state.agentSessions[role].status !== "inactive")
-  )
-    return "cleanup";
-  return state.lastError != null ? "diagnostic" : null;
-}
-
-export function runNeedsResume(state: Parameters<typeof runRecoveryKind>[0]): boolean {
-  return runRecoveryKind(state) !== null;
-}
-
-/** Enqueue surviving current-format sessions for cleanup after workflow completion. */
-export function prepareCompletedSessionCleanup(state: RunState): RunState {
-  const source = RunStateSchema.parse(state);
-  const agentSessions: AgentSessions = { ...source.agentSessions };
-  const pendingAgentCleanup: AgentCleanupAction[] = [...source.pendingAgentCleanup];
-
-  for (const role of AGENT_ROLES) {
-    const session = agentSessions[role];
-    if (source.phase === "complete" && session.status !== "inactive") {
-      agentSessions[role] = { status: "inactive" };
-      const duplicate = pendingAgentCleanup.some(
-        (action) =>
-          action.kind === "session" &&
-          action.runtime === source.runtime &&
-          action.sessionId === session.sessionId,
-      );
-      if (!duplicate) {
-        pendingAgentCleanup.push({
-          kind: "session",
-          runtime: source.runtime,
-          role,
-          sessionId: session.sessionId,
-        });
-      }
-    }
-  }
-
-  return RunStateSchema.parse({ ...source, agentSessions, pendingAgentCleanup });
-}
 
 export const EventLevelSchema = z.enum(["debug", "info", "success", "warning", "error"]);
 export type EventLevel = z.infer<typeof EventLevelSchema>;
@@ -509,23 +297,6 @@ export const EngineEventSchema = z.object({
 });
 
 export type EngineEvent = z.infer<typeof EngineEventSchema>;
-
-export type DoctorCheck = {
-  name: string;
-  status: "pass" | "warn" | "fail";
-  message: string;
-};
-
-export type EpicSnapshot = {
-  epic: Issue;
-  issues: Issue[];
-  openIssues: Issue[];
-  readyIssues: Issue[];
-  blockedIssues?: Issue[];
-  triage: unknown;
-  plan: unknown;
-  graph: unknown;
-};
 
 const refinementKeywords = new Set([
   "$schema",
@@ -574,4 +345,3 @@ export function agentOutputSchema(schema: z.ZodType): Record<string, unknown> {
 
 export const REVIEW_OUTPUT_SCHEMA = agentOutputSchema(ReviewResultSchema);
 export const IMPLEMENTATION_OUTPUT_SCHEMA = agentOutputSchema(ImplementationResultSchema);
-export const SELECTION_OUTPUT_SCHEMA = agentOutputSchema(SelectionResultSchema);

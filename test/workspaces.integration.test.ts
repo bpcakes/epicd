@@ -58,7 +58,7 @@ function fixture(format: "sha1" | "sha256" = "sha1") {
   stores.push(store);
   const initial = initialRun();
   initial.repoPath = source;
-  const state = store.createAdaptive(initial, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
+  const state = store.create(initial, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
   const lease = store.acquireLease(state.runId);
   const authority: ControllerAuthority = {
     runId: state.runId,

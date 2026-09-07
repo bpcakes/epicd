@@ -57,7 +57,7 @@ async function fixture(
   const root = await mkdtemp("/var/tmp/epicd-controlled-sdk-");
   const databasePath = join(root, "state.sqlite3");
   let store = new StateStore(databasePath);
-  const state = store.createAdaptive(
+  const state = store.create(
     initialRun(),
     RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { artifactBytes } }),
   );

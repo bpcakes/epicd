@@ -129,6 +129,7 @@ export class ActionKernel {
     });
     this.registerLocal("inspect_run", ({ authority }) => {
       const content = {
+        objective: journal.runObjective(authority.runId),
         control: journal.control(authority.runId),
         agents: journal.agents.summaries(authority.runId),
         delivery: journal.delivery.summaries(authority.runId),
@@ -355,6 +356,26 @@ export class ActionKernel {
   operation(operationId: string): Promise<ActionResult> | null {
     return this.operations.get(operationId)?.result ?? null;
   }
+
+  /** Settle dispatched handlers before releasing their controller lease. */
+  async drain(timeoutMs = 30_000): Promise<boolean> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000)
+      throw new Error("Invalid controller drain deadline");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        Promise.allSettled([...this.operations.values()].map((operation) => operation.result)).then(
+          () => true,
+        ),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   assertHealthy(): void {
     if (this.integrityError) throw this.integrityError;
   }

@@ -7,16 +7,14 @@ import { ZodError } from "zod";
 import {
   AgentPreferencesSchema,
   EngineEventSchema,
-  prepareCompletedSessionCleanup,
   RUN_STATE_SCHEMA_VERSION,
-  runNeedsResume,
-  runRecoveryKind,
   RunStateSchema,
-  resolveAdaptiveAgentRoleSettings,
+  resolveAgentRoleSettings,
   type AgentPreferences,
   type EngineEvent,
   type EventLevel,
   type RunState,
+  type CommonGitDirectory,
 } from "../domain/types.js";
 import { redactSensitiveText } from "../util/redact.js";
 import {
@@ -29,11 +27,15 @@ import { RepositoryPolicySchema, type RepositoryPolicy } from "../domain/reposit
 type RunRow = {
   run_id: string;
   repo_path: string;
+  common_path: string | null;
+  common_device: string | null;
+  common_inode: string | null;
   epic_id: string;
   phase: string;
   state_json: string;
   updated_at: string;
   orchestration_present?: number;
+  control_status?: string;
 };
 type QuarantineRunRow = RunRow & { created_at: string };
 type EventRow = {
@@ -166,18 +168,31 @@ function decodeRunRow(row: RunRow | undefined): RunState | null {
       }
     }
     const state = RunStateSchema.parse(input);
-    if (
-      row.orchestration_present !== undefined &&
-      Boolean(row.orchestration_present) !== (state.orchestrationMode === "adaptive")
-    ) {
-      throw new Error("Run orchestration mode does not match its durable control record");
+    if (row.control_status !== undefined && row.phase !== row.control_status)
+      throw new Error("Indexed status does not match the durable control record");
+    if (row.orchestration_present !== undefined && !Boolean(row.orchestration_present)) {
+      throw new Error("Run is missing its durable control record");
     }
     const identities = [
       ["run ID", row.run_id, state.runId],
       ["repository path", row.repo_path, state.repoPath],
       ["epic ID", row.epic_id, state.epicId],
-      ["phase", row.phase, state.phase],
       ["updated timestamp", row.updated_at, state.updatedAt],
+      [
+        "common Git path",
+        row.common_path,
+        state.runtimeConfiguration?.commonDirectory.path ?? null,
+      ],
+      [
+        "common Git device",
+        row.common_device,
+        state.runtimeConfiguration?.commonDirectory.device ?? null,
+      ],
+      [
+        "common Git inode",
+        row.common_inode,
+        state.runtimeConfiguration?.commonDirectory.inode ?? null,
+      ],
     ] as const;
     for (const [name, indexed, serialized] of identities) {
       if (indexed !== serialized) {
@@ -208,8 +223,9 @@ function inspectRunRow(row: RunRow): StoredRunInspection {
   }
 }
 
-const RUN_ROW_COLUMNS = `run_id, repo_path, epic_id, phase, state_json, updated_at,
-  EXISTS(SELECT 1 FROM orchestration_runs WHERE orchestration_runs.run_id = runs.run_id) AS orchestration_present`;
+const RUN_ROW_COLUMNS = `run_id, repo_path, common_path, common_device, common_inode, epic_id, phase, state_json, updated_at,
+  EXISTS(SELECT 1 FROM orchestration_runs WHERE orchestration_runs.run_id = runs.run_id) AS orchestration_present,
+  (SELECT status FROM orchestration_runs WHERE orchestration_runs.run_id = runs.run_id) AS control_status`;
 const RUN_NEWEST_FIRST = "updated_at DESC, created_at DESC, run_id DESC";
 
 function encodeRunState(state: RunState): string {
@@ -269,6 +285,9 @@ export class StateStore {
         CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
         repo_path TEXT NOT NULL,
+        common_path TEXT,
+        common_device TEXT,
+        common_inode TEXT,
         epic_id TEXT NOT NULL,
         phase TEXT NOT NULL,
         state_json TEXT NOT NULL,
@@ -296,6 +315,9 @@ export class StateStore {
       CREATE TABLE IF NOT EXISTS quarantined_runs (
         run_id TEXT PRIMARY KEY,
         repo_path TEXT NOT NULL,
+        common_path TEXT,
+        common_device TEXT,
+        common_inode TEXT,
         epic_id TEXT NOT NULL,
         recorded_phase TEXT NOT NULL,
         state_json TEXT NOT NULL,
@@ -319,6 +341,9 @@ export class StateStore {
         CREATE UNIQUE INDEX IF NOT EXISTS runs_active_repo
           ON runs(repo_path)
           WHERE phase != 'complete';
+        CREATE UNIQUE INDEX IF NOT EXISTS runs_active_common_directory
+          ON runs(common_device, common_inode)
+          WHERE phase != 'complete';
         CREATE INDEX IF NOT EXISTS runs_by_repo_epic_order
           ON runs(repo_path, epic_id, updated_at DESC, created_at DESC, run_id DESC);
       `);
@@ -330,72 +355,41 @@ export class StateStore {
     }
   }
 
-  create(state: RunState): void {
+  create(state: RunState, policyInput: RepositoryPolicy): RunState {
     const parsed = RunStateSchema.parse(state);
-    if (parsed.orchestrationMode === "adaptive")
-      throw new Error("Adaptive creation requires a frozen policy");
-    this.createRun(parsed);
-  }
-
-  createAdaptive(state: RunState, policyInput: RepositoryPolicy): RunState {
     const policy = RepositoryPolicySchema.parse(policyInput);
-    const coordinator = resolveAdaptiveAgentRoleSettings(state, "orchestrator");
+    const coordinator = resolveAgentRoleSettings(parsed, "orchestrator");
     if (
-      !policy.coordinator.reasoningEfforts.includes(
-        coordinator.reasoningEffort as (typeof policy.coordinator.reasoningEfforts)[number],
-      )
+      !policy.coordinator.reasoningEfforts.some((effort) => effort === coordinator.reasoningEffort)
     )
       throw new Error("Coordinator effort is not allowed by frozen policy");
-    if (state.phase !== "selecting" || state.currentBeadId !== null || state.completedTasks !== 0)
-      throw new Error("Cannot convert an existing delivery workflow to adaptive mode");
-    const parsed = RunStateSchema.parse({
-      ...state,
-      stateSchemaVersion: 2,
-      orchestrationMode: "adaptive",
-      agentSettings: {
-        ...state.agentSettings,
-        orchestrator: { ...state.agentSettings.orchestrator, model: coordinator.model },
-      },
-    });
-    this.createRun(parsed, policy);
+    this.db
+      .transaction(() => {
+        const common = parsed.runtimeConfiguration?.commonDirectory;
+        const owner = this.inspectWorkflowOwner(parsed.repoPath, common);
+        if (owner) throw recoverableRunError(owner, true);
+        const existing = this.inspectRecoverable(parsed.repoPath, parsed.epicId);
+        if (existing) throw recoverableRunError(existing);
+        this.db
+          .prepare(
+            `INSERT INTO runs(run_id, repo_path, common_path, common_device, common_inode, epic_id, phase, state_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+          )
+          .run(
+            parsed.runId,
+            parsed.repoPath,
+            common?.path ?? null,
+            common?.device ?? null,
+            common?.inode ?? null,
+            parsed.epicId,
+            encodeRunState(parsed),
+            parsed.createdAt,
+            parsed.updatedAt,
+          );
+        this.orchestration.initialize(parsed.runId, policy, parsed.totalTasks);
+      })
+      .immediate();
     return parsed;
-  }
-
-  private createRun(parsed: RunState, policy?: RepositoryPolicy): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const workflowOwner = this.inspectWorkflowOwner(parsed.repoPath);
-      if (workflowOwner) throw recoverableRunError(workflowOwner, true);
-      const existingEpic = this.inspectRecoverable(parsed.repoPath, parsed.epicId);
-      if (existingEpic) throw recoverableRunError(existingEpic);
-      this.db
-        .prepare(
-          `INSERT INTO runs(run_id, repo_path, epic_id, phase, state_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          parsed.runId,
-          parsed.repoPath,
-          parsed.epicId,
-          parsed.phase,
-          encodeRunState(parsed),
-          parsed.createdAt,
-          parsed.updatedAt,
-        );
-      if (policy) this.orchestration.initialize(parsed.runId, policy, parsed.totalTasks);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      if (this.db.inTransaction) this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  save(state: RunState): void {
-    this.persist(state, { kind: "unleased" });
-  }
-
-  saveWithLease(state: RunState, ownerToken: string): void {
-    this.persist(state, { kind: "lease", ownerToken });
   }
 
   updateAgentSettingsWithLease(
@@ -432,18 +426,18 @@ export class StateStore {
         .get(runId) as RunRow | undefined;
       if (!row) throw new RunNotFoundError(runId);
       const source = decodeRunRow(row);
-      if (source.phase === "complete") {
+      if (this.orchestration.control(runId).status === "complete") {
         throw new Error("A completed run cannot create new agent threads");
       }
       if (authority.kind === "unleased") this.removeStaleLeaseOrThrow(runId);
       const candidate = RunStateSchema.parse({
         ...source,
-        ...(runWide ?? {}),
+        ...(runWide ? { model: runWide.model, reasoningEffort: runWide.reasoningEffort } : {}),
         agentSettings: parsedSettings,
         updatedAt: new Date().toISOString(),
       });
-      if (source.orchestrationMode === "adaptive") {
-        const effective = resolveAdaptiveAgentRoleSettings(candidate, "orchestrator");
+      {
+        const effective = resolveAgentRoleSettings(candidate, "orchestrator");
         const policy = this.orchestration.policy(runId);
         if (
           !policy.coordinator.reasoningEfforts.some(
@@ -453,7 +447,7 @@ export class StateStore {
           throw new Error("Coordinator effort is not allowed by frozen policy");
         candidate.agentSettings.orchestrator.model = effective.model;
       }
-      const result = this.writeRunState(candidate, authority, true);
+      const result = this.writeSettings(candidate, authority);
       if (result.changes !== 1) {
         throw new Error(`Run ${runId} is not controlled by this epicd process`);
       }
@@ -465,7 +459,7 @@ export class StateStore {
         "Existing agent sessions keep the settings they started with",
         authority,
       );
-      if (source.orchestrationMode === "adaptive") this.orchestration.noteSettingsChange(runId);
+      this.orchestration.noteSettingsChange(runId);
       this.db.exec("COMMIT");
       return {
         event,
@@ -480,24 +474,6 @@ export class StateStore {
     }
   }
 
-  private persist(state: RunState, authority: PersistenceAuthority): void {
-    const parsed = RunStateSchema.parse({ ...state, updatedAt: new Date().toISOString() });
-    const result =
-      authority.kind === "unleased"
-        ? this.withUnleasedRun(parsed.runId, () => this.writeRunState(parsed, authority))
-        : this.writeRunState(parsed, authority);
-    if (result.changes !== 1) {
-      const exists = this.db.prepare("SELECT 1 FROM runs WHERE run_id = ?").get(parsed.runId) as
-        { 1: number } | undefined;
-      throw new Error(
-        !exists
-          ? `Unknown epicd run ${parsed.runId}`
-          : `Run ${parsed.runId} is not controlled by this epicd process`,
-      );
-    }
-    Object.assign(state, parsed);
-  }
-
   /** Keep lease validation and the write atomic, including within administrative transactions. */
   private withUnleasedRun<T>(runId: string, write: () => T): T {
     return this.db
@@ -508,35 +484,19 @@ export class StateStore {
       .immediate();
   }
 
-  /** The only update path for a serialized run and its indexed identity columns. */
-  private writeRunState(
-    state: RunState,
-    authority: PersistenceAuthority,
-    settingsOnly = false,
-  ): { changes: number } {
-    if (this.orchestration.hasRun(state.runId) && !settingsOnly) {
-      throw new Error("Adaptive control facts cannot be overwritten by a legacy state snapshot");
-    }
+  /** Only settings can update run JSON; workflow authority is never a caller-owned snapshot. */
+  private writeSettings(state: RunState, authority: PersistenceAuthority): { changes: number } {
     const parsed = RunStateSchema.parse(state);
-    const parameters = [
-      parsed.phase,
-      encodeRunState(parsed),
-      parsed.updatedAt,
-      parsed.runId,
-    ] as const;
+    const parameters = [encodeRunState(parsed), parsed.updatedAt, parsed.runId] as const;
     const result =
       authority.kind === "unleased"
         ? this.db
-            .prepare("UPDATE runs SET phase = ?, state_json = ?, updated_at = ? WHERE run_id = ?")
+            .prepare("UPDATE runs SET state_json = ?, updated_at = ? WHERE run_id = ?")
             .run(...parameters)
         : this.db
             .prepare(
-              `UPDATE runs SET phase = ?, state_json = ?, updated_at = ?
-               WHERE run_id = ?
-                 AND EXISTS (
-                   SELECT 1 FROM run_leases
-                   WHERE run_id = ? AND owner_token = ?
-                 )`,
+              `UPDATE runs SET state_json = ?, updated_at = ? WHERE run_id = ?
+          AND EXISTS (SELECT 1 FROM run_leases WHERE run_id = ? AND owner_token = ?)`,
             )
             .run(...parameters, parsed.runId, authority.ownerToken);
     return { changes: result.changes };
@@ -601,9 +561,9 @@ export class StateStore {
     return this.inspectRecoverable(repoPath, epicId) ?? this.inspectLatest(repoPath, epicId);
   }
 
-  /** Finds repository-wide Git workflow ownership, independent of cleanup-only work. */
-  inspectWorkflowOwner(repoPath: string): StoredRunInspection | null {
-    const row = this.workflowOwnerRow(repoPath);
+  /** Finds repository-wide delivery ownership. */
+  inspectWorkflowOwner(repoPath: string, common?: CommonGitDirectory): StoredRunInspection | null {
+    const row = this.workflowOwnerRow(repoPath, common);
     return row ? inspectRunRow(row) : null;
   }
 
@@ -623,14 +583,17 @@ export class StateStore {
           .get(repoPath) as RunRow | undefined);
   }
 
-  private workflowOwnerRow(repoPath: string): RunRow | undefined {
+  private workflowOwnerRow(repoPath: string, common?: CommonGitDirectory): RunRow | undefined {
     const row = this.db
       .prepare(
         `SELECT ${RUN_ROW_COLUMNS} FROM runs
-         WHERE repo_path = ? AND phase != 'complete'
+         WHERE (repo_path = ? OR (common_device = ? AND common_inode = ?))
+           AND (phase != 'complete' OR NOT EXISTS (
+             SELECT 1 FROM orchestration_runs WHERE orchestration_runs.run_id = runs.run_id AND status = 'complete'
+           ))
          ORDER BY ${RUN_NEWEST_FIRST} LIMIT 1`,
       )
-      .get(repoPath) as RunRow | undefined;
+      .get(repoPath, common?.device ?? null, common?.inode ?? null) as RunRow | undefined;
     return row;
   }
 
@@ -643,7 +606,7 @@ export class StateStore {
       .all(repoPath) as RunRow[];
   }
 
-  /** Finds the newest run that still owns workflow, session, or cleanup work. */
+  /** Finds the newest run that still owns delivery work. */
   inspectRecoverable(repoPath: string, epicId: string): StoredRunInspection | null {
     const rows = this.db
       .prepare(
@@ -653,7 +616,11 @@ export class StateStore {
       .all(repoPath, epicId) as RunRow[];
     for (const row of rows) {
       const inspected = inspectRunRow(row);
-      if (inspected.kind === "invalid" || runNeedsResume(inspected.state)) return inspected;
+      if (
+        inspected.kind === "invalid" ||
+        this.orchestration.control(inspected.state.runId).status !== "complete"
+      )
+        return inspected;
     }
     return null;
   }
@@ -667,7 +634,7 @@ export class StateStore {
     try {
       const row = this.db
         .prepare(
-          `SELECT run_id, repo_path, epic_id, phase, state_json, created_at, updated_at
+          `SELECT ${RUN_ROW_COLUMNS}, created_at
            FROM runs WHERE run_id = ?`,
         )
         .get(runId) as QuarantineRunRow | undefined;
@@ -675,7 +642,7 @@ export class StateStore {
       const inspected = inspectRunRow(row);
       if (inspected.kind === "valid") {
         throw new Error(
-          `Run ${runId} has valid persisted state; use normal resume or cleanup instead of quarantine`,
+          `Run ${runId} has valid persisted state; use normal resume instead of quarantine`,
         );
       }
       const unsupportedVersion = unsupportedRunStateVersion(inspected.error);
@@ -690,13 +657,16 @@ export class StateStore {
       this.db
         .prepare(
           `INSERT INTO quarantined_runs(
-             run_id, repo_path, epic_id, recorded_phase, state_json,
+             run_id, repo_path, common_path, common_device, common_inode, epic_id, recorded_phase, state_json,
              created_at, updated_at, quarantined_at, reason
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.run_id,
           row.repo_path,
+          row.common_path,
+          row.common_device,
+          row.common_inode,
           row.epic_id,
           row.phase,
           row.state_json,
@@ -726,59 +696,6 @@ export class StateStore {
         quarantinedAt,
         reason,
       };
-    } catch (error) {
-      if (this.db.inTransaction) this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  abandonAgentCleanup(runId: string): { state: RunState; abandonedActions: number } {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.removeStaleLeaseOrThrow(runId);
-      const row = this.db
-        .prepare(`SELECT ${RUN_ROW_COLUMNS} FROM runs WHERE run_id = ?`)
-        .get(runId) as RunRow | undefined;
-      if (!row) throw new RunNotFoundError(runId);
-      const state = decodeRunRow(row);
-      if (state.phase !== "complete") {
-        throw new Error(
-          `Run ${runId} is ${state.phase}; cleanup can be abandoned only after completion`,
-        );
-      }
-      const abandonedActions =
-        state.pendingAgentCleanup.length +
-        Object.values(state.agentSessions).filter((session) => session.status !== "inactive")
-          .length;
-      if (abandonedActions === 0 && state.lastError === null) {
-        throw new Error(`Run ${runId} has no pending agent cleanup`);
-      }
-      const updatedAt = new Date().toISOString();
-      const abandoned = RunStateSchema.parse({
-        ...state,
-        agentSessions: {
-          orchestrator: { status: "inactive" },
-          implementation: { status: "inactive" },
-          review: { status: "inactive" },
-        },
-        pendingAgentCleanup: [],
-        lastError: null,
-        updatedAt,
-      });
-      const written = this.writeRunState(abandoned, { kind: "unleased" });
-      if (written.changes !== 1) throw new RunNotFoundError(runId);
-      const abandonedResources = abandonedActions > 0;
-      this.addEvent(
-        runId,
-        "warning",
-        "agent.cleanup_abandoned",
-        abandonedResources
-          ? `Abandoned ${abandonedActions} agent cleanup action(s)`
-          : "Cleared completed cleanup diagnostic",
-        abandonedResources ? "External agent resources may remain open" : null,
-      );
-      this.db.exec("COMMIT");
-      return { state: abandoned, abandonedActions };
     } catch (error) {
       if (this.db.inTransaction) this.db.exec("ROLLBACK");
       throw error;
@@ -908,8 +825,7 @@ export class StateStore {
         .prepare(`SELECT ${RUN_ROW_COLUMNS} FROM runs WHERE run_id = ?`)
         .get(runId) as RunRow | undefined;
       if (!row) throw new RunNotFoundError(runId);
-      let state: RunState;
-      state = decodeRunRow(row);
+      const state = decodeRunRow(row);
       const existing = this.db
         .prepare(
           "SELECT owner_token, lease_id, pid, acquired_at, process_marker FROM run_leases WHERE run_id = ?",
@@ -933,15 +849,6 @@ export class StateStore {
           new Date().toISOString(),
           processMarker(process.pid),
         );
-      const controlledState =
-        state.orchestrationMode === "adaptive" ? state : prepareCompletedSessionCleanup(state);
-      if (encodeRunState(controlledState) !== encodeRunState(state)) {
-        state = RunStateSchema.parse({
-          ...controlledState,
-          updatedAt: new Date().toISOString(),
-        });
-        this.writeRunState(state, { kind: "lease", ownerToken });
-      }
       this.db.exec("COMMIT");
       return { ownerToken, leaseId, state };
     } catch (error) {
@@ -999,18 +906,8 @@ function recoverableRunError(inspection: StoredRunInspection, repositoryWide = f
     );
   }
   const state = inspection.state;
-  if (state.phase === "complete") {
-    if (runRecoveryKind(state) === "diagnostic") {
-      return new Error(
-        `Epic ${state.epicId} has a saved diagnostic in completed run ${state.runId}; resume it with epicd resume ${state.epicId}, or clear it with epicd cleanup ${state.runId} --abandon`,
-      );
-    }
-    return new Error(
-      `Epic ${state.epicId} still has agent cleanup or session recovery; resume that run before replacing the epic`,
-    );
-  }
   return new Error(
-    `Repository ${state.repoPath} is already owned by ${state.epicId} (${state.phase} workflow); resume that run before starting another epic`,
+    `Repository ${state.repoPath} is already owned by run ${state.runId} for ${state.epicId}; resume that run before starting another epic`,
   );
 }
 

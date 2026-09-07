@@ -35,7 +35,7 @@ function fixture(maxWorkers = 4) {
   const path = join(root, "state.sqlite3");
   const store = new StateStore(path);
   stores.push(store);
-  const state = store.createAdaptive(
+  const state = store.create(
     initialRun(),
     RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { maxWorkers } }),
   );

@@ -1,3 +1,4 @@
+import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -18,31 +19,7 @@ afterEach(() => {
 });
 
 function state(runId: string, epicId = "epic") {
-  return RunStateSchema.parse({
-    ...initialRun(),
-    runId,
-    agentNamespace: "0123456789abcdef0123",
-    repoPath: "/repo",
-    epicId,
-    epicTitle: "Epic",
-    model: null,
-    phase: "selecting",
-    currentBeadId: null,
-    currentBeadTitle: null,
-    baseRevision: null,
-    epicBaseRevision: "abc123",
-    candidateRevision: null,
-    completedTasks: 0,
-    totalTasks: 1,
-    reviewPass: 0,
-    pendingFindings: [],
-    recentOutcomes: [],
-    lastReviewSummary: null,
-    resumePhase: null,
-    lastError: null,
-    createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: "2026-01-01T00:00:00.000Z",
-  });
+  return RunStateSchema.parse({ ...initialRun(runId), repoPath: "/repo", epicId });
 }
 
 describe("controller leases across processes", () => {
@@ -52,7 +29,7 @@ describe("controller leases across processes", () => {
     const databasePath = join(directory, "state.sqlite3");
     const runId = "cross-process-run";
     const store = new StateStore(databasePath);
-    store.create(state(runId));
+    store.create(state(runId), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
 
     const child = spawn(
       process.execPath,
@@ -121,7 +98,7 @@ const state = JSON.parse(process.argv[2]);
 console.log("ready");
 process.stdin.once("data", () => {
   try {
-    store.create(state);
+    store.create(state, {"schemaVersion":1});
     console.log(JSON.stringify({ok:true,runId:state.runId}));
   } catch (error) {
     console.log(JSON.stringify({ok:false,message:error instanceof Error ? error.message : String(error)}));

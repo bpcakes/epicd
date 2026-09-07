@@ -102,7 +102,7 @@ export async function fixture(
   const head = git(source, "rev-parse", "HEAD");
   const path = join(root, "state.sqlite3");
   let store = new StateStore(path);
-  const state = store.createAdaptive(
+  const state = store.create(
     { ...initialRun(), repoPath: source, epicBaseRevision: head, epicId: trackedTask.epicId },
     RepositoryPolicySchema.parse({ schemaVersion: 1, requiredChecks: [required] }),
   );

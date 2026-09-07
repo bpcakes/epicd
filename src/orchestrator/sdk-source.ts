@@ -10,7 +10,7 @@ import {
   type ControllerAuthority,
 } from "../domain/orchestration.js";
 import { digestJson } from "../domain/repository-policy.js";
-import { ADAPTIVE_ORCHESTRATOR_MODEL, agentOutputSchema } from "../domain/types.js";
+import { ORCHESTRATOR_MODEL, agentOutputSchema } from "../domain/types.js";
 import type { DecisionSource } from "./loop.js";
 import { buildDecisionPrompt } from "./prompt.js";
 
@@ -61,7 +61,7 @@ export class ControlledDecisionSource implements DecisionSource {
     if (
       instance.role !== "orchestrator" ||
       instance.contract.runtime !== this.runtime.kind ||
-      instance.contract.effective.model !== ADAPTIVE_ORCHESTRATOR_MODEL
+      instance.contract.effective.model !== ORCHESTRATOR_MODEL
     )
       throw new DecisionSourceError(
         "configuration",

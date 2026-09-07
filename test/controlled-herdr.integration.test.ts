@@ -139,10 +139,7 @@ async function fixture(coordinator = false) {
   const databasePath = join(root, "state.sqlite3");
   let store = new StateStore(databasePath);
   closeStore = () => store.close();
-  const state = store.createAdaptive(
-    initialRun(),
-    RepositoryPolicySchema.parse({ schemaVersion: 1 }),
-  );
+  const state = store.create(initialRun(), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
   const lease = store.acquireLease(state.runId);
   let authority: ControllerAuthority = {
     runId: state.runId,

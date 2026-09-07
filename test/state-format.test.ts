@@ -4,8 +4,8 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
-import { RunStateSchema, AgentSessionStateSchema } from "../src/domain/types.js";
-import { currentSession, initialRun } from "./fixtures/orchestration/state.js";
+import { RunStateSchema, SdkAgentSessionContractSchema } from "../src/domain/types.js";
+import { initialRun } from "./fixtures/orchestration/state.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -22,18 +22,18 @@ describe("hard-cut state format", () => {
   it("requires persisted fields instead of supplying historical defaults", () => {
     for (const field of [
       "stateSchemaVersion",
-      "orchestrationMode",
       "runtime",
       "reasoningEffort",
       "agentSettings",
-      "agentNamespace",
-      "agentAccessMode",
-      "maxReviewPasses",
-      "agentSessions",
-      "pendingAgentCleanup",
-      "reviewBaselineFingerprint",
-      "reviewedFingerprint",
-      "reviewedTree",
+      "runtimeConfiguration",
+      "epicBaseRevision",
+      "runId",
+      "repoPath",
+      "epicId",
+      "model",
+      "totalTasks",
+      "createdAt",
+      "updatedAt",
     ]) {
       const input: Record<string, unknown> = initialRun();
       delete input[field];
@@ -43,22 +43,18 @@ describe("hard-cut state format", () => {
   });
 
   it("rejects obsolete session contracts instead of inventing settings or a cleanup transition", () => {
-    const active = currentSession("session");
-    for (const obsolete of [
-      { status: "unresolved", sessionId: "session", settings: active.contract.requested },
-      { status: "active", sessionId: "session", settings: active.contract.requested },
-      {
-        ...active,
-        contract: { requested: active.contract.requested, effective: active.contract.effective },
-      },
-      {
-        ...active,
-        contract: { ...active.contract, effective: { model: null, reasoningEffort: "xhigh" } },
-      },
-    ])
-      expect(AgentSessionStateSchema.safeParse(obsolete).success).toBe(false);
-    expect(AgentSessionStateSchema.parse(JSON.parse(JSON.stringify(active)))).toEqual(active);
+    expect(
+      SdkAgentSessionContractSchema.safeParse({
+        runtime: "sdk",
+        requested: { model: null, reasoningEffort: "high" },
+        effective: { model: null, reasoningEffort: "high" },
+      }).success,
+    ).toBe(false);
     for (const alias of [
+      "phase",
+      "orchestrationMode",
+      "agentSessions",
+      "pendingAgentCleanup",
       "reviewThreadId",
       "implementationThreadId",
       "orchestratorThreadId",
@@ -78,10 +74,7 @@ describe("hard-cut state format", () => {
       const { path } = fixture();
       const store = new StateStore(path);
       cleanups.push(() => store.close());
-      const run = store.createAdaptive(
-        initialRun(),
-        RepositoryPolicySchema.parse({ schemaVersion: 1 }),
-      );
+      const run = store.create(initialRun(), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
       const db = new Database(path);
       cleanups.push(() => db.close());
       const obsolete =
@@ -105,10 +98,7 @@ describe("hard-cut state format", () => {
     const { root, path } = fixture();
     const store = new StateStore(path);
     cleanups.push(() => store.close());
-    const run = store.createAdaptive(
-      initialRun(),
-      RepositoryPolicySchema.parse({ schemaVersion: 1 }),
-    );
+    const run = store.create(initialRun(), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
     const db = new Database(path);
     cleanups.push(() => db.close());
     const before = db.prepare("SELECT * FROM runs").all();
@@ -117,7 +107,7 @@ describe("hard-cut state format", () => {
     expect(reopened.get(run.runId)).toEqual(run);
     expect(reopened.orchestration.policy(run.runId).coordinator.model).toBe("gpt-6-astra");
     expect(db.prepare("SELECT * FROM runs").all()).toEqual(before);
-    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 13 }]);
+    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 15 }]);
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE name = 'diagnostic_artifacts'").get(),
     ).toBeDefined();
@@ -127,9 +117,9 @@ describe("hard-cut state format", () => {
   it.each([
     { label: "unmarked", versions: null },
     { label: "empty marker", versions: [] },
-    { label: "older format", versions: [12] },
-    { label: "newer format", versions: [14] },
-    { label: "multiple format markers", versions: [12, 13] },
+    { label: "older format", versions: [14] },
+    { label: "newer format", versions: [16] },
+    { label: "multiple format markers", versions: [14, 15] },
   ])("refuses $label without migration, backups or deletion", ({ versions }) => {
     const { root, path } = fixture();
     const db = new Database(path);
@@ -155,10 +145,7 @@ describe("hard-cut state format", () => {
     const { path } = fixture();
     const store = new StateStore(path);
     cleanups.push(() => store.close());
-    const state = store.createAdaptive(
-      initialRun(),
-      RepositoryPolicySchema.parse({ schemaVersion: 1 }),
-    );
+    const state = store.create(initialRun(), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
     const db = new Database(path);
     cleanups.push(() => db.close());
     db.prepare("DELETE FROM orchestration_runs WHERE run_id = ?").run(state.runId);

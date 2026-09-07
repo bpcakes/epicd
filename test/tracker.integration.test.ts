@@ -124,7 +124,7 @@ else: sys.exit('unsupported')
   stores.push(store);
   const run = initialRun();
   run.repoPath = repo;
-  store.createAdaptive(run, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
+  store.create(run, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
   let lease = store.acquireLease(run.runId);
   const authority = (): ControllerAuthority => ({
     runId: run.runId,
@@ -722,7 +722,7 @@ describe.skipIf(!process.env.EPICD_TEST_BR_PATH || process.platform !== "linux")
       const run = initialRun("real-fixture");
       run.repoPath = root;
       run.epicId = epic.id;
-      store.createAdaptive(run, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
+      store.create(run, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
       const lease = store.acquireLease(run.runId);
       const authority = { runId: run.runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
       const kernel = new ActionKernel(store.orchestration);

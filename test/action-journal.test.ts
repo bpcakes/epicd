@@ -28,7 +28,7 @@ function fixture(policy = RepositoryPolicySchema.parse({ schemaVersion: 1 })) {
   const path = join(root, "state.sqlite3");
   const store = new StateStore(path);
   stores.push(store);
-  const run = store.createAdaptive(initialRun(), policy);
+  const run = store.create(initialRun(), policy);
   const lease = store.acquireLease(run.runId);
   const authority: ControllerAuthority = {
     runId: run.runId,
@@ -286,14 +286,11 @@ describe("durable action admission", () => {
     expect(setup.journal.observations(setup.run.runId)).toHaveLength(1);
   });
 
-  it("prevents a whole legacy snapshot from overwriting adaptive state", () => {
+  it("has no whole-state overwrite API", () => {
     const setup = fixture();
-    expect(() =>
-      setup.store.saveWithLease(
-        { ...setup.run, orchestrationMode: "legacy" },
-        setup.authority.ownerToken,
-      ),
-    ).toThrow("legacy state snapshot");
+    expect(setup.store).not.toHaveProperty("save");
+    expect(setup.store).not.toHaveProperty("saveWithLease");
+    expect(setup.store).not.toHaveProperty("createAdaptive");
   });
 
   it("retains run-local knowledge and validates provenance and supersession", () => {

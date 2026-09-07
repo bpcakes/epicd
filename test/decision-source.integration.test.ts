@@ -34,10 +34,7 @@ function fixture() {
   const path = join(root, "state.sqlite3");
   const store = new StateStore(path);
   stores.push(store);
-  const state = store.createAdaptive(
-    initialRun(),
-    RepositoryPolicySchema.parse({ schemaVersion: 1 }),
-  );
+  const state = store.create(initialRun(), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
   const lease = store.acquireLease(state.runId);
   const authority: ControllerAuthority = {
     runId: state.runId,

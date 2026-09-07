@@ -1,133 +1,261 @@
-import { runRecoveryKind, type EngineEvent, type RunPhase, type RunState } from "./domain/types.js";
-import { RunAlreadyControlledError } from "./adapters/store.js";
-import { AgentCleanupRequiredError, WorkflowCompletionReportingError } from "./engine/errors.js";
+import { digestJson } from "./domain/repository-policy.js";
+import {
+  AgentSessionContractSchema,
+  resolveAgentRoleSettings,
+  type AgentRole,
+  type RunState,
+} from "./domain/types.js";
+import type { ControllerAuthority } from "./domain/orchestration.js";
+import type { AgentInstance } from "./domain/agents.js";
+import { StateStore } from "./adapters/store.js";
+import { WorkspaceManager } from "./adapters/workspaces.js";
+import { ControlledSdkRuntime } from "./adapters/controlled-sdk.js";
+import { ControlledHerdrRuntime } from "./adapters/controlled-herdr.js";
+import { KernelBeads } from "./adapters/kernel-beads.js";
+import { PublicationGit } from "./adapters/publication-git.js";
+import { ActionKernel } from "./kernel/actions.js";
+import { registerAgentCapabilities, type ControlledAgentDriver } from "./kernel/agents.js";
+import { registerDeliveryCapabilities } from "./kernel/delivery.js";
+import {
+  registerInspectionCapabilities,
+  reconcileRepositoryInspection,
+} from "./kernel/inspection.js";
+import { registerReviewCapabilities } from "./kernel/reviews.js";
+import { registerCommitCapabilities } from "./kernel/commits.js";
+import { registerPublicationCapabilities } from "./kernel/publication.js";
+import { registerTrackerCapabilities } from "./kernel/tracker.js";
+import { reconcileActions } from "./kernel/reconcile.js";
+import { ControlledDecisionSource } from "./orchestrator/sdk-source.js";
+import { OrchestratorLoop } from "./orchestrator/loop.js";
+import { runStatusView } from "./status.js";
+import { redactSensitiveText } from "./util/redact.js";
 
-const IDLE_CONTROLLER_PHASES = new Set<RunPhase>(["paused", "blocked", "complete"]);
-
-export function isControllerIdlePhase(phase: RunPhase): boolean {
-  return IDLE_CONTROLLER_PHASES.has(phase);
-}
-
-export function canRequestPause(controllerBusy: boolean, phase: RunPhase): boolean {
-  return controllerBusy && !isControllerIdlePhase(phase);
-}
-
-/** Workflow phase may become idle before the active operation releases its lease. */
-export function shouldExitAfterController(
-  pauseThenExit: boolean,
-  controllerBusy: boolean,
-): boolean {
-  return pauseThenExit && !controllerBusy;
-}
-
-export function controllerFailureMessage(error: unknown): string {
-  if (error instanceof RunAlreadyControlledError) {
-    return `Run ${error.runId} is already controlled by process ${error.pid}. Stop that epicd process first. If the controller is stale, run: epicd unlock ${error.runId} --owner-pid ${error.pid} --lease-id ${error.leaseId} --force`;
-  }
-  if (error instanceof AgentCleanupRequiredError) {
-    return `Agent cleanup for run ${error.runId} needs attention: ${error.message}. Retry with: epicd resume ${error.epicId}. If cleanup cannot be completed, explicitly abandon it with: epicd cleanup ${error.runId} --abandon. External agent resources may remain open.`;
-  }
-  if (error instanceof WorkflowCompletionReportingError) {
-    return `Workflow for epic ${error.epicId} completed, but its final event could not be recorded: ${error.message}. Inspect the durable result with: epicd status ${error.epicId}`;
-  }
-  const detail = error instanceof Error ? error.message : String(error);
-  return `Controller stopped unexpectedly: ${detail}. Restart epicd to recover from the last persisted phase.`;
-}
-
-export function performControllerCommand(
-  command: () => void,
-  onError: (message: string) => void,
-): boolean {
-  try {
-    command();
-    return true;
-  } catch (error) {
-    onError(controllerFailureMessage(error));
-    return false;
-  }
-}
-
-export function epicRunConflictMessage(
-  run: Parameters<typeof runRecoveryKind>[0] & Pick<RunState, "epicId" | "runId">,
-  repoPath: string,
-): string {
-  if (runRecoveryKind(run) === "diagnostic") {
-    return `Completed run ${run.runId} for epic ${run.epicId} has a saved diagnostic. Use: epicd resume ${run.epicId} --repo ${repoPath}, or epicd cleanup ${run.runId} --abandon`;
-  }
-  const ownership = run.phase === "complete" ? "pending agent cleanup" : `a ${run.phase} workflow`;
-  return `An existing run for epic ${run.epicId} has ${ownership}. Use: epicd resume ${run.epicId} --repo ${repoPath}`;
-}
-
-type HeadlessController = {
-  onEvent(listener: (event: EngineEvent) => void): () => void;
-  run(): Promise<RunState>;
-};
-
-export async function launchHeadlessController(controller: HeadlessController): Promise<void> {
-  controller.onEvent((event) => {
-    process.stdout.write(
-      `${event.at} ${event.level.toUpperCase()} ${event.message}${event.detail ? ` — ${event.detail}` : ""}\n`,
-    );
+export function agentContract(state: RunState, role: AgentRole) {
+  const settings = resolveAgentRoleSettings(state, role);
+  if (!settings.model) throw new Error(`Resolve a concrete ${role} model before starting a run`);
+  return AgentSessionContractSchema.parse({
+    runtime: state.runtime,
+    requested: settings,
+    effective: settings,
   });
-  let result: RunState;
-  try {
-    result = await controller.run();
-  } catch (error) {
-    process.exitCode = 1;
-    throw new Error(controllerFailureMessage(error), { cause: error });
-  }
-  if (result.phase !== "complete") process.exitCode = 1;
 }
 
-export async function observeControllerOperation(
-  operation: Promise<RunState>,
-  onState: (state: RunState) => void,
-  onError: (message: string) => void,
-): Promise<void> {
-  let state: RunState;
-  try {
-    state = await operation;
-  } catch (error) {
-    onError(controllerFailureMessage(error));
-    return;
-  }
-  onState(state);
+/** Native Herdr never routes through the SDK. Runtime and paths are frozen at creation. */
+export function controlledDriver(store: StateStore, state: RunState): ControlledAgentDriver {
+  const config = state.runtimeConfiguration;
+  if (!config) throw new Error("Run has no runtime configuration; create a fresh configured run");
+  const common = {
+    root: config.runtimeRoot,
+    executable: config.executable,
+    authCachePath: config.authCachePath,
+    turnTimeoutMs: config.turnTimeoutMs,
+  };
+  if (state.runtime === "sdk") return new ControlledSdkRuntime(store.orchestration, common);
+  if (!config.herdr) throw new Error("Native Herdr endpoint is missing");
+  return new ControlledHerdrRuntime(store.orchestration, {
+    ...common,
+    herdrPath: config.herdr.executable,
+    sessionName: config.herdr.sessionName,
+    workspaceId: config.herdr.workspaceId,
+  });
 }
 
-export class ControllerOperationGate {
-  private active: Promise<RunState> | null = null;
+/** Supplies capabilities and stop recovery. The model chooses all delivery transitions. */
+export class OrchestratorController {
+  private running = false;
+  constructor(
+    readonly store: StateStore,
+    readonly runId: string,
+    private readonly options: {
+      driver?: (store: StateStore, state: RunState) => ControlledAgentDriver;
+      drainTimeoutMs?: number;
+    } = {},
+  ) {}
 
-  get busy(): boolean {
-    return this.active !== null;
+  status() {
+    return runStatusView(this.store, this.runId);
+  }
+  pause() {
+    const journal = this.store.orchestration;
+    return journal.operatorControl(this.runId, journal.control(this.runId).controlVersion, {
+      kind: "pause",
+    });
   }
 
-  start(
-    operation: () => Promise<RunState>,
-    onState: (state: RunState) => void,
-    onError: (message: string) => void,
-    onBusyChange: (busy: boolean) => void,
-  ): boolean {
-    if (this.active) return false;
-    let active: Promise<RunState>;
+  async run(signal?: AbortSignal) {
+    if (this.running) throw new Error("This controller is already running");
+    this.running = true;
+    let authority: ControllerAuthority | null = null;
+    let kernel: ActionKernel | null = null;
     try {
-      active = operation();
-    } catch (error) {
-      onError(controllerFailureMessage(error));
-      return false;
-    }
-    this.active = active;
-    onBusyChange(true);
-    void observeControllerOperation(active, onState, onError)
-      .catch(() => {
-        process.emitWarning(
-          "Controller state observer failed; persisted state remains authoritative",
+      const lease = this.store.acquireLease(this.runId);
+      authority = { runId: this.runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
+      const state = lease.state;
+      const journal = this.store.orchestration;
+      const config = state.runtimeConfiguration;
+      if (!config)
+        throw new Error("Run has no runtime configuration; create a fresh configured run");
+      const currentRepository = await new PublicationGit().bind(state.repoPath, signal);
+      if (digestJson(currentRepository.commonDirectory) !== digestJson(config.commonDirectory))
+        throw new Error(
+          "Repository metadata identity changed; the recorded run cannot attach to this checkout",
         );
-      })
-      .finally(() => {
-        if (this.active !== active) return;
-        this.active = null;
-        onBusyChange(false);
+      const driver = (this.options.driver ?? controlledDriver)(this.store, state);
+      if (driver.kind !== state.runtime)
+        throw new Error("Driver does not match the persisted runtime");
+      const workspaces = new WorkspaceManager(journal, config.workspaceRoot);
+      kernel = new ActionKernel(journal);
+      const contractFor = (role: AgentRole) => agentContract(this.store.get(this.runId)!, role);
+      registerAgentCapabilities(kernel, driver, contractFor);
+      registerDeliveryCapabilities(kernel, workspaces);
+      registerInspectionCapabilities(kernel, workspaces);
+      registerReviewCapabilities(kernel, workspaces, driver, () => contractFor("review"));
+      registerCommitCapabilities(kernel, workspaces);
+      registerPublicationCapabilities(kernel, workspaces);
+      registerTrackerCapabilities(kernel, new KernelBeads(config.trackerExecutable));
+
+      // A replaced controller lease is never evidence that its external work stopped.
+      for (const turn of journal.agents.turns(this.runId)) {
+        if (turn.stopEvidence) continue;
+        try {
+          await driver.reconcile(authority, turn.identity);
+        } catch (error) {
+          journal.appendObservation(authority, {
+            source: "controller",
+            sourceEventId: `stop-${authority.leaseId}-${turn.identity.turnId}`,
+            kind: "recovery.unresolved",
+            summary: redactSensitiveText(String(error), 7999),
+            identity: turn.identity,
+            artifactIds: [],
+            wakesOrchestrator: true,
+          });
+        }
+      }
+      await reconcileActions(journal, authority, async (action) => {
+        if (action.request.action.kind === "inspect_repo")
+          return reconcileRepositoryInspection(action);
+        if (
+          ["start_agent", "continue_agent", "start_specialist"].includes(action.request.action.kind)
+        ) {
+          const turn = journal.agents
+            .turns(this.runId)
+            .find((turn) => turn.identity.operationId === action.operationId);
+          if (turn?.stopEvidence)
+            return {
+              status: "failed",
+              detail: `Previous worker turn ${turn.identity.turnId} stopped; inspect its retained result before choosing a follow-up. Its lost action acknowledgement was not replayed.`,
+            };
+        }
+        return {
+          status: "unresolved",
+          detail: `Action ${action.actionId} remains indeterminate. Inspect its owned resources and use the available reconciliation capability; no effect was repeated.`,
+        };
       });
-    return true;
+      if (journal.control(this.runId).status === "active" && !signal?.aborted) {
+        const coordinator = await this.coordinator(authority, state, workspaces, signal);
+        const source = new ControlledDecisionSource(journal, authority, coordinator, driver);
+        await new OrchestratorLoop(kernel, source).run(authority, signal);
+      }
+    } catch (error) {
+      if (authority && !signal?.aborted) {
+        const journal = this.store.orchestration;
+        journal.assertAuthority(authority);
+        if (journal.control(this.runId).status === "active")
+          journal.setEscalation(
+            authority,
+            redactSensitiveText(`Controller could not continue: ${String(error)}`, 7999),
+            "controller_unavailable",
+            [],
+          );
+      }
+      if (!signal?.aborted) throw error;
+    } finally {
+      try {
+        if (kernel) {
+          kernel.interruptAll();
+          const drained = await kernel.drain(this.options.drainTimeoutMs);
+          if (authority) {
+            const journal = this.store.orchestration;
+            journal.assertAuthority(authority);
+            if (!drained) {
+              journal.markInterruptedActions(authority);
+              if (journal.control(this.runId).status === "active")
+                journal.setEscalation(
+                  authority,
+                  "Shutdown could not confirm all operations stopped. Reconcile their recorded identities before retrying effects.",
+                  "shutdown_indeterminate",
+                  [],
+                );
+            } else if (signal?.aborted && journal.control(this.runId).status === "active") {
+              journal.changeStatus(authority, "paused");
+            }
+          }
+        }
+      } finally {
+        if (authority) this.store.releaseLease(this.runId, authority.ownerToken);
+        this.running = false;
+      }
+    }
+    return this.status();
+  }
+
+  private async coordinator(
+    authority: ControllerAuthority,
+    state: RunState,
+    workspaces: WorkspaceManager,
+    signal?: AbortSignal,
+  ): Promise<AgentInstance> {
+    const journal = this.store.orchestration;
+    const contract = agentContract(state, "orchestrator");
+    const prior = journal.agents
+      .instances(this.runId)
+      .filter((agent) => agent.role === "orchestrator");
+    const live = prior.filter((agent) => !["revoked", "released"].includes(agent.status));
+    if (live.length > 1) throw new Error("Multiple coordinator assignments require reconciliation");
+    const existing = live[0];
+    if (existing) {
+      if (existing.activeTurnId) throw new Error("The previous coordinator has no confirmed stop");
+      if (digestJson(existing.contract) === digestJson(contract)) return existing;
+      journal.agents.revokeAgent(
+        authority,
+        existing,
+        "Operator changed future-thread coordinator settings",
+      );
+      journal.agents.releaseAgent(authority, existing);
+    }
+    const operation = `coordinator-${digestJson([this.runId, prior.length, contract]).slice(0, 40)}`;
+    let workspace = journal.agents.workspaceForOperation(this.runId, operation);
+    if (workspace) {
+      if ((await workspaces.inspectMaterialization(authority, workspace, signal)) !== "ready")
+        throw new Error(
+          "The reserved coordinator workspace is incomplete; it was preserved for inspection",
+        );
+      workspace = journal.agents.workspace(this.runId, workspace);
+    } else {
+      workspace = await workspaces.create(
+        authority,
+        state.repoPath,
+        state.epicBaseRevision,
+        "coordinator",
+        signal,
+        operation,
+      );
+    }
+    return journal.agents.reserveAgent(
+      authority,
+      {
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        workspaceId: workspace.workspaceId,
+        workspaceGeneration: workspace.workspaceGeneration,
+        instructions:
+          "Deliver the selected epic through the available kernel capabilities. Choose the strategy, investigate failures, preserve useful memory and demand independent exact-revision evidence. Escalate for missing authority, judgment, or unavailable capabilities.",
+        contract,
+        confinementProfile: "epicd-isolated",
+      },
+      journal.control(this.runId).controlVersion,
+    );
   }
 }
