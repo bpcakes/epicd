@@ -177,6 +177,11 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
     revision: Id.nullable(),
   }),
   z.strictObject({
+    kind: z.literal("create_diagnostic_workspace"),
+    candidate: z.strictObject(CandidateTarget).nullable(),
+    revision: Id.nullable(),
+  }),
+  z.strictObject({
     kind: z.literal("restore_owned_delta"),
     ...WorkspaceTarget,
     baselineSnapshotId: Id,

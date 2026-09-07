@@ -25,6 +25,10 @@ import { registerCommitCapabilities } from "./kernel/commits.js";
 import { registerPublicationCapabilities } from "./kernel/publication.js";
 import { registerTrackerCapabilities } from "./kernel/tracker.js";
 import { registerSettingsCapabilities } from "./kernel/settings.js";
+import {
+  registerDiagnosticWorkspaceCapabilities,
+  reconcileDiagnosticWorkspace,
+} from "./kernel/diagnostic-workspaces.js";
 import { reconcileActions } from "./kernel/reconcile.js";
 import { ControlledDecisionSource } from "./orchestrator/sdk-source.js";
 import { OrchestratorLoop } from "./orchestrator/loop.js";
@@ -115,6 +119,7 @@ export class OrchestratorController {
       registerPublicationCapabilities(kernel, workspaces);
       registerTrackerCapabilities(kernel, new KernelBeads(config.trackerExecutable));
       registerSettingsCapabilities(kernel, this.store);
+      registerDiagnosticWorkspaceCapabilities(kernel, workspaces, state.repoPath);
 
       // A replaced controller lease is never evidence that its external work stopped.
       for (const turn of journal.agents.turns(this.runId)) {
@@ -134,6 +139,8 @@ export class OrchestratorController {
         }
       }
       await reconcileActions(journal, authority, async (action) => {
+        if (action.request.action.kind === "create_diagnostic_workspace")
+          return reconcileDiagnosticWorkspace(journal, workspaces, authority!, action, signal);
         if (action.request.action.kind === "inspect_repo")
           return reconcileRepositoryInspection(action);
         if (

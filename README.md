@@ -108,6 +108,8 @@ During a run, the orchestrator can invoke `change_agent_settings` within frozen 
 
 `replace_agent` requires the old worker's confirmed stop and a separately created workspace. It preserves the old copy, retires that generation and reserves a fresh one with the same task/purpose and current permitted settings. The orchestrator supplies handoff instructions and chooses when to continue; independent reviewers still run through `run_review`. Replacement does not erase findings, reuse a contaminated copy or count as completed work.
 
+`create_diagnostic_workspace` gives specialists a writable private copy for experiments. With `candidate` and `revision` both null it copies the frozen epic baseline, even while implementation is active. A candidate identity selects its captured snapshot; an explicit revision must also identify that candidate's kernel-recorded exact commit. Candidate copying requires its source workspace to be stopped. The orchestrator then chooses `start_specialist`, follow-up, inspection or replacement through the selected SDK/native Herdr driver. Diagnostic edits and reports cannot satisfy delivery validation or independent review. Restart can recover a lost creation acknowledgement only from an intact recorded copy with confirmed I/O stop; it never recreates an uncertain copy or discards its delta.
+
 ## Safety and recovery
 
 The model chooses the next useful capability. The kernel validates control versions, leases, policy, workspace ownership, and evidence before executing it.

@@ -216,12 +216,12 @@ export class WorkspaceManager {
     });
   }
 
-  async createReviewCopy(
+  async createSnapshotCopy(
     authority: ControllerAuthority,
     snapshotInput: WorkspaceSnapshot,
     signal?: AbortSignal,
     creationOperationId?: string,
-    purpose: "review" | "verification" = "review",
+    purpose: "review" | "verification" | "diagnostic" = "review",
   ): Promise<WorkspaceRecord> {
     const snapshot = WorkspaceSnapshotSchema.parse(snapshotInput);
     if (snapshot.runId !== authority.runId)
@@ -241,7 +241,7 @@ export class WorkspaceManager {
       if (tree !== snapshot.fullTree || copy.baselineFingerprint !== snapshot.fingerprint)
         throw new WorkspaceError(
           "candidate_copy_mismatch",
-          "Review copy does not match the captured candidate",
+          "Workspace copy does not match the captured candidate",
         );
       return copy;
     });

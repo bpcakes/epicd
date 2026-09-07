@@ -120,7 +120,7 @@ export function registerDeliveryCapabilities(
           "candidate_not_captured",
           "Candidate capture has not completed",
         );
-      const workspace = await workspaces.createReviewCopy(
+      const workspace = await workspaces.createSnapshotCopy(
         authority,
         journal.delivery.snapshotAtRevision(authority.runId, candidate, action.revision),
         signal,

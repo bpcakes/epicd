@@ -10,6 +10,7 @@ import { ControlledSdkRuntime } from "../../src/adapters/controlled-sdk.js";
 import { ActionKernel } from "../../src/kernel/actions.js";
 import { registerAgentCapabilities } from "../../src/kernel/agents.js";
 import { registerDeliveryCapabilities } from "../../src/kernel/delivery.js";
+import { registerDiagnosticWorkspaceCapabilities } from "../../src/kernel/diagnostic-workspaces.js";
 import { registerCommitCapabilities } from "../../src/kernel/commits.js";
 import { registerPublicationCapabilities } from "../../src/kernel/publication.js";
 import { registerReviewCapabilities } from "../../src/kernel/reviews.js";
@@ -150,6 +151,7 @@ export async function fixture(
   };
   const driver = new ControlledSdkRuntime(journal, options);
   registerDeliveryCapabilities(kernel, manager);
+  registerDiagnosticWorkspaceCapabilities(kernel, manager, source);
   registerCommitCapabilities(kernel, manager);
   const publication = registerPublicationCapabilities(kernel, manager);
   registerAgentCapabilities(kernel, driver, () => contract);

@@ -168,7 +168,7 @@ describe("managed independent Git workspaces", () => {
     expect(snapshot.fullTree).not.toBe(snapshot.applicationTree);
     expect(git(work.path, "rev-parse", "HEAD")).toBe(setup.head);
     expect(readFileSync(join(work.path, ".git", "index"))).toEqual(index);
-    const review = await setup.manager.createReviewCopy(setup.authority, snapshot);
+    const review = await setup.manager.createSnapshotCopy(setup.authority, snapshot);
     expect(review.sourceMode).toBe("immutable");
     expect(review.baselineFingerprint).toBe(snapshot.fingerprint);
     expect(readFileSync(join(review.path, name))).toEqual(binary);
@@ -195,7 +195,7 @@ describe("managed independent Git workspaces", () => {
     await expect(setup.manager.capture(setup.authority, work, id)).rejects.toThrow(
       "different bytes",
     );
-    const review = await setup.manager.createReviewCopy(setup.authority, first);
+    const review = await setup.manager.createSnapshotCopy(setup.authority, first);
     expect(readFileSync(join(review.path, "app.txt"), "utf8")).toBe("candidate one\n");
     writeFileSync(join(review.path, "app.txt"), "diagnostic contamination\n");
     expect(readFileSync(join(work.path, "app.txt"), "utf8")).toBe("candidate two\n");
