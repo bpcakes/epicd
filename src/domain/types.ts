@@ -204,6 +204,28 @@ export function resolveAgentSettings(source: AgentSettingsSource): AgentSettings
   );
 }
 
+export const ADAPTIVE_ORCHESTRATOR_MODEL = "gpt-6-astra";
+export const AstraReasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
+
+/** Adaptive coordination has a required model, not a run-wide worker fallback. */
+export function resolveAdaptiveAgentRoleSettings(
+  source: AgentSettingsSource,
+  role: AgentRole,
+): AgentRoleSettings {
+  if (role !== "orchestrator") return resolveAgentRoleSettings(source, role);
+  const preference = source.agentSettings.orchestrator;
+  if (preference.model !== null && preference.model !== ADAPTIVE_ORCHESTRATOR_MODEL) {
+    throw new Error(`Adaptive orchestration requires ${ADAPTIVE_ORCHESTRATOR_MODEL}`);
+  }
+  const settings = resolveAgentRoleSettings(source, role);
+  if (!AstraReasoningEffortSchema.safeParse(settings.reasoningEffort).success) {
+    throw new Error(
+      `${ADAPTIVE_ORCHESTRATOR_MODEL} supports reasoning efforts: ${AstraReasoningEffortSchema.options.join(", ")}`,
+    );
+  }
+  return { model: ADAPTIVE_ORCHESTRATOR_MODEL, reasoningEffort: settings.reasoningEffort };
+}
+
 export const ResolvedAgentRoleSettingsSchema = AgentRoleSettingsSchema.extend({
   model: ModelIdSchema,
 });
@@ -281,10 +303,11 @@ export const RunPhaseSchema = z.enum([
 
 export type RunPhase = z.infer<typeof RunPhaseSchema>;
 
-export const RUN_STATE_SCHEMA_VERSION = 1;
+export const RUN_STATE_SCHEMA_VERSION = 2;
 
 const RunStateBaseSchema = z.object({
-  stateSchemaVersion: z.literal(RUN_STATE_SCHEMA_VERSION),
+  stateSchemaVersion: z.union([z.literal(1), z.literal(2)]),
+  orchestrationMode: z.enum(["legacy", "adaptive"]).optional(),
   runId: z.string(),
   agentNamespace: z.string().regex(/^[a-f0-9]{20}$/),
   repoPath: z.string(),
@@ -336,10 +359,11 @@ function migrateRunStateInput(input: unknown): unknown {
   const state = { ...input };
   if (
     state.stateSchemaVersion !== undefined &&
+    state.stateSchemaVersion !== 1 &&
     state.stateSchemaVersion !== RUN_STATE_SCHEMA_VERSION
   )
     return state;
-  state.stateSchemaVersion = RUN_STATE_SCHEMA_VERSION;
+  state.stateSchemaVersion ??= 1;
   if (state.agentAccessMode === undefined) {
     state.agentAccessMode =
       state.dangerouslyBypassApprovalsAndSandbox === true ? "danger-full-access" : "sandboxed";
@@ -481,9 +505,34 @@ const requiredFieldsByPhase: Partial<Record<RunPhase, readonly RequiredRunStateF
 export const RunStateSchema = z
   .preprocess(migrateRunStateInput, RunStateBaseSchema)
   .superRefine((state, context) => {
+    if (state.stateSchemaVersion === 2 && state.orchestrationMode === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["orchestrationMode"],
+        message: "Version 2 requires an explicit orchestration mode",
+      });
+    }
+    if (state.orchestrationMode === "adaptive") {
+      if (state.stateSchemaVersion !== 2 || state.agentAccessMode !== "sandboxed") {
+        context.addIssue({
+          code: "custom",
+          path: ["orchestrationMode"],
+          message: "Adaptive runs require version 2 and confined access",
+        });
+      }
+      try {
+        resolveAdaptiveAgentRoleSettings(state, "orchestrator");
+      } catch (error) {
+        context.addIssue({
+          code: "custom",
+          path: ["agentSettings", "orchestrator"],
+          message: error instanceof Error ? error.message : "Invalid adaptive settings",
+        });
+      }
+    }
     const activePhase =
       state.phase === "paused" || state.phase === "blocked" ? state.resumePhase : state.phase;
-    if (activePhase) {
+    if (activePhase && state.orchestrationMode !== "adaptive") {
       const requiredFields: readonly RequiredRunStateField[] =
         requiredFieldsByPhase[activePhase] ?? [];
       for (const field of requiredFields) {
@@ -701,7 +750,7 @@ function normalizeAgentOutputSchema(value: unknown): unknown {
   return normalized;
 }
 
-function agentOutputSchema(schema: z.ZodType): Record<string, unknown> {
+export function agentOutputSchema(schema: z.ZodType): Record<string, unknown> {
   // The agent boundary intentionally describes shape only. Zod remains the
   // canonical validator for refinements after the structured response arrives.
   return normalizeAgentOutputSchema(z.toJSONSchema(schema)) as Record<string, unknown>;

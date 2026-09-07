@@ -171,7 +171,7 @@ describe("StateStore", () => {
 
   it("rejects persisted state written by an unsupported future schema", () => {
     expect(() =>
-      RunStateSchema.parse({ ...state("future-state"), stateSchemaVersion: 2 }),
+      RunStateSchema.parse({ ...state("future-state"), stateSchemaVersion: 3 }),
     ).toThrow();
   });
 
@@ -733,13 +733,13 @@ describe("StateStore", () => {
     const database = new Database(path);
     database
       .prepare("UPDATE runs SET state_json = ? WHERE run_id = ?")
-      .run(JSON.stringify({ ...future, stateSchemaVersion: 2 }), future.runId);
+      .run(JSON.stringify({ ...future, stateSchemaVersion: 3 }), future.runId);
     database.close();
 
     const inspected = store.inspectCurrent(future.repoPath, future.epicId);
     expect(inspected).toMatchObject({ kind: "invalid", runId: future.runId });
     if (inspected?.kind !== "invalid") throw new Error("expected newer-schema state");
-    expect(unsupportedRunStateVersion(inspected.error)).toBe(2);
+    expect(unsupportedRunStateVersion(inspected.error)).toBe(3);
     expect(runStateDecodeDetail(inspected.error)).toContain("requires a newer Epicd");
     expect(() => store.quarantineInvalidRun(future.runId)).toThrow(
       "upgrade Epicd instead of quarantining",

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import type {
   AgentRole,
@@ -21,6 +22,8 @@ import {
 } from "../domain/types.js";
 import { CommandError, runCommand, runJson } from "../util/command.js";
 import { redactSensitiveText } from "../util/redact.js";
+import { HerdrObserver, type NativeHerdrIdentity } from "./herdr-observer.js";
+import { runtimeCapabilities } from "./runtime-capabilities.js";
 
 const HerdrEnvelopeSchema = z.object({
   ok: z.boolean().optional(),
@@ -60,16 +63,24 @@ export class HerdrRuntime implements AgentRuntime<"herdr"> {
   private readonly herdrPath: string;
   private readonly accessMode: HerdrRuntimeOptions["accessMode"];
   private readonly legacyAgentIds: ReadonlySet<string>;
+  private readonly observer: HerdrObserver;
+  private readonly activeSessions = new Set<HerdrAgentSession>();
+  private readonly activeAgentNames = new Set<string>();
 
   constructor(options: HerdrRuntimeOptions) {
     this.repoPath = options.repoPath;
     this.runId = options.runId;
     this.agentNamespace = options.agentNamespace;
     this.herdrPath = options.herdrPath ?? "herdr";
+    this.observer = new HerdrObserver({ cwd: this.repoPath, herdrPath: this.herdrPath });
     this.accessMode = options.accessMode;
     this.legacyAgentIds = new Set(options.legacyAgentIds ?? []);
     const stateRoot = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
     this.resultRoot = join(stateRoot, "epicd", "herdr", safeName(options.runId));
+  }
+
+  capabilities() {
+    return runtimeCapabilities(this.kind);
   }
 
   async prepareNewSession(
@@ -107,6 +118,27 @@ export class HerdrRuntime implements AgentRuntime<"herdr"> {
     if (opened.runtime !== "herdr") {
       throw new Error("Herdr runtime received a non-Herdr session");
     }
+    if (
+      this.activeSessions.has(opened.session) ||
+      (opened.session.id && this.activeAgentNames.has(opened.session.id))
+    ) {
+      throw new Error("Herdr agent already has an active turn");
+    }
+    this.activeSessions.add(opened.session);
+    if (opened.session.id) this.activeAgentNames.add(opened.session.id);
+    try {
+      return await this.runOwnedTurn(opened, prompt, options);
+    } finally {
+      this.activeSessions.delete(opened.session);
+      if (opened.session.id) this.activeAgentNames.delete(opened.session.id);
+    }
+  }
+
+  private async runOwnedTurn(
+    opened: OpenedAgentSession<"herdr">,
+    prompt: string,
+    options: RunTurnOptions,
+  ): Promise<TurnExecution> {
     const session = opened.session;
     this.assertEnvironment();
     await mkdir(this.resultRoot, { recursive: true, mode: 0o700 });
@@ -116,23 +148,23 @@ export class HerdrRuntime implements AgentRuntime<"herdr"> {
     else {
       agentName = await this.createAgent(session.role, opened.contract.effective);
       session.id = agentName;
+      this.activeAgentNames.add(agentName);
       options.onEvent?.({ type: "session.started", sessionId: agentName });
     }
-    await this.cleanOrphanedArtifacts();
-
-    const resultPath = join(this.resultRoot, `${randomUUID()}.json`);
+    const turnRoot = join(this.resultRoot, agentName, randomUUID());
+    await mkdir(turnRoot, { recursive: true, mode: 0o700 });
+    const resultPath = join(turnRoot, "result.json");
     await writeFile(`${resultPath}.tmp`, "", { mode: 0o600 });
     const fullPrompt = resultContract(prompt, options.outputSchema, resultPath);
     try {
-      await runCommand(
-        this.herdrPath,
-        ["agent", "prompt", agentName, fullPrompt, "--wait", "--timeout", String(TURN_TIMEOUT_MS)],
-        {
-          cwd: this.repoPath,
-          timeoutMs: TURN_TIMEOUT_MS + 30_000,
-          ...(options.signal ? { signal: options.signal } : {}),
-        },
-      );
+      const before = await this.observer.observe(agentName, undefined, options.signal);
+      if (!before.ready) throw new Error(`Herdr agent is not ready (${before.state})`);
+      await runCommand(this.herdrPath, ["agent", "prompt", agentName, fullPrompt], {
+        cwd: this.repoPath,
+        timeoutMs: 15_000,
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+      await this.waitForReady(before.identity, options);
     } catch (error) {
       if (options.signal?.aborted) await this.interrupt(agentName);
       await rm(resultPath, { force: true });
@@ -156,7 +188,8 @@ export class HerdrRuntime implements AgentRuntime<"herdr"> {
       await rm(`${resultPath}.tmp`, { force: true });
     }
     if (!finalResponse.trim()) throw new Error(`Herdr agent ${agentName} wrote an empty result`);
-    return { sessionId: agentName, finalResponse };
+    options.onEvent?.({ type: "turn.completed", usage: null });
+    return { sessionId: agentName, finalResponse, usage: null };
   }
 
   async release(sessionId: string): Promise<void> {
@@ -205,19 +238,8 @@ export class HerdrRuntime implements AgentRuntime<"herdr"> {
 
   private async assertAgentAvailable(agentName: string, signal?: AbortSignal): Promise<void> {
     try {
-      await runCommand(this.herdrPath, ["agent", "get", agentName], {
-        cwd: this.repoPath,
-        timeoutMs: 10_000,
-      });
-      await runCommand(
-        this.herdrPath,
-        ["agent", "wait", agentName, "--timeout", String(TURN_TIMEOUT_MS)],
-        {
-          cwd: this.repoPath,
-          timeoutMs: TURN_TIMEOUT_MS + 30_000,
-          ...(signal ? { signal } : {}),
-        },
-      );
+      const observed = await this.observer.observe(agentName, undefined, signal);
+      if (!observed.ready) throw new Error(`Herdr agent is not ready (${observed.state})`);
     } catch (error) {
       if (signal?.aborted) {
         await this.interrupt(agentName);
@@ -229,18 +251,36 @@ export class HerdrRuntime implements AgentRuntime<"herdr"> {
     }
   }
 
-  private async cleanOrphanedArtifacts(): Promise<void> {
-    for (const entry of await readdir(this.resultRoot)) {
-      if (entry.endsWith(".json") || entry.endsWith(".json.tmp")) {
-        await rm(join(this.resultRoot, entry), { force: true });
-      }
+  private async waitForReady(
+    identity: NativeHerdrIdentity,
+    options: RunTurnOptions,
+  ): Promise<void> {
+    const deadline = Date.now() + TURN_TIMEOUT_MS;
+    let observedIdentity = identity;
+    while (Date.now() < deadline) {
+      const observed = await this.observer.observe(identity.name, observedIdentity, options.signal);
+      observedIdentity = observed.identity;
+      options.onEvent?.({
+        type: "agent.lifecycle",
+        sessionId: identity.name,
+        state: observed.state,
+        ready: observed.ready,
+        sourceSequence: observed.sourceSequence,
+      });
+      if (observed.state === "blocked")
+        throw new Error("Herdr agent requires approval or user input");
+      if (observed.ready) return;
+      await delay(1_000, undefined, { signal: options.signal });
     }
+    throw new Error("Herdr turn timed out before becoming ready");
   }
 
   private async createAgent(role: AgentRole, settings: AgentRoleSettings): Promise<HerdrAgentId> {
     const workspaceId = process.env.HERDR_WORKSPACE_ID;
     if (!workspaceId) throw new Error("Herdr did not provide HERDR_WORKSPACE_ID");
     const agentName = this.agentName(role);
+    const agentResultRoot = join(this.resultRoot, agentName);
+    await mkdir(agentResultRoot, { recursive: true, mode: 0o700 });
     let paneId: string | undefined;
     try {
       const created = await runJson(
@@ -287,7 +327,7 @@ export class HerdrRuntime implements AgentRuntime<"herdr"> {
         "--cd",
         this.repoPath,
         "--add-dir",
-        this.resultRoot,
+        agentResultRoot,
         ...permissionArgs,
         "--config",
         `model_reasoning_effort="${settings.reasoningEffort}"`,

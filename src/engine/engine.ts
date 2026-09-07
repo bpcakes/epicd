@@ -312,6 +312,7 @@ export class EpicEngine {
     const now = new Date().toISOString();
     const state: RunState = {
       stateSchemaVersion: RUN_STATE_SCHEMA_VERSION,
+      orchestrationMode: "legacy",
       runId: randomUUID(),
       agentNamespace: randomUUID().replaceAll("-", "").slice(0, 20),
       repoPath,
@@ -907,6 +908,14 @@ export class EpicEngine {
   }
 
   async run(signal?: AbortSignal): Promise<RunState> {
+    if (
+      this.state.orchestrationMode === "adaptive" ||
+      this.store.orchestration.hasRun(this.state.runId)
+    ) {
+      throw new Error(
+        "Adaptive runs require the adaptive action controller, not legacy phase dispatch",
+      );
+    }
     const lease: RunLease = this.store.acquireLease(this.state.runId);
     this.activeLease = lease.ownerToken;
     try {

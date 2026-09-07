@@ -9,60 +9,30 @@ import {
   rename,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { z } from "zod";
 import { codexConfinementConfig } from "./codex-confinement.js";
-import { ModelIdSchema, ReasoningEffortSchema } from "../domain/types.js";
-
-const PathSchema = z
-  .string()
-  .min(1)
-  .refine(
-    (path) => isAbsolute(path) && resolve(path) === path && path !== "/" && !path.includes("\0"),
-  );
-export const CodexLaunchSchema = z.strictObject({
-  generation: z.string().uuid(),
-  confinement: z.strictObject({
-    executable: PathSchema,
-    workspace: PathSchema,
-    sourceMode: z.enum(["read-only", "workspace-write"]),
-    providerHome: PathSchema,
-    scratch: PathSchema,
-    artifacts: PathSchema,
-  }),
-  model: ModelIdSchema,
-  reasoningEffort: ReasoningEffortSchema,
-  /** Only the cache pathname is persisted, never its contents or a refresh token. */
-  authCachePath: PathSchema.nullable(),
-  controlDirectory: PathSchema,
-});
-export type CodexLaunch = z.infer<typeof CodexLaunchSchema>;
+import {
+  CodexLaunchSchema,
+  CodexLaunchStopSchema,
+  LaunchPathSchema as PathSchema,
+  type CodexLaunch,
+  type CodexLaunchStop,
+} from "../domain/codex-launch.js";
+export {
+  CodexLaunchSchema,
+  CodexLaunchStopSchema,
+  type CodexLaunch,
+  type CodexLaunchStop,
+} from "../domain/codex-launch.js";
 
 export const CodexLaunchObservationSchema = z.strictObject({
   generation: z.string().uuid(),
   state: z.enum(["preparing", "running", "stopping"]),
 });
-export const CodexLaunchStopSchema = z
-  .strictObject({
-    generation: z.string().uuid(),
-    stoppedAt: z.iso.datetime(),
-    kind: z.enum(["stopped", "not_started"]),
-    code: z.number().int().nonnegative().max(255).nullable(),
-    signal: z
-      .string()
-      .regex(/^SIG[A-Z0-9]+$/)
-      .nullable(),
-    interrupted: z.boolean(),
-    processTreeStopped: z.literal(true),
-  })
-  .refine(
-    (receipt) =>
-      receipt.kind !== "not_started" || (receipt.code === null && receipt.signal === null),
-  );
-export type CodexLaunchStop = z.infer<typeof CodexLaunchStopSchema>;
 
 /** Only the trusted supervisor's exact-generation file proves termination. Missing is unknown. */
 export async function readCodexLaunchStop(input: CodexLaunch): Promise<CodexLaunchStop | null> {
@@ -92,41 +62,112 @@ export async function readCodexLaunchStop(input: CodexLaunch): Promise<CodexLaun
   return receipt;
 }
 
-export function controlCodexLaunch(launch: CodexLaunch, operation: "inspect" | "interrupt") {
-  return new Promise<z.infer<typeof CodexLaunchObservationSchema>>((resolveResult, reject) => {
-    const socket = connect(join(launch.controlDirectory, "control.sock"));
-    let data = "";
-    let done = false;
-    const finish = (error?: Error) => {
-      if (done) return;
-      done = true;
-      socket.destroy();
-      if (error) {
-        reject(error);
-        return;
-      }
-      try {
-        const observation = CodexLaunchObservationSchema.parse(JSON.parse(data));
-        if (observation.generation !== launch.generation)
-          throw new Error("Codex launch generation changed");
-        resolveResult(observation);
-      } catch (error) {
-        reject(error);
-      }
-    };
-    socket.setTimeout(2000, () =>
-      finish(new Error("Codex launch control timed out; stop state is unknown")),
+/** Atomically defeats a launch that has not claimed its start gate. Existing owners are never replaced. */
+export async function preventCodexLaunchStart(input: CodexLaunch): Promise<boolean> {
+  const launch = CodexLaunchSchema.parse(input);
+  await privateDirectory(launch.controlDirectory);
+  try {
+    await writeFile(
+      join(launch.controlDirectory, "started.json"),
+      JSON.stringify({
+        generation: launch.generation,
+        startedAt: new Date().toISOString(),
+        prevented: true,
+      }),
+      { flag: "wx", mode: 0o600 },
     );
-    socket.once("error", (error) => finish(error));
-    socket.once("connect", () =>
-      socket.end(JSON.stringify({ generation: launch.generation, operation }) + "\n"),
-    );
-    socket.on("data", (chunk: Buffer) => {
-      data += chunk.toString("utf8");
-      if (data.length > 1024) finish(new Error("Codex launch control exceeded its response bound"));
-    });
-    socket.once("end", () => finish());
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") return false;
+    throw error;
+  }
+  await writeCodexLaunchStop(launch, {
+    kind: "not_started",
+    code: null,
+    signal: null,
+    interrupted: true,
   });
+  return true;
+}
+
+/** Supervisor/reconciler only. Call after observed process closure or an exclusive never-start gate. */
+export async function writeCodexLaunchStop(
+  launch: CodexLaunch,
+  outcome: Pick<CodexLaunchStop, "kind" | "code" | "signal" | "interrupted">,
+) {
+  const receipt = CodexLaunchStopSchema.parse({
+    generation: launch.generation,
+    stoppedAt: new Date().toISOString(),
+    ...outcome,
+    processTreeStopped: true,
+  });
+  const target = join(launch.controlDirectory, "stopped.json");
+  const temporary = `${target}.tmp`;
+  const file = await open(temporary, "wx", 0o600);
+  try {
+    await file.writeFile(JSON.stringify(receipt));
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  // Each generation has exactly one start-gate owner and one terminal write.
+  await rename(temporary, target);
+  const directory = await open(launch.controlDirectory, "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+export async function controlCodexLaunch(launch: CodexLaunch, operation: "inspect" | "interrupt") {
+  await privateDirectory(launch.controlDirectory);
+  const directory = await open(
+    launch.controlDirectory,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    return await new Promise<z.infer<typeof CodexLaunchObservationSchema>>(
+      (resolveResult, reject) => {
+        // Linux resolves the held directory FD before lookup, avoiding AF_UNIX's
+        // pathname length limit without moving authority to a global abstract socket.
+        const socket = connect(`/proc/self/fd/${directory.fd}/control.sock`);
+        let data = "";
+        let done = false;
+        const finish = (error?: Error) => {
+          if (done) return;
+          done = true;
+          socket.destroy();
+          if (error) {
+            reject(error);
+            return;
+          }
+          try {
+            const observation = CodexLaunchObservationSchema.parse(JSON.parse(data));
+            if (observation.generation !== launch.generation)
+              throw new Error("Codex launch generation changed");
+            resolveResult(observation);
+          } catch (error) {
+            reject(error);
+          }
+        };
+        socket.setTimeout(2000, () =>
+          finish(new Error("Codex launch control timed out; stop state is unknown")),
+        );
+        socket.once("error", (error) => finish(error));
+        socket.once("connect", () =>
+          socket.end(JSON.stringify({ generation: launch.generation, operation }) + "\n"),
+        );
+        socket.on("data", (chunk: Buffer) => {
+          data += chunk.toString("utf8");
+          if (data.length > 1024)
+            finish(new Error("Codex launch control exceeded its response bound"));
+        });
+        socket.once("end", () => finish());
+      },
+    );
+  } finally {
+    await directory.close();
+  }
 }
 
 /** One launcher per invocation; resuming a conversation uses a fresh launcher. */
@@ -135,6 +176,15 @@ export async function createCodexLauncher(
   entrypoint = fileURLToPath(new URL("codex-launch-cli.js", import.meta.url)),
 ): Promise<{ executable: string; manifestPath: string; launch: CodexLaunch }> {
   const launch = CodexLaunchSchema.parse({ ...input, generation: randomUUID() });
+  return materializeCodexLauncher(launch, entrypoint);
+}
+
+/** Materialize a kernel-reserved manifest. Repeated calls never overwrite a launch. */
+export async function materializeCodexLauncher(
+  input: CodexLaunch,
+  entrypoint = fileURLToPath(new URL("codex-launch-cli.js", import.meta.url)),
+): Promise<{ executable: string; manifestPath: string; launch: CodexLaunch }> {
+  const launch = CodexLaunchSchema.parse(input);
   const spec = launch.confinement;
   await privateDirectory(launch.controlDirectory);
   for (const path of [spec.workspace, spec.providerHome, spec.scratch, spec.artifacts]) {

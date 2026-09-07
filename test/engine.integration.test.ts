@@ -263,7 +263,7 @@ if (args[0] === "tab" && args[1] === "create") {
 } else if (args[0] === "agent" && args[1] === "get") {
   const agent = readAgents().find(candidate => candidate.name === args[2]);
   if (!agent) process.exit(1);
-  console.log(JSON.stringify({ok:true,result:{agent:{...agent,state:"idle"}}}));
+  console.log(JSON.stringify({ok:true,result:{agent:{...agent,agent_status:"idle",interactive_ready:true,pane_id:"w-e2e:p9",terminal_id:"term-" + agent.name}}}));
 } else if (args[0] === "agent" && args[1] === "list") {
   console.log(JSON.stringify({ok:true,result:{agents:readAgents()}}));
 } else if (args[0] === "agent" && args[1] === "wait") {

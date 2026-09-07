@@ -12,12 +12,19 @@ import {
   runNeedsResume,
   runRecoveryKind,
   RunStateSchema,
+  resolveAdaptiveAgentRoleSettings,
   type AgentPreferences,
   type EngineEvent,
   type EventLevel,
   type RunState,
 } from "../domain/types.js";
 import { redactSensitiveText } from "../util/redact.js";
+import {
+  OrchestrationJournal,
+  migrateOrchestration,
+  ORCHESTRATION_SCHEMA_VERSION,
+} from "./orchestration-journal.js";
+import { RepositoryPolicySchema, type RepositoryPolicy } from "../domain/repository-policy.js";
 
 type RunRow = {
   run_id: string;
@@ -26,6 +33,7 @@ type RunRow = {
   phase: string;
   state_json: string;
   updated_at: string;
+  orchestration_present?: number;
 };
 type QuarantineRunRow = RunRow & { created_at: string };
 type EventRow = {
@@ -158,6 +166,12 @@ function decodeRunRow(row: RunRow | undefined): RunState | null {
       }
     }
     const state = RunStateSchema.parse(input);
+    if (
+      row.orchestration_present !== undefined &&
+      Boolean(row.orchestration_present) !== (state.orchestrationMode === "adaptive")
+    ) {
+      throw new Error("Run orchestration mode does not match its durable control record");
+    }
     const identities = [
       ["run ID", row.run_id, state.runId],
       ["repository path", row.repo_path, state.repoPath],
@@ -194,7 +208,8 @@ function inspectRunRow(row: RunRow): StoredRunInspection {
   }
 }
 
-const RUN_ROW_COLUMNS = "run_id, repo_path, epic_id, phase, state_json, updated_at";
+const RUN_ROW_COLUMNS = `run_id, repo_path, epic_id, phase, state_json, updated_at,
+  EXISTS(SELECT 1 FROM orchestration_runs WHERE orchestration_runs.run_id = runs.run_id) AS orchestration_present`;
 const RUN_NEWEST_FIRST = "updated_at DESC, created_at DESC, run_id DESC";
 
 function encodeRunState(state: RunState): string {
@@ -209,11 +224,13 @@ export function defaultStatePath(): string {
 export class StateStore {
   readonly path: string;
   private readonly db: Database.Database;
+  readonly orchestration: OrchestrationJournal;
 
   constructor(path = defaultStatePath()) {
     this.path = path;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new Database(path, { timeout: 5_000 });
+    this.orchestration = new OrchestrationJournal(this.db);
     try {
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
@@ -229,6 +246,31 @@ export class StateStore {
   }
 
   private migrate(): void {
+    const existingSchema = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_schema'")
+      .get();
+    let requiresSnapshot = !existingSchema;
+    if (existingSchema) {
+      const version = this.db
+        .prepare("SELECT MAX(version) AS version FROM orchestration_schema")
+        .get() as { version: number | null };
+      if (
+        version.version === null ||
+        version.version < 1 ||
+        version.version > ORCHESTRATION_SCHEMA_VERSION
+      )
+        throw new Error("Orchestration database requires a different Epicd schema version");
+      requiresSnapshot = version.version < ORCHESTRATION_SCHEMA_VERSION;
+    }
+    if (
+      requiresSnapshot &&
+      this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").get()
+    ) {
+      // SQLite's snapshot facility includes committed WAL pages; copying the main file does not.
+      const backupPath = `${this.path}.before-orchestration-${randomUUID()}.sqlite3`;
+      this.db.prepare("VACUUM main INTO ?").run(backupPath);
+      chmodSync(backupPath, 0o600);
+    }
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.exec(`
@@ -345,6 +387,7 @@ export class StateStore {
         CREATE INDEX IF NOT EXISTS runs_by_repo_epic_order
           ON runs(repo_path, epic_id, updated_at DESC, created_at DESC, run_id DESC);
       `);
+      migrateOrchestration(this.db);
       this.db.exec("COMMIT");
     } catch (error) {
       if (this.db.inTransaction) this.db.exec("ROLLBACK");
@@ -354,6 +397,36 @@ export class StateStore {
 
   create(state: RunState): void {
     const parsed = RunStateSchema.parse(state);
+    if (parsed.orchestrationMode === "adaptive")
+      throw new Error("Adaptive creation requires a frozen policy");
+    this.createRun(parsed);
+  }
+
+  createAdaptive(state: RunState, policyInput: RepositoryPolicy): RunState {
+    const policy = RepositoryPolicySchema.parse(policyInput);
+    const coordinator = resolveAdaptiveAgentRoleSettings(state, "orchestrator");
+    if (
+      !policy.coordinator.reasoningEfforts.includes(
+        coordinator.reasoningEffort as (typeof policy.coordinator.reasoningEfforts)[number],
+      )
+    )
+      throw new Error("Coordinator effort is not allowed by frozen policy");
+    if (state.phase !== "selecting" || state.currentBeadId !== null || state.completedTasks !== 0)
+      throw new Error("Cannot convert an existing delivery workflow to adaptive mode");
+    const parsed = RunStateSchema.parse({
+      ...state,
+      stateSchemaVersion: 2,
+      orchestrationMode: "adaptive",
+      agentSettings: {
+        ...state.agentSettings,
+        orchestrator: { ...state.agentSettings.orchestrator, model: coordinator.model },
+      },
+    });
+    this.createRun(parsed, policy);
+    return parsed;
+  }
+
+  private createRun(parsed: RunState, policy?: RepositoryPolicy): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const workflowOwner = this.inspectWorkflowOwner(parsed.repoPath);
@@ -374,6 +447,7 @@ export class StateStore {
           parsed.createdAt,
           parsed.updatedAt,
         );
+      if (policy) this.orchestration.initialize(parsed.runId, policy, parsed.totalTasks);
       this.db.exec("COMMIT");
     } catch (error) {
       if (this.db.inTransaction) this.db.exec("ROLLBACK");
@@ -433,7 +507,18 @@ export class StateStore {
         agentSettings: parsedSettings,
         updatedAt: new Date().toISOString(),
       });
-      const result = this.writeRunState(candidate, authority);
+      if (source.orchestrationMode === "adaptive") {
+        const effective = resolveAdaptiveAgentRoleSettings(candidate, "orchestrator");
+        const policy = this.orchestration.policy(runId);
+        if (
+          !policy.coordinator.reasoningEfforts.some(
+            (effort) => effort === effective.reasoningEffort,
+          )
+        )
+          throw new Error("Coordinator effort is not allowed by frozen policy");
+        candidate.agentSettings.orchestrator.model = effective.model;
+      }
+      const result = this.writeRunState(candidate, authority, true);
       if (result.changes !== 1) {
         throw new Error(`Run ${runId} is not controlled by this epicd process`);
       }
@@ -445,6 +530,7 @@ export class StateStore {
         "Existing agent sessions keep the settings they started with",
         authority,
       );
+      if (source.orchestrationMode === "adaptive") this.orchestration.noteSettingsChange(runId);
       this.db.exec("COMMIT");
       return {
         event,
@@ -488,7 +574,14 @@ export class StateStore {
   }
 
   /** The only update path for a serialized run and its indexed identity columns. */
-  private writeRunState(state: RunState, authority: PersistenceAuthority): { changes: number } {
+  private writeRunState(
+    state: RunState,
+    authority: PersistenceAuthority,
+    settingsOnly = false,
+  ): { changes: number } {
+    if (this.orchestration.hasRun(state.runId) && !settingsOnly) {
+      throw new Error("Adaptive control facts cannot be overwritten by a legacy state snapshot");
+    }
     const parsed = RunStateSchema.parse(state);
     const parameters = [
       parsed.phase,
@@ -686,6 +779,7 @@ export class StateStore {
            FROM events WHERE run_id = ?`,
         )
         .run(runId);
+      this.orchestration.preserveQuarantine(runId);
       const removed = this.db.prepare("DELETE FROM runs WHERE run_id = ?").run(runId);
       if (removed.changes !== 1) throw new RunNotFoundError(runId);
       this.db.exec("COMMIT");
@@ -904,7 +998,8 @@ export class StateStore {
           new Date().toISOString(),
           processMarker(process.pid),
         );
-      const controlledState = prepareRunStateForControl(state);
+      const controlledState =
+        state.orchestrationMode === "adaptive" ? state : prepareRunStateForControl(state);
       if (encodeRunState(controlledState) !== encodeRunState(state)) {
         state = RunStateSchema.parse({
           ...controlledState,

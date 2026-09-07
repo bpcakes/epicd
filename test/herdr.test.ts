@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -54,7 +54,8 @@ if (args[0] === "tab" && args[1] === "create") {
 } else if (args[0] === "agent" && args[1] === "start") {
   console.log(JSON.stringify({ok:true,result:{agent:{name:args[2]}}}));
 } else if (args[0] === "agent" && args[1] === "get") {
-  console.log(JSON.stringify({ok:true,result:{agent:{name:args[2],state:"idle",tab_id:"w-test:t9"}}}));
+  const state = process.env.EPICD_HERDR_MODE === "blocked" ? "blocked" : "idle";
+  console.log(JSON.stringify({ok:true,result:{agent:{name:args[2],agent_status:state,interactive_ready:state === "idle",tab_id:"w-test:t9",pane_id:"w-test:p9",terminal_id:"terminal-9"}}}));
 } else if (args[0] === "agent" && args[1] === "list") {
   const prefix = process.env.EPICD_HERDR_RUN_PREFIX;
   const agents = [
@@ -222,7 +223,52 @@ describe("HerdrRuntime", () => {
     expect(start).toContain('model_reasoning_effort="max"');
     expect(calls.filter((args) => args[0] === "agent" && args[1] === "start")).toHaveLength(1);
     expect(start).toContain("workspace-write");
+    expect(start?.[start.indexOf("--add-dir") + 1]).toContain(first.sessionId);
+    expect(
+      calls
+        .filter((args) => args[0] === "agent" && args[1] === "prompt")
+        .every((args) => !args.includes("--wait")),
+    ).toBe(true);
     expect(calls.some((args) => args[0] === "agent" && args[1] === "get")).toBe(true);
+  });
+
+  it("does not sweep another turn's unacknowledged artifacts", async () => {
+    const setup = fixture();
+    const root = join(setup.root, "state", "epicd", "herdr", "artifact-run");
+    mkdirSync(root, { recursive: true });
+    const preserved = join(root, "old-result.json");
+    writeFileSync(preserved, "unacknowledged");
+    const runtime = createRuntime(setup, "artifact-run");
+    const first = await runtime.open("review", {
+      kind: "new",
+      settings: { model: "gpt-test", reasoningEffort: "high" },
+    });
+    const second = await runtime.open("review", {
+      kind: "new",
+      settings: { model: "gpt-test", reasoningEffort: "high" },
+    });
+    const results = await Promise.all([
+      runtime.run(first, "Review one"),
+      runtime.run(second, "Review two"),
+    ]);
+    expect(results.every((value) => JSON.parse(value.finalResponse).answer === "ok")).toBe(true);
+    expect(readFileSync(preserved, "utf8")).toBe("unacknowledged");
+  });
+
+  it("does not submit a prompt or accept a result from an approval dialog", async () => {
+    const setup = fixture();
+    process.env.EPICD_HERDR_MODE = "blocked";
+    const runtime = createRuntime(setup, "blocked-run");
+    const opened = await runtime.open("review", {
+      kind: "new",
+      settings: { model: "gpt-test", reasoningEffort: "high" },
+    });
+    await expect(runtime.run(opened, "Review")).rejects.toThrow("Herdr turn failed");
+    const calls = readFileSync(setup.log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(calls.some((args) => args[0] === "agent" && args[1] === "prompt")).toBe(false);
   });
 
   it("runs a prepared session through a replacement adapter instance", async () => {

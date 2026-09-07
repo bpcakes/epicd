@@ -150,6 +150,7 @@ if (args[0] === "app-server") {
     type: "item.completed",
     item: { id: "item-1", type: "agent_message", text: "done" }
   }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } }));
 }
 `,
   );
@@ -594,7 +595,17 @@ describe("CodexRuntime sessions", () => {
     });
     const result = await runtime.run(opened, "Review");
 
-    expect(result).toEqual({ sessionId: "thr-test", finalResponse: "done" });
+    expect(result).toEqual({
+      sessionId: "thr-test",
+      finalResponse: "done",
+      usage: {
+        inputTokens: 1,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 1,
+        reasoningOutputTokens: 0,
+      },
+    });
     expect(opened.contract).toEqual({
       runtime: "sdk",
       requested: { model: null, reasoningEffort: "xhigh" },

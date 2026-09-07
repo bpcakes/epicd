@@ -1,9 +1,15 @@
 import { spawn } from "node:child_process";
-import { open, readFile, rename, writeFile } from "node:fs/promises";
+import { open, readFile, writeFile, type FileHandle } from "node:fs/promises";
+import { constants } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { z } from "zod";
-import { CodexLaunchSchema, codexLaunchCommand, prepareCodexAccessToken } from "./codex-launch.js";
+import {
+  CodexLaunchSchema,
+  codexLaunchCommand,
+  prepareCodexAccessToken,
+  writeCodexLaunchStop,
+} from "./codex-launch.js";
 import { redactSensitiveText } from "../util/redact.js";
 
 /** Trusted launcher, outside the agent's mounts. No model output is a stop receipt. */
@@ -55,10 +61,16 @@ async function main() {
   });
   let launched = false;
   let terminalAttempted = false;
+  let controlDirectory: FileHandle | null = null;
   try {
+    controlDirectory = await open(
+      launch.controlDirectory,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const controlSocketPath = `/proc/self/fd/${controlDirectory.fd}/control.sock`;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(join(launch.controlDirectory, "control.sock"), resolve);
+      server.listen(controlSocketPath, resolve);
     });
     const command = await codexLaunchCommand(launch, process.argv.slice(3));
     abort.signal.throwIfAborted();
@@ -114,38 +126,17 @@ async function main() {
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await controlDirectory?.close();
   }
 
   async function terminal(outcome: {
-    kind: string;
+    kind: "stopped" | "not_started";
     code: number | null;
     signal: NodeJS.Signals | null;
     interrupted: boolean;
   }) {
     terminalAttempted = true;
-    const path = join(launch.controlDirectory, "stopped.json");
-    const temporary = `${path}.tmp`;
-    const file = await open(temporary, "wx", 0o600);
-    try {
-      await file.writeFile(
-        JSON.stringify({
-          generation: launch.generation,
-          stoppedAt: new Date().toISOString(),
-          ...outcome,
-          processTreeStopped: true,
-        }),
-      );
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, path);
-    const directory = await open(launch.controlDirectory, "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
+    await writeCodexLaunchStop(launch, outcome);
   }
 }
 main().catch((error: unknown) => {

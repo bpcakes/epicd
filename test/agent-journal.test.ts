@@ -1,0 +1,802 @@
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import Database from "better-sqlite3";
+import { afterEach, describe, expect, it } from "vitest";
+import { StateStore } from "../src/adapters/store.js";
+import { ActionKernel } from "../src/kernel/actions.js";
+import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
+import {
+  SdkAgentSessionContractSchema,
+  HerdrAgentSessionContractSchema,
+} from "../src/domain/types.js";
+import type { AgentIdentity, WorkspaceRecord } from "../src/domain/agents.js";
+import type {
+  ControllerAuthority,
+  KernelAction,
+  OrchestratorDecision,
+} from "../src/domain/orchestration.js";
+import { initialRun } from "./fixtures/orchestration/state.js";
+
+const roots: string[] = [];
+const stores: StateStore[] = [];
+const databases: Database.Database[] = [];
+afterEach(() => {
+  for (const db of databases.splice(0)) if (db.open) db.close();
+  for (const store of stores.splice(0)) store.close();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+function fixture(maxWorkers = 4) {
+  const root = mkdtempSync(join(tmpdir(), "epicd-agent-journal-"));
+  roots.push(root);
+  const path = join(root, "state.sqlite3");
+  const store = new StateStore(path);
+  stores.push(store);
+  const state = store.createAdaptive(
+    initialRun(),
+    RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { maxWorkers } }),
+  );
+  const lease = store.acquireLease(state.runId);
+  const authority: ControllerAuthority = {
+    runId: state.runId,
+    ownerToken: lease.ownerToken,
+    leaseId: lease.leaseId,
+  };
+  const journal = store.orchestration;
+  const agents = journal.agents;
+  const version = () => journal.control(state.runId).controlVersion;
+  function workspace(purpose: WorkspaceRecord["purpose"] = "implementation") {
+    const record = agents.reserveWorkspace(
+      authority,
+      {
+        root: join(root, "workspaces"),
+        purpose,
+        sourceMode: ["review", "verification", "coordinator"].includes(purpose)
+          ? "immutable"
+          : "mutable",
+        baselineRevision: "base",
+      },
+      version(),
+    );
+    mkdirSync(record.path, { recursive: true });
+    return agents.markWorkspaceReady(authority, record, "baseline-fingerprint");
+  }
+  function reserve(
+    purpose: "implementation" | "review" | "specialist" = "implementation",
+    replaces?: AgentIdentity,
+  ) {
+    const ws = workspace(purpose === "specialist" ? "diagnostic" : purpose);
+    const settings = { model: "worker-model", reasoningEffort: "high" as const };
+    return agents.reserveAgent(
+      authority,
+      {
+        ...ws,
+        purpose,
+        role: purpose === "review" ? "review" : "implementation",
+        taskId: "demo.1",
+        candidateId: purpose === "review" ? "candidate" : null,
+        instructions: "Investigate and report the actual outcome",
+        contract: SdkAgentSessionContractSchema.parse({
+          runtime: "sdk",
+          requested: settings,
+          effective: settings,
+        }),
+        confinementProfile: "test-only-supervisor",
+        ...(replaces ? { replaces } : {}),
+      },
+      version(),
+    );
+  }
+  function ready(
+    purpose: "implementation" | "review" | "specialist" = "implementation",
+    replaces?: AgentIdentity,
+  ) {
+    const agent = reserve(purpose, replaces);
+    return agents.bindProvider(authority, agent, { runtime: "sdk", sessionId: randomUUID() });
+  }
+  const prepare = (
+    agent: AgentIdentity,
+    operationId = randomUUID(),
+    instructions = "Run the assigned check",
+  ) =>
+    agents.prepareTurn(authority, agent, operationId, instructions, { type: "object" }, version());
+  const submit = (agent: AgentIdentity) => {
+    const turn = prepare(agent);
+    agents.markSubmitting(authority, turn.identity);
+    return agents.acknowledgePrompt(
+      authority,
+      turn.identity,
+      turn.promptDigest,
+      "Fixture observed exact submitted turn",
+    );
+  };
+  const db = new Database(path);
+  databases.push(db);
+  return {
+    root,
+    path,
+    store,
+    journal,
+    agents,
+    authority,
+    version,
+    workspace,
+    reserve,
+    ready,
+    prepare,
+    submit,
+    db,
+  };
+}
+function decision(setup: ReturnType<typeof fixture>, action: KernelAction): OrchestratorDecision {
+  const ticket = setup.journal.beginDecision(
+    setup.authority,
+    setup.journal.latestObservationCursor(setup.authority.runId),
+    setup.version(),
+  );
+  return {
+    explanation: "Choose a useful agent action",
+    evidenceIds: [],
+    request: {
+      schemaVersion: 1,
+      decisionId: ticket.decisionId,
+      observationCursor: ticket.observationCursor,
+      expectedControlVersion: ticket.expectedControlVersion,
+      action,
+    },
+  };
+}
+
+describe("durable agent coordination", () => {
+  it("requires a materialized directory before a workspace can be marked ready", () => {
+    const setup = fixture();
+    const workspace = setup.agents.reserveWorkspace(
+      setup.authority,
+      {
+        root: join(setup.root, "workspaces"),
+        purpose: "implementation",
+        sourceMode: "mutable",
+        baselineRevision: "base",
+      },
+      setup.version(),
+    );
+    mkdirSync(dirname(workspace.path), { recursive: true });
+    writeFileSync(workspace.path, "not a directory");
+    expect(() =>
+      setup.agents.markWorkspaceReady(setup.authority, workspace, "fingerprint"),
+    ).toThrow("canonical directory");
+    expect(setup.agents.workspace(setup.authority.runId, workspace).status).toBe("reserved");
+  });
+
+  it("exposes the latest failed agent report for diagnosis while labeling it as a claim", async () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const turn = setup.submit(agent);
+    setup.agents.finishTurn(setup.authority, turn.identity, {
+      status: "completed",
+      stopEvidence: "Stopped descendants",
+      result: {
+        status: "completed",
+        tests: [{ command: "browser test", outcome: "failed", detail: "Database unavailable" }],
+      },
+    });
+    const kernel = new ActionKernel(setup.journal);
+    const result = await kernel.execute(
+      decision(setup, {
+        kind: "inspect_agent",
+        agentId: agent.agentId,
+        agentGeneration: agent.agentGeneration,
+      }),
+      setup.authority,
+    );
+    expect(result.status).toBe("succeeded");
+    if (result.status !== "succeeded" || result.result.kind !== "inspection")
+      throw new Error("Expected an agent inspection");
+    const inspected = JSON.parse(result.result.text);
+    expect(inspected.latestResult.turnId).toBe(turn.identity.turnId);
+    expect(JSON.parse(inspected.latestResult.claim).tests).toEqual([
+      { command: "browser test", outcome: "failed", detail: "Database unavailable" },
+    ]);
+    expect(inspected.latestResult.evidenceWarning).toContain("not kernel validation");
+    expect(inspected.latestResult.truncated).toBe(false);
+  });
+
+  it("binds native identities monotonically without sharing a Codex session across runtimes", () => {
+    const setup = fixture();
+    const sdk = setup.ready("specialist");
+    const ws = setup.workspace("review");
+    const settings = { model: "review-model", reasoningEffort: "high" as const };
+    const native = setup.agents.reserveAgent(
+      setup.authority,
+      {
+        ...ws,
+        role: "review",
+        purpose: "review",
+        taskId: "demo.1",
+        candidateId: "candidate",
+        instructions: "Review independently",
+        confinementProfile: "test-only",
+        contract: HerdrAgentSessionContractSchema.parse({
+          runtime: "herdr",
+          requested: settings,
+          effective: settings,
+        }),
+      },
+      setup.version(),
+    );
+    const provider = {
+      runtime: "herdr" as const,
+      name: "reviewer",
+      paneId: "w1:p1",
+      tabId: "w1:t1",
+      terminalId: "terminal",
+      sessionId: null,
+    };
+    setup.agents.bindProvider(setup.authority, native, provider);
+    expect(() =>
+      setup.agents.bindProvider(setup.authority, native, {
+        ...provider,
+        sessionId: sdk.provider!.sessionId,
+      }),
+    ).toThrow("already bound");
+    expect(
+      setup.agents.bindProvider(setup.authority, native, {
+        ...provider,
+        sessionId: "native-session",
+      }).provider?.sessionId,
+    ).toBe("native-session");
+    expect(() =>
+      setup.agents.bindProvider(setup.authority, native, {
+        ...provider,
+        sessionId: "other-session",
+      }),
+    ).toThrow("replaced in place");
+    expect(() =>
+      setup.agents.bindProvider(setup.authority, native, {
+        ...provider,
+        terminalId: "other-terminal",
+        sessionId: "native-session",
+      }),
+    ).toThrow("replaced in place");
+  });
+
+  it("cannot reserve two turns from different SQLite connections for one conversation", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const turn = setup.prepare(agent);
+    const second = new StateStore(setup.path);
+    stores.push(second);
+    expect(() =>
+      second.orchestration.agents.prepareTurn(
+        setup.authority,
+        agent,
+        randomUUID(),
+        "Another turn",
+        {},
+        setup.version(),
+      ),
+    ).toThrow("ready agent");
+    expect(second.orchestration.agents.turns(setup.authority.runId)).toEqual([turn]);
+  });
+
+  it("records a fresh SDK turn before its provider session exists and binds only its exact start event", () => {
+    const setup = fixture();
+    const agent = setup.reserve();
+    const turn = setup.prepare(agent);
+    expect(setup.agents.instance(setup.authority.runId, agent).provider).toBeNull();
+    expect(() =>
+      setup.agents.bindTurnProvider(setup.authority, turn.identity, {
+        runtime: "sdk",
+        sessionId: "thread",
+      }),
+    ).toThrow("dispatched SDK turn");
+    setup.agents.markSubmitting(setup.authority, turn.identity);
+    expect(() =>
+      setup.agents.bindTurnProvider(
+        setup.authority,
+        { ...turn.identity, assignmentId: "wrong" },
+        { runtime: "sdk", sessionId: "thread" },
+      ),
+    ).toThrow("identity");
+    expect(
+      setup.agents.bindTurnProvider(setup.authority, turn.identity, {
+        runtime: "sdk",
+        sessionId: "thread",
+      }),
+    ).toMatchObject({ status: "busy", provider: { runtime: "sdk", sessionId: "thread" } });
+    expect(() =>
+      setup.agents.bindTurnProvider(setup.authority, turn.identity, {
+        runtime: "sdk",
+        sessionId: "different-thread",
+      }),
+    ).toThrow("replaced in place");
+  });
+
+  it("redacts structured secrets and does not treat an agent claim as kernel validation", () => {
+    const setup = fixture();
+    const turn = setup.submit(setup.ready());
+    const result = setup.agents.finishTurn(setup.authority, turn.identity, {
+      status: "completed",
+      stopEvidence: "Fixture supervisor stopped",
+      result: {
+        status: "completed",
+        password: "sensitive-password",
+        tests: [{ command: "login --token token-value", outcome: "passed" }],
+      },
+    });
+    expect(JSON.stringify(result.result)).not.toContain("sensitive-password");
+    expect(JSON.stringify(result.result)).not.toContain("token-value");
+    expect(result.resultEligible).toBe(true);
+    expect(setup.journal.actions(setup.authority.runId)).toEqual([]);
+    expect(
+      new ActionKernel(setup.journal)
+        .capabilities()
+        .find((capability) => capability.kind === "request_commit")?.available,
+    ).toBe(false);
+  });
+
+  it("persists assignment, provider, and exact prompt before dispatch and survives reopening", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const message = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      agent,
+      randomUUID(),
+      "Explain the failed browser check",
+    );
+    const turn = setup.prepare(agent);
+    expect(turn.status).toBe("prepared");
+    expect(turn.prompt.messages).toEqual([
+      { messageId: message.messageId, content: message.content },
+    ]);
+    const reopened = new StateStore(setup.path);
+    stores.push(reopened);
+    expect(reopened.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
+    expect(reopened.orchestration.agents.instance(setup.authority.runId, agent)).toMatchObject({
+      status: "busy",
+      activeTurnId: turn.identity.turnId,
+      provider: agent.provider,
+    });
+    expect(reopened.orchestration.agents.messages(setup.authority.runId, agent)[0]).toMatchObject({
+      status: "reserved",
+      deliveryTurnId: turn.identity.turnId,
+    });
+    expect(setup.db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("binds queued messages to one prompt and does not resend acknowledged messages on follow-up", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const operationId = randomUUID();
+    const message = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      agent,
+      operationId,
+      "Use no-receipt validation",
+    );
+    expect(
+      setup.agents.enqueueAgentMessage(setup.authority, agent, operationId, message.content),
+    ).toEqual(message);
+    expect(() =>
+      setup.agents.enqueueAgentMessage(
+        setup.authority,
+        agent,
+        operationId,
+        "Different instruction",
+      ),
+    ).toThrow("reused");
+    const turn = setup.prepare(agent);
+    setup.agents.markSubmitting(setup.authority, turn.identity);
+    expect(() =>
+      setup.agents.acknowledgePrompt(setup.authority, turn.identity, "wrong", "ack"),
+    ).toThrow("different prompt");
+    setup.agents.acknowledgePrompt(
+      setup.authority,
+      turn.identity,
+      turn.promptDigest,
+      "Exact prompt accepted",
+    );
+    expect(setup.agents.messages(setup.authority.runId, agent)[0]?.status).toBe("acknowledged");
+    const late = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      agent,
+      randomUUID(),
+      "Investigate a second symptom",
+    );
+    const result = setup.agents.finishTurn(setup.authority, turn.identity, {
+      status: "completed",
+      result: { status: "completed" },
+      stopEvidence: "Supervisor reaped turn descendants",
+    });
+    expect(result.resultEligible).toBe(true); // Eligible agent claim, not validation/review evidence.
+    const next = setup.prepare(agent);
+    expect(next.prompt.messages.map((entry) => entry.messageId)).toEqual([late.messageId]);
+    expect(next.identity.turnId).not.toBe(turn.identity.turnId);
+  });
+
+  it("keeps uncertain submissions busy and never silently redelivers their messages", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const message = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      agent,
+      randomUUID(),
+      "Do the bounded diagnosis",
+    );
+    const turn = setup.prepare(agent);
+    setup.agents.markSubmitting(setup.authority, turn.identity);
+    setup.agents.markIndeterminate(
+      setup.authority,
+      turn.identity,
+      "Controller lost connection after prompt submission",
+    );
+    expect(() => setup.prepare(agent)).toThrow("ready agent");
+    expect(() => setup.agents.markSubmitting(setup.authority, turn.identity)).toThrow();
+    expect(() => setup.agents.cancelPreparedTurn(setup.authority, turn.identity)).toThrow(
+      "never-dispatched",
+    );
+    setup.agents.finishTurn(setup.authority, turn.identity, {
+      status: "failed",
+      result: null,
+      stopEvidence: "Supervisor confirmed dead process tree",
+    });
+    expect(setup.agents.messages(setup.authority.runId, agent)[0]).toMatchObject({
+      messageId: message.messageId,
+      status: "indeterminate",
+      deliveryTurnId: turn.identity.turnId,
+    });
+    expect(setup.prepare(agent).prompt.messages).toEqual([]);
+  });
+
+  it("returns messages to the queue only when cancellation proves the prompt was never submitted", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const message = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      agent,
+      randomUUID(),
+      "Question",
+    );
+    const turn = setup.prepare(agent);
+    expect(setup.agents.cancelPreparedTurn(setup.authority, turn.identity)).toMatchObject({
+      status: "cancelled",
+      resultEligible: false,
+    });
+    expect(setup.agents.messages(setup.authority.runId, agent)[0]).toMatchObject({
+      status: "queued",
+      deliveryTurnId: null,
+    });
+    expect(setup.prepare(agent).prompt.messages.map((entry) => entry.messageId)).toEqual([
+      message.messageId,
+    ]);
+  });
+
+  it("keeps cancellation irreversible when restart makes the running outcome uncertain", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const turn = setup.submit(agent);
+    setup.agents.requestStop(setup.authority, turn.identity);
+    setup.agents.markIndeterminate(
+      setup.authority,
+      turn.identity,
+      "Controller restarted before stop acknowledgement",
+    );
+    expect(
+      setup.agents.finishTurn(setup.authority, turn.identity, {
+        status: "completed",
+        result: { verdict: "approved" },
+        stopEvidence: "Confirmed stop",
+      }),
+    ).toMatchObject({ resultEligible: false, stopRequested: true });
+  });
+
+  it("revokes old results, quarantines uncertain work, and rejects a second writer even after replacement", () => {
+    const setup = fixture();
+    const old = setup.ready();
+    const turn = setup.submit(old);
+    setup.agents.revokeAgent(setup.authority, old, "Contaminated turn");
+    expect(setup.agents.workspace(setup.authority.runId, old).status).toBe("quarantined");
+    expect(() => setup.agents.releaseAgent(setup.authority, old)).toThrow("may still be running");
+    expect(() =>
+      setup.agents.enqueueAgentMessage(setup.authority, old, randomUUID(), "Do more work"),
+    ).toThrow("retired");
+    const replacement = setup.ready("implementation", old);
+    expect(replacement.agentId).toBe(old.agentId);
+    expect(replacement.agentGeneration).toBe(2);
+    expect(() => setup.prepare(replacement)).toThrow("writer may still be running");
+    const finished = setup.agents.finishTurn(setup.authority, turn.identity, {
+      status: "completed",
+      result: { verdict: "approved" },
+      stopEvidence: "Old generation stopped",
+    });
+    expect(finished.resultEligible).toBe(false);
+    expect(() =>
+      setup.agents.turn(setup.authority.runId, { ...turn.identity, agentGeneration: 2 }),
+    ).toThrow("identity");
+    expect(setup.prepare(replacement).identity.workspaceId).not.toBe(turn.identity.workspaceId);
+    expect(() => setup.reserve("implementation", old)).toThrow("already has a replacement");
+    expect(setup.agents.releaseAgent(setup.authority, old).status).toBe("released");
+  });
+
+  it("uses current leases and control versions for every coordination mutation", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    expect(() =>
+      setup.agents.enqueueAgentMessage(
+        { ...setup.authority, leaseId: "stale" },
+        agent,
+        randomUUID(),
+        "Question",
+      ),
+    ).toThrow("lease");
+    const turn = setup.prepare(agent);
+    setup.journal.changeStatus(setup.authority, "paused");
+    expect(() => setup.agents.markSubmitting(setup.authority, turn.identity)).toThrow("paused");
+    setup.journal.changeStatus(setup.authority, "active");
+    expect(() => setup.agents.markSubmitting(setup.authority, turn.identity)).toThrow(
+      "Control facts changed",
+    );
+    setup.agents.cancelPreparedTurn(setup.authority, turn.identity);
+    setup.store.releaseLease(setup.authority.runId, setup.authority.ownerToken);
+    const lease = setup.store.acquireLease(setup.authority.runId);
+    expect(() => setup.agents.revokeAgent(setup.authority, agent, "Old controller")).toThrow(
+      "lease",
+    );
+    expect(
+      setup.agents.revokeAgent(
+        { runId: setup.authority.runId, leaseId: lease.leaseId, ownerToken: lease.ownerToken },
+        agent,
+        "Current controller",
+      ).status,
+    ).toBe("revoked");
+  });
+
+  it("rejects a workspace or provider borrowed from another run or agent", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const other = setup.reserve("specialist");
+    expect(() => setup.agents.bindProvider(setup.authority, other, agent.provider!)).toThrow(
+      "already bound",
+    );
+    expect(() =>
+      setup.agents.bindProvider(setup.authority, other, {
+        runtime: "herdr",
+        name: "agent",
+        paneId: "p",
+        tabId: "t",
+        terminalId: "x",
+        sessionId: null,
+      }),
+    ).toThrow("pinned runtime");
+    expect(() => setup.agents.workspace("another-run", agent)).toThrow("another run");
+    expect(() =>
+      setup.agents.instance(setup.authority.runId, { ...agent, agentGeneration: 9 }),
+    ).toThrow("stale");
+  });
+
+  it("does not admit writable review or non-Astra coordinator contracts", () => {
+    const setup = fixture();
+    const ws = setup.workspace();
+    const settings = { model: "wrong-model", reasoningEffort: "high" as const };
+    const input = {
+      ...ws,
+      purpose: "review" as const,
+      role: "review" as const,
+      taskId: "demo.1",
+      candidateId: "candidate",
+      instructions: "Review",
+      contract: SdkAgentSessionContractSchema.parse({
+        runtime: "sdk",
+        requested: settings,
+        effective: settings,
+      }),
+      confinementProfile: "fake",
+    };
+    expect(() => setup.agents.reserveAgent(setup.authority, input, setup.version())).toThrow(
+      "immutable candidate",
+    );
+    const coordinatorWorkspace = setup.workspace("coordinator");
+    expect(() =>
+      setup.agents.reserveAgent(
+        setup.authority,
+        { ...input, ...coordinatorWorkspace, purpose: "coordination", role: "orchestrator" },
+        setup.version(),
+      ),
+    ).toThrow("Astra");
+    expect(setup.agents.instances(setup.authority.runId)).toEqual([]);
+  });
+
+  it("counts uncertain worker operations against the persistent concurrency budget", () => {
+    const setup = fixture(1);
+    const first = setup.ready("specialist");
+    const second = setup.ready("review");
+    const turn = setup.submit(first);
+    setup.agents.markIndeterminate(setup.authority, turn.identity, "Unknown stop state");
+    expect(() => setup.prepare(second)).toThrow("worker limit");
+    setup.agents.finishTurn(setup.authority, turn.identity, {
+      status: "failed",
+      result: null,
+      stopEvidence: "Actual stop",
+    });
+    expect(setup.prepare(second).status).toBe("prepared");
+  });
+
+  it("rolls back turn reservation, busy markers, mailbox, and events as one transaction", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    setup.agents.enqueueAgentMessage(setup.authority, agent, randomUUID(), "Question");
+    const cursor = setup.journal.latestObservationCursor(setup.authority.runId);
+    setup.db.exec(
+      "CREATE TRIGGER fail_turn_event BEFORE INSERT ON observations WHEN json_extract(NEW.observation_json, '$.kind') = 'agent.turn_prepared' BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END",
+    );
+    expect(() => setup.prepare(agent)).toThrow("injected persistence failure");
+    expect(setup.agents.turns(setup.authority.runId)).toEqual([]);
+    expect(setup.agents.instance(setup.authority.runId, agent).status).toBe("ready");
+    expect(setup.agents.workspace(setup.authority.runId, agent).activeTurnId).toBeNull();
+    expect(setup.agents.messages(setup.authority.runId, agent)[0]?.status).toBe("queued");
+    expect(setup.journal.latestObservationCursor(setup.authority.runId)).toBe(cursor);
+  });
+
+  it("guards turn replay and detects altered persisted prompt contents", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const operationId = randomUUID();
+    const turn = setup.prepare(agent, operationId);
+    expect(setup.prepare(agent, operationId)).toEqual(turn);
+    expect(() => setup.prepare(agent, operationId, "Different instruction")).toThrow("reused");
+    setup.db
+      .prepare(
+        "UPDATE agent_turns SET record_json = json_set(record_json, '$.prompt.instructions', 'tampered') WHERE turn_id = ?",
+      )
+      .run(turn.identity.turnId);
+    expect(() => setup.agents.turn(setup.authority.runId, turn.identity)).toThrow("inconsistent");
+  });
+
+  it("journals message_agent through the real kernel and rejects revoked targets without stopping the run", async () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const kernel = new ActionKernel(setup.journal);
+    const request = decision(setup, {
+      kind: "message_agent",
+      agentId: agent.agentId,
+      agentGeneration: agent.agentGeneration,
+      message: "Explain the failed test",
+    });
+    const result = await kernel.execute(request, setup.authority);
+    expect(result).toMatchObject({
+      status: "succeeded",
+      result: { kind: "message", delivery: "queued" },
+    });
+    expect(await kernel.execute(request, setup.authority)).toEqual(result);
+    expect(setup.agents.messages(setup.authority.runId, agent)).toHaveLength(1);
+    const inspected = await kernel.execute(
+      decision(setup, { kind: "inspect_agent", agentId: agent.agentId, agentGeneration: 1 }),
+      setup.authority,
+    );
+    expect(inspected.status).toBe("succeeded");
+    setup.agents.revokeAgent(setup.authority, agent, "Replace");
+    expect(
+      await kernel.execute(decision(setup, request.request.action), setup.authority),
+    ).toMatchObject({ status: "rejected", code: "agent_revoked" });
+    expect(setup.journal.control(setup.authority.runId).status).toBe("active");
+  });
+
+  it("preserves raw agent, turn, assignment, workspace, and mailbox rows during quarantine", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    setup.agents.enqueueAgentMessage(setup.authority, agent, randomUUID(), "Question");
+    setup.submit(agent);
+    const originalTurn = setup.db
+      .prepare("SELECT * FROM agent_turns WHERE run_id = ?")
+      .get(setup.authority.runId);
+    const workspaceOperation = setup.agents.beginWorkspaceOperation(
+      setup.authority,
+      setup.workspace(),
+      "capture",
+      setup.version(),
+    );
+    const originalWorkspaceOperation = setup.db
+      .prepare("SELECT * FROM workspace_operations WHERE operation_id = ?")
+      .get(workspaceOperation.operationId);
+    setup.store.releaseLease(setup.authority.runId, setup.authority.ownerToken);
+    setup.db
+      .prepare("UPDATE runs SET state_json = 'broken' WHERE run_id = ?")
+      .run(setup.authority.runId);
+    setup.store.quarantineInvalidRun(setup.authority.runId);
+    const rows = setup.db
+      .prepare("SELECT source_table, row_json FROM quarantined_orchestration WHERE run_id = ?")
+      .all(setup.authority.runId) as { source_table: string; row_json: string }[];
+    expect(rows.map((row) => row.source_table)).toEqual(
+      expect.arrayContaining([
+        "agent_instances",
+        "agent_assignments",
+        "agent_turns",
+        "agent_messages",
+        "workspaces",
+        "workspace_operations",
+      ]),
+    );
+    expect(JSON.parse(rows.find((row) => row.source_table === "agent_turns")!.row_json)).toEqual(
+      originalTurn,
+    );
+    expect(
+      JSON.parse(rows.find((row) => row.source_table === "workspace_operations")!.row_json),
+    ).toEqual(originalWorkspaceOperation);
+    expect(setup.db.pragma("foreign_key_check")).toEqual([]);
+    expect(setup.agents.instances(setup.authority.runId)).toEqual([]);
+  });
+
+  it("snapshots schema-one databases before adding the durable agent tables", () => {
+    const setup = fixture();
+    for (const table of [
+      "validation_evidence",
+      "candidate_workspaces",
+      "candidates",
+      "validation_plans",
+      "workspace_operations",
+      "agent_messages",
+      "agent_turns",
+      "agent_instances",
+      "agent_assignments",
+      "workspaces",
+    ])
+      setup.db.exec(`DROP TABLE ${table}`);
+    setup.db.exec(
+      "DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (1)",
+    );
+    const upgraded = new StateStore(setup.path);
+    stores.push(upgraded);
+    expect(
+      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 6 });
+    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
+    expect(backup).toBeDefined();
+    const snapshot = new Database(join(setup.root, backup!), { readonly: true });
+    databases.push(snapshot);
+    expect(
+      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 1 });
+    expect(snapshot.prepare("SELECT run_id FROM orchestration_runs").get()).toEqual({
+      run_id: setup.authority.runId,
+    });
+    expect(
+      snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'agent_turns'").get(),
+    ).toBeUndefined();
+    expect(
+      setup.db.prepare("SELECT name FROM sqlite_master WHERE name = 'agent_turns'").get(),
+    ).toEqual({ name: "agent_turns" });
+  });
+
+  it("snapshots schema-two agent records before adding workspace I/O exclusions", () => {
+    const setup = fixture();
+    const agent = setup.ready();
+    const turn = setup.submit(agent);
+    const original = setup.agents.instance(setup.authority.runId, agent);
+    setup.db.exec(
+      "DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP TABLE workspace_operations; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (2)",
+    );
+    const upgraded = new StateStore(setup.path);
+    stores.push(upgraded);
+    expect(upgraded.orchestration.agents.instance(setup.authority.runId, agent)).toEqual(original);
+    expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
+    expect(
+      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 6 });
+    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
+    const snapshot = new Database(join(setup.root, backup), { readonly: true });
+    databases.push(snapshot);
+    expect(
+      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 2 });
+    expect(
+      snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'workspace_operations'").get(),
+    ).toBeUndefined();
+    expect(
+      snapshot
+        .prepare("SELECT record_json FROM agent_instances WHERE agent_id = ?")
+        .get(agent.agentId),
+    ).toEqual({ record_json: JSON.stringify(original) });
+    expect(setup.db.pragma("foreign_key_check")).toEqual([]);
+  });
+});
