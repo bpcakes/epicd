@@ -503,6 +503,109 @@ export class WorkspaceManager {
     return { text: bytes.toString("utf8"), truncated: offset + limit < data.length };
   }
 
+  /** Read-only observations may coexist with a writer; they confer no source/evidence approval. */
+  async inspectionSource(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+  ): Promise<WorkspaceRecord> {
+    return this.owned(authority, identity);
+  }
+
+  async inspectionTree(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    signal: AbortSignal,
+  ): Promise<TreeEntry[]> {
+    return this.inspectionGit(authority, identity, signal, (git, workspace) =>
+      this.treeEntries(git, workspace.baselineRevision, signal),
+    );
+  }
+
+  async inspectionBaseline(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    path: string,
+    signal: AbortSignal,
+  ): Promise<{ entry: TreeEntry; bytes: Buffer } | null> {
+    const file = safeRelative(path);
+    return this.inspectionGit(authority, identity, signal, async (git, workspace) => {
+      const entry = (await this.treeEntries(git, workspace.baselineRevision, signal)).find(
+        (entry) => entry.path === file,
+      );
+      if (!entry) return null;
+      const size = Number((await git.text(["cat-file", "-s", entry.objectId], { signal })).trim());
+      if (!Number.isSafeInteger(size) || size > 4 * 1024 * 1024)
+        throw new WorkspaceError(
+          "inspection_file_limit",
+          "Baseline file exceeds the 4 MiB inspection limit",
+        );
+      const bytes = await git.bytes(["cat-file", "blob", entry.objectId], { signal });
+      if (bytes.length !== size)
+        throw new WorkspaceError(
+          "inspection_blob_changed",
+          "Baseline object changed during inspection",
+        );
+      return { entry, bytes };
+    });
+  }
+
+  async inspectionHistory(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    path: string,
+    offset: number,
+    limit: number,
+    signal: AbortSignal,
+  ): Promise<string[]> {
+    const file = path ? safeRelative(path) : null;
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      offset > 10000 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 1001
+    )
+      throw new WorkspaceError(
+        "inspection_history_limit",
+        "History requires a bounded commit range",
+      );
+    return this.inspectionGit(authority, identity, signal, async (git, workspace) => {
+      const text = await git.text(
+        [
+          "--literal-pathspecs",
+          "log",
+          "--no-decorate",
+          "--no-show-signature",
+          "--format=%H %s",
+          `--max-count=${limit}`,
+          `--skip=${offset}`,
+          workspace.baselineRevision,
+          "--",
+          ...(file ? [file] : []),
+        ],
+        { signal },
+      );
+      return text ? text.replace(/\n$/, "").split("\n") : [];
+    });
+  }
+
+  private async inspectionGit<T>(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    signal: AbortSignal,
+    body: (git: KernelGit, workspace: WorkspaceRecord) => Promise<T>,
+  ): Promise<T> {
+    const workspace = await this.owned(authority, identity);
+    const git = new KernelGit(workspace.path);
+    await this.assertPrivateGit(git, signal);
+    const result = await body(git, workspace);
+    await this.assertPrivateGit(git, signal);
+    await this.owned(authority, identity);
+    signal.throwIfAborted();
+    return result;
+  }
+
   /** Runs under a journal-owned validation exclusion, not an agent's assertion of file equality. */
   async verifyValidationWorkspace(
     authority: ControllerAuthority,
@@ -728,7 +831,7 @@ export class WorkspaceManager {
     if ((await realpath(join(git.path, ".git"))) !== join(git.path, ".git"))
       throw new WorkspaceError("shared_git_directory", "Managed Git directory is not private");
     // Inspect metadata before asking Git to read it. In particular, do not honor an injected include.
-    await rejectAliases(join(git.path, ".git"));
+    await rejectAliases(join(git.path, ".git"), signal);
     const config = (await regularBytes(join(git.path, ".git", "config"))).toString("utf8");
     if (config !== privateConfig("sha1") && config !== privateConfig("sha256"))
       throw new WorkspaceError(
@@ -1081,12 +1184,14 @@ async function regularBytes(path: string): Promise<Buffer> {
     await handle.close();
   }
 }
-async function rejectAliases(root: string): Promise<void> {
+async function rejectAliases(root: string, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
   const stat = await lstat(root);
+  signal?.throwIfAborted();
   if (stat.isSymbolicLink())
     throw new WorkspaceError("shared_git_directory", "Managed metadata contains a symbolic link");
   if (stat.isDirectory()) {
-    for (const entry of await readdir(root)) await rejectAliases(join(root, entry));
+    for (const entry of await readdir(root)) await rejectAliases(join(root, entry), signal);
   } else if (!stat.isFile() || stat.nlink !== 1)
     throw new WorkspaceError(
       "shared_git_directory",
