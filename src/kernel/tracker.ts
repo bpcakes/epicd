@@ -90,7 +90,12 @@ export function registerTrackerCapabilities(kernel: ActionKernel, transport: Ker
     } = journal.tracker.record(authority.runId, action.trackerOperationId);
     return { kind: "inspection", text: JSON.stringify(record), artifactIds: [] };
   });
-  for (const kind of ["refresh_tracker", "request_beads_transition", "complete_run"] as const)
+  for (const kind of [
+    "refresh_tracker",
+    "export_tracker",
+    "request_beads_transition",
+    "complete_run",
+  ] as const)
     kernel.registerExternal(kind, async ({ authority, record, signal }) => {
       const intent = journal.tracker.reserve(authority, record.actionId);
       const result = await adapter.execute(authority, intent.trackerOperationId, signal);
@@ -98,6 +103,7 @@ export function registerTrackerCapabilities(kernel: ActionKernel, transport: Ker
       if (!result.outcome) throw new Error("Tracker effect requires explicit reconciliation");
       if (
         result.outcome !== "observed" &&
+        result.outcome !== "exported" &&
         result.outcome !== "claimed" &&
         result.outcome !== "closed"
       )
@@ -151,7 +157,7 @@ export async function reconcileTracker(
     !terminalReconciler
   ) {
     if (
-      (["observed", "claimed", "closed", "completed"].includes(record.outcome ?? "") ||
+      (["observed", "exported", "claimed", "closed", "completed"].includes(record.outcome ?? "") ||
         (record.kind === "complete" && record.completion)) &&
       action.policyDigest === kernel.journal.control(authority.runId).policyDigest
     )

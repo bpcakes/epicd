@@ -162,6 +162,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       "run_review",
       "request_commit",
       "request_publish",
+      "export_tracker",
       "request_beads_transition",
       "complete_run",
     ])

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { IssueStatusSchema, IssueTypeSchema } from "./types.js";
 import type { KernelAction } from "./orchestration.js";
+import { digestJson } from "./repository-policy.js";
 
 export const TrackerIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/);
 const Node = z.strictObject({
@@ -115,6 +116,44 @@ export const TrackerSnapshotSchema = z.strictObject({
   graph: TrackerGraphSchema,
 });
 export type TrackerSnapshot = z.infer<typeof TrackerSnapshotSchema>;
+export const TrackerExportMetadataSchema = z.strictObject({
+  sha256: z.string().length(64),
+  byteLength: z
+    .number()
+    .int()
+    .min(1)
+    .max(4 * 1024 * 1024),
+  issueCount: z.number().int().min(1).max(100000),
+  scopeDigest: z.string().length(64),
+});
+export type TrackerExportMetadata = z.infer<typeof TrackerExportMetadataSchema>;
+export const TrackerExportSchema = z.strictObject({
+  directory: z.string().startsWith("/").max(4096),
+  metadata: TrackerExportMetadataSchema.nullable(),
+  capturedScopeDigest: z.string().length(64).nullable(),
+  currentScopeDigest: z.string().length(64).nullable(),
+});
+/** Raw, order-independent scope identity; timestamps of capture itself are not content. */
+export function trackerExportScope(graph: TrackerGraph) {
+  const edges = (values: TrackerIssue["dependencies"]) =>
+    [...values].sort(
+      (a, b) =>
+        a.id.localeCompare(b.id) ||
+        a.type.localeCompare(b.type) ||
+        a.status.localeCompare(b.status),
+    );
+  return digestJson({
+    epicId: graph.epicId,
+    readyIds: [...graph.readyIds].sort(),
+    issues: [...graph.issues]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map(({ workDigest: _work, ...issue }) => ({
+        ...issue,
+        dependencies: edges(issue.dependencies),
+        dependents: edges(issue.dependents),
+      })),
+  });
+}
 export const EpicRepairBindingSchema = z.strictObject({
   scopeDigest: z.string().length(64),
   epicBaselineRevision: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
@@ -156,6 +195,7 @@ export const CompletionResourcesSchema = z.strictObject({
   agentAssignmentIds: z.array(z.string()),
   publicationIds: z.array(z.uuid()),
   fixtureCreationIds: z.array(z.uuid()),
+  trackerExportIds: z.array(z.uuid()),
   detail: z.string().min(1).max(4000),
 });
 export type CompletionResources = z.infer<typeof CompletionResourcesSchema>;
@@ -171,6 +211,7 @@ export const TrackerOperationSchema = z
     policyDigest: z.string(),
     kind: z.enum([
       "refresh",
+      "export",
       "claim",
       "adopt",
       "close_task",
@@ -179,6 +220,7 @@ export const TrackerOperationSchema = z
       "complete",
     ]),
     closure: TrackerClosureSchema.optional(),
+    export: TrackerExportSchema.optional(),
     completion: CompletionResourcesSchema.nullable(),
     taskId: TrackerIdSchema.nullable(),
     dispatched: z.boolean(),
@@ -189,6 +231,7 @@ export const TrackerOperationSchema = z
     outcome: z
       .enum([
         "observed",
+        "exported",
         "claimed",
         "not_claimed",
         "closed",
@@ -204,6 +247,20 @@ export const TrackerOperationSchema = z
   })
   .refine((operation) => (operation.outcome !== null) === (operation.finishedAt !== null))
   .refine((operation) => operation.outcome === null || operation.ioStopped)
+  .refine((operation) => (operation.kind === "export") === (operation.export !== undefined))
+  .refine(
+    (operation) =>
+      !operation.export?.metadata ||
+      operation.export.metadata.scopeDigest === operation.export.capturedScopeDigest,
+  )
+  .refine(
+    (operation) =>
+      operation.outcome !== "exported" ||
+      (!!operation.export?.metadata &&
+        operation.beforeSnapshotId !== null &&
+        operation.afterSnapshotId !== null &&
+        operation.export.metadata.scopeDigest === operation.export.currentScopeDigest),
+  )
   .refine(
     (operation) =>
       ["close_task", "close_container", "close_epic", "complete"].includes(operation.kind) ===
@@ -232,7 +289,7 @@ export const TrackerOperationSchema = z
     (operation) =>
       !operation.mutationDispatched ||
       (operation.dispatched &&
-        !["refresh", "complete"].includes(operation.kind) &&
+        !["refresh", "export", "complete"].includes(operation.kind) &&
         operation.beforeSnapshotId !== null),
   );
 export type TrackerOperation = z.infer<typeof TrackerOperationSchema>;

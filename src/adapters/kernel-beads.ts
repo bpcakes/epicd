@@ -17,7 +17,13 @@ import {
 } from "../domain/tracker.js";
 import { redactSensitiveText } from "../util/redact.js";
 
-const CONFIG = ["config.yaml", "policy.yaml", "metadata.json", "routes.json"];
+export const TRACKER_CONFIGURATION_FILES = [
+  "config.yaml",
+  "policy.yaml",
+  "metadata.json",
+  "routes.json",
+];
+const CONFIG = TRACKER_CONFIGURATION_FILES;
 const LIMIT = 4 * 1024 * 1024;
 type Guard = () => void;
 export class TrackerTransportError extends Error {
@@ -181,6 +187,26 @@ export class KernelBeads {
       signal,
     );
   }
+  /** Only an isolated export adapter calls this against its disposable database copy. */
+  async exportSnapshot(binding: TrackerBinding, guard: Guard, signal: AbortSignal) {
+    return z
+      .object({
+        exported_issues: z.number().int().positive(),
+        policy: z.literal("strict"),
+        success_rate: z.literal(1),
+        errors: z.array(z.unknown()).length(0),
+        content_hash: z.string().regex(/^[0-9a-f]{64}$/),
+      })
+      .parse(
+        await this.command(
+          binding,
+          ["sync", "--flush-only", "--error-policy", "strict", "--export-parallelism", "1"],
+          guard,
+          signal,
+          true,
+        ),
+      );
+  }
   /** Exact journal-generated close metadata; never force, bypass policy, or close a batch. */
   async close(
     binding: TrackerBinding,
@@ -223,6 +249,7 @@ export class KernelBeads {
     args: string[],
     guard: Guard,
     signal: AbortSignal,
+    exportJsonl = false,
   ): Promise<unknown> {
     if (process.platform !== "linux")
       throw new TrackerTransportError("Controlled Beads requires Linux process confinement");
@@ -280,6 +307,7 @@ export class KernelBeads {
       "--setenv",
       "BEADS_DIR",
       "/workspace/.beads",
+      ...(exportJsonl ? ["--setenv", "BEADS_JSONL", "/workspace/.beads/issues.jsonl"] : []),
       "--chdir",
       "/workspace",
       "--",

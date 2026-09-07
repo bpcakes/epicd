@@ -148,9 +148,12 @@ export class OrchestratorController {
       }
       await reconcileActions(journal, authority, async (action) => {
         if (
-          ["refresh_tracker", "request_beads_transition", "complete_run"].includes(
-            action.request.action.kind,
-          )
+          [
+            "refresh_tracker",
+            "export_tracker",
+            "request_beads_transition",
+            "complete_run",
+          ].includes(action.request.action.kind)
         ) {
           const intent = journal.tracker
             .operations(this.runId)
@@ -163,7 +166,9 @@ export class OrchestratorController {
           try {
             const record = await tracker.reconcile(authority!, intent.trackerOperationId, signal);
             if (
-              ["observed", "claimed", "closed", "completed"].includes(record.outcome ?? "") ||
+              ["observed", "exported", "claimed", "closed", "completed"].includes(
+                record.outcome ?? "",
+              ) ||
               (record.kind === "complete" && record.completion)
             )
               return {

@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { join } from "node:path";
 import type Database from "better-sqlite3";
 import {
   TrackerBindingSchema,
@@ -13,6 +14,9 @@ import {
   type TaskClaimBinding,
   type TrackerClosure,
   type CompletionResources,
+  TrackerExportMetadataSchema,
+  trackerExportScope,
+  type TrackerExportMetadata,
 } from "../domain/tracker.js";
 import type {
   ActionRecord,
@@ -26,7 +30,12 @@ import { redactSensitiveText } from "../util/redact.js";
 import { DeliveryError } from "./delivery-journal.js";
 import { sameScopeClosure } from "./scope-closure.js";
 
-export const TRACKER_TABLES = ["tracker_roots", "tracker_operations", "tracker_snapshots"] as const;
+export const TRACKER_TABLES = [
+  "tracker_roots",
+  "tracker_operations",
+  "tracker_snapshots",
+  "tracker_exports",
+] as const;
 export function createTrackerSchema(db: Database.Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS tracker_roots (
     run_id TEXT PRIMARY KEY REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
@@ -47,6 +56,11 @@ export function createTrackerSchema(db: Database.Database) {
     tracker_operation_id TEXT NOT NULL REFERENCES tracker_operations(tracker_operation_id),
     record_json TEXT NOT NULL CHECK(json_valid(record_json)),
     CHECK(json_extract(record_json, '$.snapshotId') = snapshot_id AND json_extract(record_json, '$.runId') = run_id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS tracker_exports (
+    tracker_operation_id TEXT PRIMARY KEY REFERENCES tracker_operations(tracker_operation_id),
+    run_id TEXT NOT NULL REFERENCES tracker_roots(run_id) ON DELETE CASCADE,
+    body TEXT NOT NULL
   ) STRICT;`);
 }
 type Access = {
@@ -111,6 +125,7 @@ export class TrackerJournal {
       const input = action.request.action;
       if (
         input.kind !== "refresh_tracker" &&
+        input.kind !== "export_tracker" &&
         input.kind !== "request_beads_transition" &&
         input.kind !== "complete_run"
       )
@@ -123,6 +138,9 @@ export class TrackerJournal {
       )
         return fail("Claim/adopt need no revision; closure requires the exact published revision");
       let closure: TrackerClosure | undefined;
+      const config = this.run(authority.runId).runtimeConfiguration;
+      if (input.kind === "export_tracker" && !config)
+        return fail("Tracker export requires the run's frozen private storage configuration");
       if (input.kind === "request_beads_transition" && input.transition === "close_task") {
         const claim = this.assertTaskOwned(authority.runId, input.taskId);
         if (!claim)
@@ -189,13 +207,30 @@ export class TrackerJournal {
         kind:
           input.kind === "refresh_tracker"
             ? "refresh"
-            : input.kind === "complete_run"
-              ? "complete"
-              : input.transition,
+            : input.kind === "export_tracker"
+              ? "export"
+              : input.kind === "complete_run"
+                ? "complete"
+                : input.transition,
         ...(closure ? { closure } : {}),
+        ...(input.kind === "export_tracker"
+          ? {
+              export: {
+                directory: join(
+                  config!.workspaceRoot,
+                  authority.runId,
+                  "tracker-exports",
+                  action.operationId,
+                ),
+                metadata: null,
+                capturedScopeDigest: null,
+                currentScopeDigest: null,
+              },
+            }
+          : {}),
         completion: null,
         taskId:
-          input.kind === "refresh_tracker"
+          input.kind === "refresh_tracker" || input.kind === "export_tracker"
             ? null
             : input.kind === "complete_run"
               ? this.run(authority.runId).epicId
@@ -303,6 +338,10 @@ export class TrackerJournal {
       if (graph.epicId !== this.run(authority.runId).epicId)
         return fail("Tracker snapshot belongs to another epic");
       const safe = structuredClone(graph);
+      if (stage === "after" && record.export)
+        record.export.currentScopeDigest = trackerExportScope(graph);
+      if (stage === "before" && record.export)
+        record.export.capturedScopeDigest = trackerExportScope(graph);
       for (const issue of safe.issues)
         for (const field of [
           "title",
@@ -338,7 +377,7 @@ export class TrackerJournal {
     this.access.transaction(authority, () => {
       const record = this.assertWritable(authority, id);
       if (
-        ["refresh", "complete"].includes(record.kind) ||
+        ["refresh", "export", "complete"].includes(record.kind) ||
         record.mutationDispatched ||
         !record.beforeSnapshotId ||
         !record.taskId
@@ -376,6 +415,46 @@ export class TrackerJournal {
       this.save(record);
       this.changed(authority, "tracker.io_stopped", id);
     });
+  }
+  recordExport(
+    authority: ControllerAuthority,
+    id: string,
+    metadata: TrackerExportMetadata,
+    text: string,
+  ) {
+    this.access.transaction(authority, () => {
+      const record = this.assertWritable(authority, id);
+      if (!record.export || record.export.metadata || !record.beforeSnapshotId)
+        return fail("Export bytes require an unused export intent and its captured scope");
+      const parsed = TrackerExportMetadataSchema.parse(metadata);
+      if (
+        parsed.scopeDigest !== record.export.capturedScopeDigest ||
+        Buffer.byteLength(text) !== parsed.byteLength ||
+        createHash("sha256").update(text).digest("hex") !== parsed.sha256
+      )
+        return fail("Tracker export bytes do not match their recorded identity");
+      this.db
+        .prepare("INSERT INTO tracker_exports VALUES (?, ?, ?)")
+        .run(id, authority.runId, text);
+      record.export.metadata = parsed;
+      this.save(record);
+      this.changed(authority, "tracker.export_retained", id);
+    });
+  }
+  /** Raw private payload for kernel commit construction, never a model-supplied replacement. */
+  exportBytes(runId: string, id: string): string {
+    const metadata = this.record(runId, id).export?.metadata;
+    const row = this.db
+      .prepare("SELECT body FROM tracker_exports WHERE run_id = ? AND tracker_operation_id = ?")
+      .get(runId, id) as { body: string } | undefined;
+    if (
+      !metadata ||
+      !row ||
+      Buffer.byteLength(row.body) !== metadata.byteLength ||
+      createHash("sha256").update(row.body).digest("hex") !== metadata.sha256
+    )
+      return fail("Tracker export is missing or its retained bytes changed");
+    return row.body;
   }
   beginInspection(authority: ControllerAuthority, id: string) {
     return this.access.transaction(authority, () => {
@@ -436,7 +515,15 @@ export class TrackerJournal {
       )
         return record; // A lost ref-inspection result needs reconciliation, not a second close.
       if (record.kind === "refresh") record.outcome = after ? "observed" : "failed";
-      else if (record.kind === "complete") {
+      else if (record.kind === "export") {
+        if (record.export?.metadata) this.exportBytes(authority.runId, id);
+        record.outcome =
+          !record.export?.metadata || !after
+            ? "failed"
+            : record.export.metadata.scopeDigest === record.export.currentScopeDigest
+              ? "exported"
+              : "conflict";
+      } else if (record.kind === "complete") {
         if (this.access.control(authority.runId).status !== "active") return record;
         try {
           if (!after || !record.closure?.refsVerified || record.closure.intervention)
@@ -682,6 +769,7 @@ export class TrackerJournal {
     const snapshot = row ? this.snapshot(runId, row.snapshot_id) : null;
     const pending = this.pending(runId);
     const completed = this.operations(runId).findLast((record) => record.outcome === "completed");
+    const exports = this.operations(runId).filter((record) => record.kind === "export");
     return {
       configured: true as const,
       snapshotId: snapshot?.snapshotId ?? null,
@@ -701,8 +789,16 @@ export class TrackerJournal {
             agentAssignmentCount: completed.completion!.agentAssignmentIds.length,
             publicationCount: completed.completion!.publicationIds.length,
             fixtureCount: completed.completion!.fixtureCreationIds.length,
+            trackerExportCount: completed.completion!.trackerExportIds.length,
           }
         : null,
+      exports: exports.slice(-10).map((record) => ({
+        trackerOperationId: record.trackerOperationId,
+        outcome: record.outcome,
+        ioStopped: record.ioStopped,
+        metadata: record.export!.metadata,
+      })),
+      omittedExports: Math.max(0, exports.length - 10),
       pending: pending
         ? {
             trackerOperationId: pending.trackerOperationId,

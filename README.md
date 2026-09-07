@@ -4,7 +4,7 @@ Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra 
 
 This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Use a fresh state path. Unsupported existing data is left intact.
 
-The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure and atomic run completion are implemented. Guarded tracker export/commit handling, host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
+The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion and isolated tracker export are implemented. Tracker-only delivery commits, host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
 ## Requirements
 
@@ -34,6 +34,16 @@ Confined validation, Codex, Beads and fixture commands use an independent PID-na
 Whole-epic verification has its own published-revision target. `prepare_epic_delivery` binds the latest publication, observed tracker scope and closed-task provenance to an epic-root validation plan. It retains required checks from delivered tasks and demands fresh results at the final SHA. `run_review` then starts an independent `final_review` conversation in an isolated verification copy, covering all descendant requirements and the diff from the run baseline. Findings survive replacement targets. This evidence does not itself close the tracker root or complete the run. Oversized complete review context is rejected, never silently shortened into approval.
 
 After a final finding, the orchestrator can request `start_agent` with purpose `epic_repair`, the root task ID and latest captured root candidate, using a fresh implementation workspace at the latest private commit. The kernel binds the assignment to the open root and proven closed descendants, and supplies retained requirements, findings and checks to either runtime. No task is reopened and no root claim is fabricated. Repair commits use the normal independent pre-commit and exact-revision review gates. Every further repair extends the private tip; publication must be followed by a new whole-epic target and approval before root closure. Policy/reviewer requirements and committed repair checks remain binding even before publication; uncommitted draft checks stay editable.
+
+## Isolated tracker export
+
+`export_tracker` takes no paths or replacement content from the orchestrator. The kernel creates a private, operation-owned SQLite snapshot, copies the pinned Beads configuration, and runs a strict confined export against that copy. SQLite's [online backup API](https://www.sqlite.org/backup.html) captures committed WAL state; this is an execution snapshot, not an old-format migration or compatibility backup.
+
+The source database is opened read-only for the snapshot. Its dirty flags, user JSONL and base JSONL are not flushed, imported or cleared. The private export includes the tracker's full JSONL output, not just the current epic. The kernel checks count/hash, captured issue fields and relationships, stability of the copied epic graph, and agreement with a later live epic observation. A changed epic scope yields a conflict and retains the historical bytes. That comparison does not certify freshness of unrelated issues or grant authority to overwrite them later.
+
+`inspect_tracker_operation` and status expose export identity and metadata; raw JSONL stays in the private journal for future kernel commit construction. It can contain sensitive tracker content and is not a redacted diagnostic. Export uses a 4-MiB output limit, a 64-MiB database bound and a 120-second cooperative deadline. Existing operation directories are never reused or truncated. Recovery can inspect a known-stopped operation without exporting again; an unknown process stop remains unknown. Private copies, including incomplete ones, are retained in the completion resource inventory.
+
+Export alone does not commit, publish, close an issue or approve completion. Tracker-only commits on the actual delivery branch and their reviewed-application ancestry proof remain unimplemented. Neither runtime substitutes a shell command or legacy workflow for those missing capabilities.
 
 ## Declare policy
 
@@ -179,7 +189,7 @@ The model chooses the next useful capability. The kernel validates control versi
 - Review judgments and validation evidence are tied to exact candidate/workspace/turn identities; actual-SHA verification is separate from pre-commit review.
 - A task close requires a current verified publication and claim. The installed Beads close interface lacks atomic expected-owner/parentage comparison; fresh before/after checks detect conflicts but cannot eliminate that race. This remains a release blocker.
 - Container closure requires proven closure of its own descendants; unrelated root tasks may remain open. Root closure additionally requires current independent whole-epic verification at the published SHA. Neither a model verdict nor a successful Beads exit code substitutes for those proofs.
-- `complete_run` inspects the live tracker graph and both publication refs, verifies this run's root-closure markers and stopped work, then records completion and the successful action result in one SQLite transaction. Interrupted inspections can be reconciled without repeating a close. Workspaces, agent sessions, publication artifacts and owned fixtures are explicitly retained for inspection, not silently deleted.
+- `complete_run` inspects the live tracker graph and both publication refs, verifies this run's root-closure markers and stopped work, then records completion and the successful action result in one SQLite transaction. Interrupted inspections can be reconciled without repeating a close. Workspaces, agent sessions, publication artifacts, tracker export copies and owned fixtures are explicitly retained for inspection, not silently deleted.
 - Unknown stop state stays unknown. Restart reconciles recorded work; it does not replay an uncertain external mutation.
 - Epicd creates local commits/refs, never pushes.
 

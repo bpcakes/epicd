@@ -4,15 +4,19 @@ import { KernelBeads } from "./kernel-beads.js";
 import { claimable } from "../domain/tracker.js";
 import { PublicationGit, PublicationGitError } from "./publication-git.js";
 import { NamespaceStopUnprovenError } from "./pid-namespace.js";
+import { TrackerExporter } from "./tracker-export.js";
 
 const detail = (error: unknown) =>
   error instanceof Error ? error.message : "Tracker operation failed";
 export class TrackerAdapter {
   readonly git = new PublicationGit();
+  readonly exporter: TrackerExporter;
   constructor(
     readonly journal: OrchestrationJournal,
     readonly transport: KernelBeads,
-  ) {}
+  ) {
+    this.exporter = new TrackerExporter(transport);
+  }
   async execute(authority: ControllerAuthority, id: string, signal: AbortSignal) {
     const tracker = this.journal.tracker;
     const record = tracker.start(authority, id); // Duplicate dispatch cannot settle the original I/O.
@@ -26,7 +30,23 @@ export class TrackerAdapter {
       const run = tracker.run(authority.runId);
       const binding = await this.transport.bind(run.repoPath);
       tracker.bind(authority, id, binding);
-      if (record.closure) {
+      if (record.export) {
+        const exported = await this.exporter.export(
+          binding,
+          record.export.directory,
+          run.epicId,
+          guard,
+          signal,
+        );
+        tracker.recordSnapshot(authority, id, exported.graph, "before");
+        tracker.recordExport(authority, id, exported.metadata, exported.text);
+        tracker.recordSnapshot(
+          authority,
+          id,
+          await this.transport.graph(binding, run.epicId, guard, signal),
+          "after",
+        );
+      } else if (record.closure) {
         await this.withClosureRefs(authority, id, signal, async (lockedSignal) => {
           const closeGuard = () => {
             lockedSignal.throwIfAborted();
@@ -122,7 +142,8 @@ export class TrackerAdapter {
       if (
         record.mutationDispatched ||
         record.kind === "complete" ||
-        (record.kind === "refresh" && initial.dispatched)
+        (record.kind === "refresh" && initial.dispatched) ||
+        (record.kind === "export" && record.export?.metadata)
       ) {
         const run = tracker.run(authority.runId);
         const binding = tracker.binding(authority.runId);
