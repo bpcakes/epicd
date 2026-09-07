@@ -60,6 +60,7 @@ export class PublicationAdapter {
           repository.creationOperationId,
         );
       else if (
+        workspace.workspaceId !== source.workspaceId &&
         (await this.workspaces.inspectMaterialization(authority, workspace, signal)) !== "ready"
       )
         throw new WorkspaceError(
@@ -70,7 +71,7 @@ export class PublicationAdapter {
       publications.bindCanonical(authority, publicationId, workspace, canonical);
       await this.workspaces.inspectPublicationWorkspace(authority, workspace, signal);
       const record = publications.record(authority.runId, publicationId);
-      if (repository.privateRevision !== record.revision)
+      if (repository.privateRevision !== record.revision && source.path !== canonical.root.path)
         await this.import(
           authority,
           publicationId,
@@ -192,7 +193,7 @@ export class PublicationAdapter {
     record: PublicationRecord,
     signal: AbortSignal,
   ) {
-    const commit = this.journal.commits.record(record.runId, record.commitId);
+    const commit = this.journal.publications.objectRecord(record.runId, record);
     const git = new KernelGit(repository.root.path, repository.commonDirectory.path);
     if (
       (await git.text(["cat-file", "commit", record.revision], { signal })) !== commit.objectContent

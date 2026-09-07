@@ -358,6 +358,7 @@ export class TrackerJournal {
         runId: authority.runId,
         operationId: record.operationId,
         digest: digestJson(safe),
+        rawScopeDigest: trackerExportScope(graph),
         graph: safe,
       });
       this.db

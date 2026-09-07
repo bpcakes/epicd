@@ -22,6 +22,7 @@ export function runStatusView(store: StateStore, runId: string) {
     delivery: journal.delivery.summaries(runId),
     reviews: journal.reviews.summaries(runId),
     commits: journal.commits.summaries(runId),
+    trackerCommits: journal.trackerCommits.summaries(runId),
     publications: journal.publications.summaries(runId),
     tracker: journal.tracker.summary(runId),
     diagnostics: journal.diagnostics.summary(runId),

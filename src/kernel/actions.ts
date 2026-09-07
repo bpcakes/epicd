@@ -135,6 +135,7 @@ export class ActionKernel {
         delivery: journal.delivery.summaries(authority.runId),
         reviews: journal.reviews.summaries(authority.runId),
         commits: journal.commits.summaries(authority.runId),
+        trackerCommits: journal.trackerCommits.summaries(authority.runId),
         publications: journal.publications.summaries(authority.runId),
         tracker: journal.tracker.summary(authority.runId),
         diagnostics: journal.diagnostics.summary(authority.runId),

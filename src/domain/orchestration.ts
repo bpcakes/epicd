@@ -225,6 +225,18 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("refresh_tracker") }),
   z.strictObject({ kind: z.literal("export_tracker") }),
   z.strictObject({
+    kind: z.literal("request_tracker_commit"),
+    trackerOperationId: z.uuid(),
+    publicationId: z.uuid(),
+  }),
+  z.strictObject({ kind: z.literal("inspect_tracker_commit"), trackerCommitId: z.uuid() }),
+  z.strictObject({ kind: z.literal("reconcile_tracker_commit"), trackerCommitId: z.uuid() }),
+  z.strictObject({
+    kind: z.literal("request_publish_tracker"),
+    trackerCommitId: z.uuid(),
+    expectedPreviousRevision: Id,
+  }),
+  z.strictObject({
     kind: z.literal("inspect_tracker"),
     snapshotId: Id.nullable(),
     offset: Version,

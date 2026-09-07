@@ -11,7 +11,12 @@ import {
 import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { closureFixture, publishVerified, trackerAction } from "./fixtures/tracker-closure.js";
+import {
+  closureFixture,
+  publishVerified,
+  publishTracker,
+  trackerAction,
+} from "./fixtures/tracker-closure.js";
 import {
   check,
   fixture,
@@ -474,6 +479,7 @@ describe.skipIf(process.platform !== "linux" || !process.env.EPICD_TEST_BR_PATH)
       const executable = realpathSync(process.env.EPICD_TEST_BR_PATH!);
       let taskId!: string;
       const tracker: ReviewTrackerSetup = {
+        executable: () => executable,
         async initialize(source) {
           const fixtureHome = join(dirname(source), "br-home");
           mkdirSync(fixtureHome);
@@ -565,6 +571,7 @@ describe.skipIf(process.platform !== "linux" || !process.env.EPICD_TEST_BR_PATH)
           revision: commit.revision!,
         }),
       );
+      await publishTracker(s);
       resource(await s.dispatch({ kind: "complete_run" }));
       expect(s.journal.control(s.authority.runId).status).toBe("complete");
       expect(

@@ -2,7 +2,12 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
-import { closureFixture, publishVerified, trackerAction } from "./fixtures/tracker-closure.js";
+import {
+  closureFixture,
+  publishVerified,
+  publishTracker,
+  trackerAction,
+} from "./fixtures/tracker-closure.js";
 import { check, resource, git } from "./fixtures/review.js";
 import { runStatusView } from "../src/status.js";
 import { ActionKernel } from "../src/kernel/actions.js";
@@ -78,10 +83,11 @@ function reserveCompletion(s: Setup) {
 }
 
 describe.skipIf(process.platform !== "linux")("guarded scope closure and completion", () => {
-  it("closes the independently verified root and atomically completes without another commit or changing the user checkout", async () => {
+  it("closes the independently verified root and completes with a proven tracker-only descendant without changing the user checkout", async () => {
     const s = await closureFixture(),
       run = s.authority.runId;
-    const revision = await deliverTask(s);
+    await deliverTask(s);
+    const revision = (await publishTracker(s)).revision;
     expect((await closeRoot(s, revision)).status).toBe("rejected");
     await approveEpic(s, revision);
     expect((await s.dispatch({ kind: "complete_run" })).status).toBe("rejected");
@@ -93,6 +99,8 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
       outcome: "closed",
       closure: { proof: { kind: "epic" } },
     });
+    expect((await s.dispatch({ kind: "complete_run" })).status).toBe("rejected");
+    const trackerPublication = await publishTracker(s);
     const complete = resource(await s.dispatch({ kind: "complete_run" }));
     expect(s.journal.tracker.record(run, complete.resourceId)).toMatchObject({
       kind: "complete",
@@ -102,7 +110,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     });
     expect(runStatusView(s.store, run)).toMatchObject({
       control: { status: "complete" },
-      tracker: { completion: { revision } },
+      tracker: { completion: { revision: trackerPublication.revision } },
     });
     expect(s.journal.actions(run).at(-1)?.status).toBe("succeeded");
     expect(s.journal.tracker.pending(run)).toBeNull();
@@ -113,6 +121,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
         .map((args) => args[1]),
     ).toEqual(["demo.1", "demo"]);
     expect(s.journal.commits.records(run)).toHaveLength(1);
+    expect(s.journal.trackerCommits.records(run)).toHaveLength(2);
     expect(git(s.source, "rev-parse", "HEAD")).toBe(s.head);
     expect(readFileSync(join(s.source, "app.txt"), "utf8")).toBe("user-owned work\n");
     expect(readFileSync(join(s.source, ".git/index"))).toEqual(index);
@@ -151,6 +160,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     );
     expect(s.journal.delivery.candidateCurrent(s.authority.runId, candidate)).toBe(true);
     resource(await closeRoot(s, revision));
+    await publishTracker(s);
     resource(await s.dispatch({ kind: "complete_run" }));
   }, 45000);
 
@@ -198,6 +208,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     const revision = await deliverTask(s);
     await approveEpic(s, revision);
     resource(await closeRoot(s, revision));
+    await publishTracker(s);
     const intent = reserveCompletion(s);
     const ready = await s.adapter.execute(
       s.authority,
@@ -251,6 +262,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     const revision = await deliverTask(s);
     await approveEpic(s, revision);
     resource(await closeRoot(s, revision));
+    await publishTracker(s);
     const intent = reserveCompletion(s);
     s.newLease();
     const store = s.reopen(),
@@ -273,6 +285,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     const revision = await deliverTask(s);
     await approveEpic(s, revision);
     resource(await closeRoot(s, revision));
+    await publishTracker(s);
     let calls = 0;
     const source: DecisionSource = {
       async decide({ ticket }) {
@@ -303,6 +316,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     const revision = await deliverTask(s);
     await approveEpic(s, revision);
     resource(await closeRoot(s, revision));
+    await publishTracker(s);
     const intent = reserveCompletion(s);
     await s.adapter.execute(s.authority, intent.trackerOperationId, new AbortController().signal);
     const ticket = s.journal.beginDecision(
@@ -353,6 +367,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     const revision = await deliverTask(s);
     await approveEpic(s, revision);
     resource(await closeRoot(s, revision));
+    await publishTracker(s);
     const operation = s.journal.agents.beginWorkspaceOperation(
       s.authority,
       s.workspace,

@@ -100,6 +100,16 @@ export const PublicationRecordSchema = CandidateIdentitySchema.extend({
   operationId: z.string().uuid(),
   controllerLeaseId: z.string().min(1).max(256),
   commitId: z.string().uuid(),
+  // Candidate/commit/review fields identify the reviewed application ancestor.
+  // Only this discriminant can attest that the published revision is tracker-only.
+  provenance: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("application") }),
+    z.strictObject({
+      kind: z.literal("tracker"),
+      trackerCommitId: z.uuid(),
+      reviewedRevision: Oid,
+    }),
+  ]),
   reviewEvidenceId: z.string().min(1).max(256),
   policyDigest: z.string().min(1).max(256),
   ...WorkspaceIdentitySchema.shape,

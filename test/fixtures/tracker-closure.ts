@@ -1,5 +1,6 @@
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import type { ActionKernel } from "../../src/kernel/actions.js";
 import type { ControllerAuthority, KernelAction } from "../../src/domain/orchestration.js";
 import { KernelBeads } from "../../src/adapters/kernel-beads.js";
@@ -45,10 +46,12 @@ export async function closureFixture(
     adapter!: ReturnType<typeof registerTrackerCapabilities>,
     dataPath!: string;
   const tracker: ReviewTrackerSetup = {
+    ...(claimBeforeImplementation
+      ? { executable: (root: string) => join(root, "br-fixture") }
+      : {}),
     async initialize(source) {
       mkdirSync(join(source, ".beads"));
       writeFileSync(join(source, ".beads/issues.jsonl"), "tracker\n");
-      writeFileSync(join(source, ".beads/beads.db"), "fixture-only\n");
       writeFileSync(join(source, ".beads/.gitignore"), "beads.db\ndata.json\ncommands.jsonl\n");
       dataPath = join(source, ".beads/data.json");
       writeFileSync(
@@ -86,6 +89,13 @@ export async function closureFixture(
             : [],
         }),
       );
+      const db = new Database(join(source, ".beads/beads.db"));
+      try {
+        db.exec("CREATE TABLE fixture_state (body TEXT NOT NULL)");
+        db.prepare("INSERT INTO fixture_state VALUES (?)").run(readFileSync(dataPath, "utf8"));
+      } finally {
+        db.close();
+      }
       return { epicId: "demo", taskId: "demo.1" };
     },
     async claim({ root, kernel, authority }) {
@@ -93,12 +103,15 @@ export async function closureFixture(
       writeFileSync(
         executable,
         `#!/usr/bin/python3
-import json, sys, signal, subprocess, time
+import json, sys, signal, subprocess, time, sqlite3, hashlib, os
 from pathlib import Path
 from datetime import datetime, timezone
 directory, args = Path('/workspace/.beads'), sys.argv[1:]
 with (directory/'commands.jsonl').open('a') as log: log.write(json.dumps(args)+'\\n')
-x = json.loads((directory/'data.json').read_text())
+db = sqlite3.connect(str(directory/'beads.db'))
+x = json.loads(db.execute('SELECT body FROM fixture_state').fetchone()[0])
+def save():
+    db.execute('UPDATE fixture_state SET body=?', (json.dumps(x),)); db.commit()
 def row(id):
     common = {'id':id,'title':id,'priority':1,'description':'Deliver green behavior','acceptance_criteria':'The check passes','labels':[]}
     if id == 'demo':
@@ -115,7 +128,7 @@ elif args[0] == 'update':
     y = x if args[1] == 'demo.1' else next(y for y in x['other_tasks'] if y['id'] == args[1])
     if y['assignee']: sys.exit('already owned')
     y['status'], y['assignee'] = 'in_progress', args[args.index('--actor')+1]
-    (directory/'data.json').write_text(json.dumps(x))
+    save()
     print(json.dumps([row(args[1])]))
 elif args[0] == 'close':
     if x.get('blocked_close'):
@@ -129,8 +142,17 @@ elif args[0] == 'close':
     y['status'], y['closed_at'] = 'closed', datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
     y['close_reason'], y['closed_by_session'] = args[args.index('--reason')+1], args[args.index('--session')+1]
     if args[1] == 'demo': x.update({'epic_'+key:value for key,value in y.items()})
-    (directory/'data.json').write_text(json.dumps(x))
+    save()
     print(json.dumps([row(args[1])]))
+elif args[0] == 'sync':
+    ids = ['demo','demo.1'] + (['demo.group'] if x.get('container') else []) + [y['id'] for y in x.get('other_tasks',[])] + x.get('new_children',[])
+    rows = [row(id) for id in sorted(set(ids))]
+    for y in rows:
+        y['dependencies'] = [{'issue_id':y['id'],'depends_on_id':edge['id'],'type':edge['dependency_type']} for edge in y['dependencies']]
+        y.pop('dependents', None)
+    output = ''.join(json.dumps(y,separators=(',',':'))+'\\n' for y in rows).encode()
+    Path(os.environ['BEADS_JSONL']).write_bytes(output)
+    print(json.dumps({'exported_issues':len(rows),'policy':'strict','success_rate':1,'errors':[],'content_hash':hashlib.sha256(output).hexdigest()}))
 else: sys.exit('unsupported')
 `,
       );
@@ -168,12 +190,27 @@ else: sys.exit('unsupported')
     },
     transport,
     adapter,
-    readTracker: () => JSON.parse(readFileSync(dataPath, "utf8")),
-    writeTracker: (changes: Record<string, unknown>) =>
-      writeFileSync(
-        dataPath,
-        JSON.stringify({ ...JSON.parse(readFileSync(dataPath, "utf8")), ...changes }),
-      ),
+    readTracker: () => {
+      const db = new Database(join(setup.source, ".beads/beads.db"));
+      try {
+        return JSON.parse(db.prepare("SELECT body FROM fixture_state").pluck().get() as string);
+      } finally {
+        db.close();
+      }
+    },
+    writeTracker: (changes: Record<string, unknown>) => {
+      const db = new Database(join(setup.source, ".beads/beads.db"));
+      try {
+        const before = JSON.parse(
+          db.prepare("SELECT body FROM fixture_state").pluck().get() as string,
+        );
+        db.prepare("UPDATE fixture_state SET body=?").run(
+          JSON.stringify({ ...before, ...changes }),
+        );
+      } finally {
+        db.close();
+      }
+    },
     trackerCommands: () =>
       readFileSync(join(setup.source, ".beads/commands.jsonl"), "utf8")
         .trim()
@@ -217,4 +254,25 @@ export async function publishVerified(
     commit,
     publication: s.journal.publications.record(s.authority.runId, publicationId),
   };
+}
+
+/** Explicit model-selected export, tracker-object construction, then ordinary guarded publication. */
+export async function publishTracker(s: Awaited<ReturnType<typeof fixture>>) {
+  const parent = s.journal.publications.repository(s.authority.runId)!;
+  const exported = resource(await s.dispatch({ kind: "export_tracker" }));
+  const created = resource(
+    await s.dispatch({
+      kind: "request_tracker_commit",
+      trackerOperationId: exported.resourceId,
+      publicationId: parent.lastPublishedId!,
+    }),
+  );
+  const publication = resource(
+    await s.dispatch({
+      kind: "request_publish_tracker",
+      trackerCommitId: created.resourceId,
+      expectedPreviousRevision: parent.publishedRevision!,
+    }),
+  );
+  return s.journal.publications.record(s.authority.runId, publication.resourceId);
 }

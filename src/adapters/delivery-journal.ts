@@ -104,7 +104,11 @@ type Access = {
   reviewChecks(runId: string, taskId: string): z.infer<typeof RequiredCheckSchema>[];
   exactCommit(runId: string, candidate: CandidateIdentity, revision: string): CommitRecord;
   assertPublicationIdle(runId: string): void;
-  epicTarget(runId: string, activeTrackerOperationId?: string): EpicDeliveryTarget;
+  epicTarget(
+    runId: string,
+    activeTrackerOperationId?: string,
+    reviewedPublicationId?: string,
+  ): EpicDeliveryTarget;
   epicRequirements(runId: string): ReturnType<typeof import("./epic-delivery.js").epicRequirements>;
   assertEpicRepair(
     runId: string,
@@ -857,7 +861,11 @@ export class DeliveryJournal {
     const source = candidate.source;
     if (source.kind === "published_epic") {
       try {
-        const target = this.access.epicTarget(runId, activeTrackerOperationId);
+        const target = this.access.epicTarget(
+          runId,
+          activeTrackerOperationId,
+          source.publicationId,
+        );
         const writers = this.taskWriters(runId, null);
         return (
           !writers.active &&

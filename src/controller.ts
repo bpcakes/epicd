@@ -22,6 +22,7 @@ import {
 } from "./kernel/inspection.js";
 import { registerReviewCapabilities } from "./kernel/reviews.js";
 import { registerCommitCapabilities } from "./kernel/commits.js";
+import { reconcileTrackerCommit } from "./kernel/tracker-commits.js";
 import { registerPublicationCapabilities } from "./kernel/publication.js";
 import { registerTrackerCapabilities } from "./kernel/tracker.js";
 import { registerSettingsCapabilities } from "./kernel/settings.js";
@@ -147,6 +148,42 @@ export class OrchestratorController {
         }
       }
       await reconcileActions(journal, authority, async (action) => {
+        if (action.request.action.kind === "reconcile_tracker_commit")
+          return {
+            status: "failed",
+            detail:
+              "Interrupted read-only tracker-commit inspection has no retained action result. Inspect the original commitment and choose another reconciliation if useful; no Git write was replayed and no workspace stop was inferred.",
+          };
+        if (action.request.action.kind === "request_tracker_commit") {
+          const intent = journal.trackerCommits
+            .records(this.runId)
+            .find((entry) => entry.operationId === action.operationId);
+          if (!intent)
+            return {
+              status: "failed",
+              detail: "No tracker commit intent exists; no write was admitted",
+            };
+          try {
+            const record = await reconcileTrackerCommit(
+              journal,
+              workspaces,
+              authority!,
+              intent.trackerCommitId,
+            );
+            return record.status === "created" && record.sourceIntact
+              ? {
+                  status: "succeeded",
+                  result: { kind: "resource", resourceId: record.trackerCommitId, generation: 1 },
+                }
+              : { status: "failed", detail: record.failure ?? "Tracker commit was not retained" };
+          } catch (error) {
+            journal.assertAuthority(authority!);
+            return {
+              status: "unresolved",
+              detail: `Tracker commit recovery: ${String(error)}; no write was replayed`,
+            };
+          }
+        }
         if (
           [
             "refresh_tracker",

@@ -42,6 +42,11 @@ import {
 import { ReviewJournal, REVIEW_TABLES, createReviewsSchema } from "./review-journal.js";
 import { CommitJournal, COMMIT_TABLES, createCommitsSchema } from "./commit-journal.js";
 import {
+  TrackerCommitJournal,
+  TRACKER_COMMIT_TABLES,
+  createTrackerCommitSchema,
+} from "./tracker-commit-journal.js";
+import {
   PublicationJournal,
   PUBLICATION_TABLES,
   createPublicationSchema,
@@ -60,7 +65,7 @@ import { observeEpicDelivery, epicRequirements } from "./epic-delivery.js";
 import { scopeClosure } from "./scope-closure.js";
 import { bindEpicRepair, assertEpicRepair } from "./epic-repair.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 23;
+export const ORCHESTRATION_SCHEMA_VERSION = 24;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -76,6 +81,7 @@ export const ORCHESTRATION_TABLES = [
   ...COMMIT_TABLES,
   ...PUBLICATION_TABLES,
   ...TRACKER_TABLES,
+  ...TRACKER_COMMIT_TABLES,
   ...DIAGNOSTIC_TABLES,
   ...FIXTURE_TABLES,
 ] as const;
@@ -144,6 +150,7 @@ export function createOrchestrationSchema(db: Database.Database): void {
   createCommitsSchema(db);
   createPublicationSchema(db);
   createTrackerSchema(db);
+  createTrackerCommitSchema(db);
   createDecisionSourceSchema(db);
   createDiagnosticsSchema(db);
   createFixturesSchema(db);
@@ -203,6 +210,7 @@ export class OrchestrationJournal {
   readonly delivery: DeliveryJournal;
   readonly reviews: ReviewJournal;
   readonly commits: CommitJournal;
+  readonly trackerCommits: TrackerCommitJournal;
   readonly publications: PublicationJournal;
   readonly tracker: TrackerJournal;
   readonly decisionSource: DecisionJournal;
@@ -270,6 +278,7 @@ export class OrchestrationJournal {
       policy: (runId) => this.policy(runId),
       observe: (authority, input) => this.appendObservation(authority, input),
       publicationPending: (runId) => this.publications.pending(runId),
+      assertTrackerCommitIdle: (runId) => this.trackerCommits.assertIdle(runId),
       deliveryRepository: (runId) => this.publications.repository(runId),
       assertTaskOwned: (runId, taskId) => this.tracker.assertTaskOwned(runId, taskId),
       bindEpicRepair: (runId, taskId, candidateId, workspace) =>
@@ -313,8 +322,12 @@ export class OrchestrationJournal {
       agents: this.agents,
       reviewChecks: (runId, taskId) => this.reviews.requiredChecks(runId, taskId),
       exactCommit: (runId, candidate, revision) => this.commits.exact(runId, candidate, revision),
-      assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
-      epicTarget: (runId, operationId) => observeEpicDelivery(this, runId, operationId),
+      assertPublicationIdle: (runId) => {
+        this.publications.assertIdle(runId);
+        this.trackerCommits.assertIdle(runId);
+      },
+      epicTarget: (runId, operationId, reviewedPublicationId) =>
+        observeEpicDelivery(this, runId, operationId, reviewedPublicationId),
       epicRequirements: (runId) => epicRequirements(this, runId),
       assertEpicRepair: (runId, taskId, binding, workspace) =>
         assertEpicRepair(this, runId, taskId, binding, workspace, false),
@@ -336,8 +349,24 @@ export class OrchestrationJournal {
       agents: this.agents,
       delivery: this.delivery,
       reviews: this.reviews,
-      assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
+      assertPublicationIdle: (runId) => {
+        this.publications.assertIdle(runId);
+        this.trackerCommits.assertIdle(runId);
+      },
       deliveryRepository: (runId) => this.publications.repository(runId),
+      publishedObject: (runId, commitId, revision) => {
+        const publication = this.publications
+          .records(runId)
+          .findLast(
+            (entry) =>
+              entry.revision === revision &&
+              entry.commitId === commitId &&
+              entry.outcome === "published" &&
+              entry.ioStopped &&
+              !entry.intervention,
+          );
+        return publication ? this.publications.objectRecord(runId, publication) : null;
+      },
     });
     this.publications = new PublicationJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -349,13 +378,19 @@ export class OrchestrationJournal {
       reviews: this.reviews,
       commits: this.commits,
       assertTrackerIdle: (runId) => this.tracker.assertIdle(runId),
+      assertTrackerCommitIdle: (runId) => this.trackerCommits.assertIdle(runId),
+      trackerCommit: (runId, id) => this.trackerCommits.record(runId, id),
+      assertTrackerCommitParent: (record) => this.trackerCommits.assertParent(record),
     });
     this.tracker = new TrackerJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
       control: (runId) => this.control(runId),
       action: (runId, actionId) => this.action(runId, actionId),
       observe: (authority, input) => this.appendObservation(authority, input),
-      assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
+      assertPublicationIdle: (runId) => {
+        this.publications.assertIdle(runId);
+        this.trackerCommits.assertIdle(runId);
+      },
       scopeClosure: (runId, kind, taskId, revision, operationId) =>
         scopeClosure(this, runId, kind, taskId, revision, operationId),
       completionResources: (runId, operationId) => this.completionResources(runId, operationId),
@@ -375,7 +410,13 @@ export class OrchestrationJournal {
             "closure_not_verified",
             "Task closure needs current independent exact-SHA publication approval",
           );
-        const commit = this.commits.exact(runId, publication, revision);
+        const commit = this.commits.exact(
+          runId,
+          publication,
+          publication.provenance.kind === "tracker"
+            ? publication.provenance.reviewedRevision
+            : revision,
+        );
         const candidate = this.delivery.candidate(runId, publication);
         if (candidate.source.kind !== "implementation")
           throw new DeliveryError(
@@ -396,6 +437,9 @@ export class OrchestrationJournal {
         return publication;
       },
     });
+    this.trackerCommits = new TrackerCommitJournal(db, this, (authority, body) =>
+      this.transaction(authority, body),
+    );
   }
 
   hasRun(runId: string): boolean {
@@ -700,6 +744,17 @@ export class OrchestrationJournal {
         ];
       else if (pending.policy_digest !== control.policyDigest)
         denial = ["stale_policy", "The effective policy changed"];
+      else if (
+        !concurrentWithPublication(decision.request.action.kind) &&
+        !["request_publish_tracker", "reconcile_tracker_commit"].includes(
+          decision.request.action.kind,
+        ) &&
+        this.trackerCommits.pending(authority.runId)
+      )
+        denial = [
+          "tracker_commit_unsettled",
+          "Settle and publish the pending tracker commit before further delivery mutations",
+        ];
       else if (
         !concurrentWithPublication(decision.request.action.kind) &&
         this.publications.pending(authority.runId)

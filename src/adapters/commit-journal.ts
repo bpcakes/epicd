@@ -13,6 +13,7 @@ import type { ReviewJournal } from "./review-journal.js";
 import { DeliveryError, type DeliveryJournal } from "./delivery-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { RunStateSchema } from "../domain/types.js";
+import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
 
 export const COMMIT_TABLES = ["delivery_commits"] as const;
 export function createCommitsSchema(db: Database.Database) {
@@ -43,6 +44,11 @@ type Access = {
   reviews: ReviewJournal;
   assertPublicationIdle(runId: string): void;
   deliveryRepository(runId: string): import("../domain/publication.js").DeliveryRepository | null;
+  publishedObject(
+    runId: string,
+    applicationCommitId: string,
+    revision: string,
+  ): CommitRecord | TrackerCommitRecord | null;
 };
 const at = () => new Date().toISOString();
 
@@ -276,7 +282,7 @@ export class CommitJournal {
   ): {
     revision: string;
     sourcePath: string;
-    commit: CommitRecord | null;
+    commit: CommitRecord | TrackerCommitRecord | null;
     sourceWorkspace: import("../domain/agents.js").WorkspaceIdentity | null;
   } {
     this.access.assertPublicationIdle(runId);
@@ -293,6 +299,21 @@ export class CommitJournal {
       );
     if (latest) {
       const custody = this.access.deliveryRepository(runId);
+      if (
+        custody?.workspace &&
+        custody.privateRevision &&
+        custody.privateRevision !== latest.revision &&
+        custody.privateRevision === custody.publishedRevision
+      ) {
+        const tip = this.access.publishedObject(runId, latest.commitId, custody.privateRevision);
+        if (tip)
+          return {
+            revision: tip.revision!,
+            sourcePath: this.access.agents.workspace(runId, custody.workspace).path,
+            commit: tip,
+            sourceWorkspace: custody.workspace,
+          };
+      }
       const sourceWorkspace =
         custody?.workspace && custody.privateRevision === latest.revision
           ? custody.workspace
@@ -328,6 +349,19 @@ export class CommitJournal {
         sourceIntact: record.sourceIntact,
         warning: "Commit creation alone is not independent verification or publication",
       }));
+  }
+  retainedBase(runId: string, commitId: string, revision: string) {
+    const application = this.record(runId, commitId);
+    const base =
+      application.revision === revision
+        ? application
+        : this.access.publishedObject(runId, commitId, revision);
+    if (!base)
+      throw new DeliveryError(
+        "tracker_base",
+        "No proven tracker-only descendant supplies this application base",
+      );
+    return base;
   }
   private save(record: CommitRecord) {
     this.db

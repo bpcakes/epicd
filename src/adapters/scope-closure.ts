@@ -42,7 +42,7 @@ export function scopeClosure(
     !publication.ioStopped ||
     repository.publishedRevision !== publication.revision ||
     repository.privateRevision !== publication.revision ||
-    journal.commits.latestCreated(runId)?.revision !== publication.revision ||
+    journal.commits.latestCreated(runId)?.commitId !== publication.commitId ||
     journal.commits
       .records(runId)
       .some((entry) => ["preparing", "writing"].includes(entry.status)) ||
@@ -50,6 +50,8 @@ export function scopeClosure(
   )
     return fail("Scope closure requires the complete settled and published private commit chain");
   journal.publications.assertIdle(runId);
+  journal.trackerCommits.assertIdle(runId);
+  journal.publications.objectRecord(runId, publication);
   const proof = {
     scopeDigest: scope.digest,
     closureOperationIds: scope.closures.map((entry) => entry.trackerOperationId),
@@ -66,8 +68,13 @@ export function scopeClosure(
   if (
     !candidate ||
     candidate.source.kind !== "published_epic" ||
-    candidate.source.publicationId !== publication.publicationId ||
-    candidate.snapshot?.snapshotRevision !== publication.revision
+    !journal.publications.trackerDescendsFrom(
+      runId,
+      publication.publicationId,
+      candidate.source.publicationId,
+    ) ||
+    candidate.snapshot?.snapshotRevision !==
+      journal.publications.record(runId, candidate.source.publicationId).revision
   )
     return fail("Epic closure requires a whole-epic target at this published revision");
   const reviewEvidenceId = journal.reviews.approval(
@@ -82,6 +89,14 @@ export function scopeClosure(
     );
   let rootClosureOperationId: string | null = null;
   if (kind === "complete") {
+    if (
+      publication.provenance.kind !== "tracker" ||
+      journal.trackerCommits.record(runId, publication.provenance.trackerCommitId).exportMetadata
+        .scopeDigest !== scope.snapshot.rawScopeDigest
+    )
+      return fail(
+        "Completion requires a published tracker-only commit containing the current closed epic scope",
+      );
     const closed = journal.tracker
       .operations(runId)
       .findLast((entry) => entry.kind === "close_epic" && entry.outcome === "closed");
@@ -95,7 +110,11 @@ export function scopeClosure(
       !witness ||
       closed.closure.proof.kind !== "epic" ||
       closed.closure.proof.reviewScopeDigest !== candidate.source.scopeDigest ||
-      closed.closure.publicationId !== publication.publicationId ||
+      !journal.publications.trackerDescendsFrom(
+        runId,
+        publication.publicationId,
+        closed.closure.publicationId,
+      ) ||
       root.status !== "closed" ||
       root.contentDigest !== witness.contentDigest ||
       root.assignee !== witness.assignee ||

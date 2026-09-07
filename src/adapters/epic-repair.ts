@@ -70,8 +70,16 @@ export function assertEpicRepair(
   workspace: WorkspaceIdentity,
   requireLatestBase: boolean,
 ): void {
-  if (requireLatestBase) journal.commits.implementationBase(runId, binding.baseCommitId);
-  const base = journal.commits.record(runId, binding.baseCommitId);
+  if (
+    requireLatestBase &&
+    journal.commits.implementationBase(runId, binding.baseCommitId).revision !==
+      binding.baseRevision
+  )
+    throw new DeliveryError(
+      "epic_repair_stale",
+      "Repair must extend the current complete delivery tip",
+    );
+  const base = journal.commits.retainedBase(runId, binding.baseCommitId, binding.baseRevision);
   if (
     repairScope(journal, runId, taskId) !== binding.scopeDigest ||
     binding.epicBaselineRevision !== journal.runObjective(runId).baselineRevision ||

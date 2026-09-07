@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { closureFixture, publishVerified } from "./fixtures/tracker-closure.js";
+import { closureFixture, publishVerified, publishTracker } from "./fixtures/tracker-closure.js";
 import { check, finding, git, resource, target } from "./fixtures/review.js";
 import { IMPLEMENTATION_OUTPUT_SCHEMA } from "../src/domain/types.js";
 import type { CandidateIdentity } from "../src/domain/delivery.js";
@@ -132,6 +132,7 @@ describe.skipIf(process.platform !== "linux")("epic-scoped implementation repair
     const s = await closureFixture(),
       run = s.authority.runId;
     const { delivered, final } = await initial(s);
+    const trackerTip = await publishTracker(s);
     await validate(s, final, delivered.commit.revision);
     const feedback = await s.review(
       final,
@@ -148,7 +149,7 @@ describe.skipIf(process.platform !== "linux")("epic-scoped implementation repair
       taskId: "demo",
       epicRepair: {
         baseCommitId: delivered.commit.commitId,
-        baseRevision: delivered.commit.revision,
+        baseRevision: trackerTip.revision,
       },
     });
     expect(assignment.trackerClaim).toBeUndefined();
@@ -180,7 +181,10 @@ describe.skipIf(process.platform !== "linux")("epic-scoped implementation repair
       }),
     ).resourceId;
     const repaired = s.journal.commits.record(run, id);
-    expect(repaired.parentRevision).toBe(delivered.commit.revision);
+    expect(repaired.parentRevision).toBe(trackerTip.revision);
+    expect(git(copy.path, "show", `${repaired.revision}:.beads/issues.jsonl`)).toBe(
+      git(s.source, "show", `${trackerTip.revision}:.beads/issues.jsonl`),
+    );
     expect(
       (
         await s.dispatch({
@@ -204,7 +208,7 @@ describe.skipIf(process.platform !== "linux")("epic-scoped implementation repair
         kind: "request_publish",
         ...candidate,
         revision: repaired.revision!,
-        expectedPreviousRevision: delivered.commit.revision!,
+        expectedPreviousRevision: trackerTip.revision,
       }),
     );
     expect(
@@ -233,6 +237,7 @@ describe.skipIf(process.platform !== "linux")("epic-scoped implementation repair
         revision: repaired.revision!,
       }),
     );
+    await publishTracker(s);
     resource(await s.dispatch({ kind: "complete_run" }));
     expect(s.journal.control(run).status).toBe("complete");
     expect(

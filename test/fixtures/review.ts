@@ -1,6 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach } from "vitest";
@@ -71,6 +79,7 @@ export function resource(result: ActionResult) {
 // Real private Git copies, SQLite ownership, supervisor and read-only process mounts.
 // Provider judgments are explicitly scripted; this suite does not certify model competence.
 export type ReviewTrackerSetup = {
+  executable?: (root: string) => string;
   initialize(source: string): Promise<{ epicId: string; taskId: string }>;
   claim(context: {
     root: string;
@@ -104,7 +113,30 @@ export async function fixture(
   const path = join(root, "state.sqlite3");
   let store = new StateStore(path);
   const state = store.create(
-    { ...initialRun(), repoPath: source, epicBaseRevision: head, epicId: trackedTask.epicId },
+    {
+      ...initialRun(),
+      repoPath: source,
+      epicBaseRevision: head,
+      epicId: trackedTask.epicId,
+      ...(tracker?.executable
+        ? {
+            runtimeConfiguration: {
+              commonDirectory: {
+                path: join(source, ".git"),
+                device: String(statSync(join(source, ".git")).dev),
+                inode: String(statSync(join(source, ".git")).ino),
+              },
+              executable: join(root, "bin/codex"),
+              trackerExecutable: tracker.executable(root),
+              workspaceRoot: join(root, "managed"),
+              runtimeRoot: join(root, "runtime"),
+              authCachePath: null,
+              turnTimeoutMs: 30000,
+              herdr: null,
+            },
+          }
+        : {}),
+    },
     RepositoryPolicySchema.parse({ schemaVersion: 1, requiredChecks: [required] }),
   );
   const lease = store.acquireLease(state.runId);

@@ -20,6 +20,7 @@ export type OrchestratorContext = {
   delivery: ReturnType<ActionKernel["journal"]["delivery"]["summaries"]>;
   reviews: ReturnType<ActionKernel["journal"]["reviews"]["summaries"]>;
   commits: ReturnType<ActionKernel["journal"]["commits"]["summaries"]>;
+  trackerCommits: ReturnType<ActionKernel["journal"]["trackerCommits"]["summaries"]>;
   publications: ReturnType<ActionKernel["journal"]["publications"]["summaries"]>;
   tracker: ReturnType<ActionKernel["journal"]["tracker"]["summary"]>;
   diagnostics: ReturnType<ActionKernel["journal"]["diagnostics"]["summary"]>;
@@ -55,6 +56,7 @@ export function buildOrchestratorContext(kernel: ActionKernel, runId: string): O
     delivery: kernel.journal.delivery.summaries(runId),
     reviews: kernel.journal.reviews.summaries(runId),
     commits: kernel.journal.commits.summaries(runId),
+    trackerCommits: kernel.journal.trackerCommits.summaries(runId),
     publications: kernel.journal.publications.summaries(runId),
     tracker: kernel.journal.tracker.summary(runId),
     diagnostics: kernel.journal.diagnostics.summary(runId),

@@ -27,6 +27,7 @@ import {
 } from "../domain/workspaces.js";
 import { digestJson } from "../domain/repository-policy.js";
 import type { CommitRecord } from "../domain/commits.js";
+import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
 
 const FILE_LIMIT = 64 * 1024 * 1024;
 const CHECKOUT_LIMIT = 512 * 1024 * 1024;
@@ -250,7 +251,7 @@ export class WorkspaceManager {
   /** New writable files at the retained private tip; never reset or amend an older assignment. */
   async createImplementationCopy(
     authority: ControllerAuthority,
-    commit: CommitRecord,
+    commit: CommitRecord | TrackerCommitRecord,
     creationOperationId: string,
     signal?: AbortSignal,
     sourceIdentity: WorkspaceIdentity = commit,
@@ -396,6 +397,255 @@ export class WorkspaceManager {
         "Trusted commit adapter awaited every Git process and filesystem operation",
       );
     }
+  }
+
+  /** Derive a tracker-only tree from committed custody, without touching any checkout or index. */
+  async writeTrackerCommit(
+    authority: ControllerAuthority,
+    input: TrackerCommitRecord,
+    signal?: AbortSignal,
+  ) {
+    const record = this.journal.trackerCommits.start(authority, input.trackerCommitId);
+    if (record.status !== "preparing")
+      throw new WorkspaceError("tracker_commit_dispatched", "Tracker commit write is one-use");
+    let succeeded = false;
+    try {
+      const workspace = await this.assertTrackerCustody(authority, record, signal);
+      const git = new KernelGit(workspace.path);
+      const parent = this.journal.publications.record(authority.runId, record.parentPublicationId);
+      const object = this.journal.publications.objectRecord(authority.runId, parent);
+      if (
+        (await git.text(["cat-file", "commit", record.parentRevision], optionalSignal(signal))) !==
+        object.objectContent
+      )
+        throw new WorkspaceError(
+          "tracker_parent_changed",
+          "Tracker parent differs from its retained publication object",
+        );
+      const entries = await this.treeEntries(git, record.parentRevision, signal);
+      const previous = entries.find((entry) => entry.path === ".beads/issues.jsonl");
+      if (previous && previous.mode !== "100644")
+        throw new WorkspaceError(
+          "tracker_path_changed",
+          "Tracker JSONL must be an ordinary non-executable file",
+        );
+      if (
+        entries.some(
+          (entry) => entry.path === ".beads" || entry.path.startsWith(".beads/issues.jsonl/"),
+        )
+      )
+        throw new WorkspaceError(
+          "tracker_path_changed",
+          "Tracker path collides with the committed tree",
+        );
+      const applicationTree = await this.writeTree(
+        git,
+        entries.filter((entry) => !trackerPath(entry.path)),
+        signal,
+      );
+      if (applicationTree !== record.applicationTree)
+        throw new WorkspaceError(
+          "tracker_application_changed",
+          "Tracker parent does not preserve the reviewed application tree",
+        );
+      const bytes = this.journal.tracker.exportBytes(authority.runId, record.exportOperationId);
+      this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
+      const blob = (
+        await git.text(["hash-object", "-w", "--no-filters", "--stdin"], {
+          input: bytes,
+          ...optionalSignal(signal),
+        })
+      ).trim();
+      const fullTree = await this.writeTree(
+        git,
+        [
+          ...entries.filter((entry) => entry.path !== ".beads/issues.jsonl"),
+          { path: ".beads/issues.jsonl", mode: "100644", objectId: blob },
+        ],
+        signal,
+      );
+      if (
+        fullTree ===
+        (
+          await git.text(["rev-parse", `${record.parentRevision}^{tree}`], optionalSignal(signal))
+        ).trim()
+      )
+        throw new WorkspaceError(
+          "tracker_unchanged",
+          "The delivery tree already contains this tracker export",
+        );
+      const seconds = Math.floor(Date.parse(record.createdAt) / 1000);
+      const objectContent = `tree ${fullTree}\nparent ${record.parentRevision}\nauthor Epicd <epicd@epicd.local> ${seconds} +0000\ncommitter Epicd <epicd@epicd.local> ${seconds} +0000\n\nchore: record Beads tracker state\n\nEpicd-Operation: ${record.operationId}\nEpicd-Tracker-Export: ${record.exportMetadata.sha256}\nEpicd-Reviewed-Application: ${record.applicationRevision}\n`;
+      const revision = (
+        await git.text(["hash-object", "-t", "commit", "--stdin"], {
+          input: objectContent,
+          ...optionalSignal(signal),
+        })
+      ).trim();
+      const original = this.journal.delivery.candidate(authority.runId, parent).snapshot!;
+      const manifest = [
+        ...original.manifest.filter((entry) => entry.path !== ".beads/issues.jsonl"),
+        {
+          path: ".beads/issues.jsonl",
+          mode: "100644" as const,
+          objectId: blob,
+          size: Buffer.byteLength(bytes),
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+        },
+      ].sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+      if ((await this.writeTree(git, manifest, signal)) !== fullTree)
+        throw new WorkspaceError(
+          "tracker_manifest_changed",
+          "Tracker-only tree contains changes outside the recorded export",
+        );
+      const snapshot = WorkspaceSnapshotSchema.parse({
+        schemaVersion: 1,
+        runId: authority.runId,
+        workspaceId: record.workspaceId,
+        workspaceGeneration: record.workspaceGeneration,
+        parentRevision: record.parentRevision,
+        fullTree,
+        applicationTree,
+        snapshotRevision: revision,
+        fingerprint: digestJson(manifest),
+        manifest,
+      });
+      this.journal.trackerCommits.prepareWrite(
+        authority,
+        record.trackerCommitId,
+        snapshot,
+        objectContent,
+      );
+      await this.assertTrackerCustody(authority, record, signal);
+      this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
+      if (
+        (
+          await git.text(["hash-object", "-w", "-t", "commit", "--stdin"], {
+            input: objectContent,
+            ...optionalSignal(signal),
+          })
+        ).trim() !== revision
+      )
+        throw new WorkspaceError(
+          "tracker_object_changed",
+          "Stored tracker object differs from its write intent",
+        );
+      this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
+      await git.text(
+        ["update-ref", `refs/epicd/tracker-commits/${record.trackerCommitId}`, revision, ""],
+        optionalSignal(signal),
+      );
+      succeeded = true;
+    } finally {
+      this.journal.agents.finishWorkspaceOperation(
+        authority,
+        record.workspaceOperationId,
+        succeeded ? "succeeded" : "failed",
+        "Trusted tracker-commit adapter awaited every filesystem and Git operation",
+      );
+    }
+  }
+
+  async inspectTrackerCommit(
+    authority: ControllerAuthority,
+    input: TrackerCommitRecord,
+    signal?: AbortSignal,
+  ) {
+    const record = this.journal.trackerCommits.record(authority.runId, input.trackerCommitId);
+    if (
+      !this.journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId)
+        .stopEvidence
+    )
+      throw new WorkspaceError(
+        "tracker_commit_io_unsettled",
+        "Independently prove tracker commit I/O stopped before inspection",
+      );
+    return this.exclusive(authority, record, "inspect_materialization", async () => {
+      const workspace = await this.assertTrackerCustody(authority, record, signal),
+        git = new KernelGit(workspace.path);
+      if (!record.revision)
+        return {
+          created: false,
+          sourceIntact: false,
+          detail: "No tracker commit write was admitted",
+        };
+      const ref = (
+        await git.text(
+          [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            `refs/epicd/tracker-commits/${record.trackerCommitId}`,
+          ],
+          { allowedExitCodes: [0, 1], ...optionalSignal(signal) },
+        )
+      ).trim();
+      if (ref && ref !== record.revision)
+        throw new WorkspaceError(
+          "tracker_commit_ref_changed",
+          "Tracker retention ref changed outside its intent",
+        );
+      const type = (
+        await git.text(["cat-file", "--batch-check"], {
+          input: `${record.revision}\n`,
+          ...optionalSignal(signal),
+        })
+      ).trim();
+      if (!ref && type === `${record.revision} missing`)
+        return {
+          created: false,
+          sourceIntact: false,
+          detail: "Tracker object and ref are absent after confirmed stop",
+        };
+      if (
+        type !== `${record.revision} commit ${Buffer.byteLength(record.objectContent!)}` ||
+        (await git.text(["cat-file", "commit", record.revision], optionalSignal(signal))) !==
+          record.objectContent
+      )
+        throw new WorkspaceError(
+          "tracker_commit_object_changed",
+          "Tracker object differs from its retained exact bytes",
+        );
+      return {
+        created: !!ref,
+        sourceIntact: !!ref,
+        detail: ref ? null : "Tracker object exists without its retention ref; preserve it",
+      };
+    });
+  }
+
+  private async assertTrackerCustody(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    signal?: AbortSignal,
+  ) {
+    const workspace = await this.owned(authority, identity),
+      git = new KernelGit(workspace.path);
+    this.assertStopped(workspace);
+    const repository = this.journal.publications.repository(authority.runId);
+    if (
+      workspace.purpose !== "delivery" ||
+      workspace.sourceMode !== "immutable" ||
+      repository?.workspace?.workspaceId !== workspace.workspaceId ||
+      repository.workspace.workspaceGeneration !== workspace.workspaceGeneration
+    )
+      throw new WorkspaceError(
+        "tracker_custody",
+        "Tracker objects require this run's canonical kernel-only custody",
+      );
+    await this.assertPrivateGit(git, signal);
+    if (
+      (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() !==
+        workspace.baselineRevision ||
+      digestJson(
+        (await this.scan(git, workspace.baselineRevision, signal)).map((file) => file.entry),
+      ) !== workspace.baselineFingerprint
+    )
+      throw new WorkspaceError(
+        "tracker_custody_changed",
+        "Canonical checkout changed; preserve it before tracker construction",
+      );
+    return workspace;
   }
 
   /** Read-only reconciliation after independently confirmed I/O stop, including the object/ref crash window. */
@@ -1013,7 +1263,7 @@ export class WorkspaceManager {
 
   private async writeTree(
     git: KernelGit,
-    manifest: ManifestEntry[],
+    manifest: TreeEntry[],
     signal?: AbortSignal,
   ): Promise<string> {
     const indexPath = join(git.path, ".git", `epicd-index-${randomUUID()}`);

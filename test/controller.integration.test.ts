@@ -224,6 +224,12 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       expectedGeneration: 0,
     },
     { kind: "reconcile_fixture_creation", creationId: "lost-read" },
+    { kind: "reconcile_tracker_commit", trackerCommitId: "00000000-0000-4000-8000-000000000001" },
+    {
+      kind: "request_tracker_commit",
+      trackerOperationId: "00000000-0000-4000-8000-000000000001",
+      publicationId: "00000000-0000-4000-8000-000000000002",
+    },
   ] satisfies KernelAction[])(
     "settles an interrupted $kind without an authorized external mutation",
     async (action) => {
@@ -237,7 +243,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       };
       const kernel = new ActionKernel(journal);
       kernel.registerExternal(action.kind, async () => {
-        throw new Error("Lost result before any fixture intent or provider I/O");
+        throw new Error("Lost result before any resource intent or external I/O");
       });
       const ticket = journal.beginDecision(
         authority,
@@ -267,6 +273,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       }).run();
       expect(journal.action(f.state.runId, pending.actionId)?.status).toBe("failed");
       expect(journal.fixtures.creations(f.state.runId)).toEqual([]);
+      expect(journal.trackerCommits.records(f.state.runId)).toEqual([]);
     },
   );
   it("pauses a live coordinator and waits for its supervised stop before releasing ownership", async () => {

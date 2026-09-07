@@ -28,6 +28,7 @@ import { RunStateSchema } from "../domain/types.js";
 import { digestJson } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { WorkspaceOperationSchema } from "../domain/workspaces.js";
+import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
 
 export const PUBLICATION_TABLES = ["delivery_repositories", "publications"] as const;
 export function createPublicationSchema(db: Database.Database) {
@@ -60,6 +61,9 @@ type Access = {
   reviews: ReviewJournal;
   commits: CommitJournal;
   assertTrackerIdle(runId: string): void;
+  assertTrackerCommitIdle(runId: string): void;
+  trackerCommit(runId: string, id: string): TrackerCommitRecord;
+  assertTrackerCommitParent(record: TrackerCommitRecord): void;
 };
 const fail = (code: string, message: string): never => {
   throw new DeliveryError(code, message);
@@ -94,16 +98,36 @@ export class PublicationJournal {
       if (
         !action ||
         action.status !== "running" ||
-        action.request.action.kind !== "request_publish" ||
+        !["request_publish", "request_publish_tracker"].includes(action.request.action.kind) ||
         control.status !== "active" ||
         action.policyDigest !== control.policyDigest
       )
         return fail("publication_action_stale", "Publication needs its current admitted action");
       const request = action.request.action;
-      const commit = this.access.commits.exact(authority.runId, request, request.revision);
+      if (request.kind !== "request_publish" && request.kind !== "request_publish_tracker")
+        return fail("publication_action", "Wrong publication action");
+      if (request.kind === "request_publish") this.access.assertTrackerCommitIdle(authority.runId);
+      const tracker =
+        request.kind === "request_publish_tracker"
+          ? this.access.trackerCommit(authority.runId, request.trackerCommitId)
+          : null;
+      if (tracker) {
+        this.access.assertTrackerCommitParent(tracker);
+        if (tracker.status !== "created" || !tracker.sourceIntact || !tracker.revision)
+          return fail(
+            "tracker_commit_unconfirmed",
+            "Publish only a physically confirmed tracker object",
+          );
+      }
+      const commit =
+        request.kind === "request_publish"
+          ? this.access.commits.exact(authority.runId, request, request.revision)
+          : this.access.commits.record(authority.runId, tracker!.applicationCommitId);
       if (this.access.commits.latestCreated(authority.runId)?.commitId !== commit.commitId)
         fail("publication_tip_stale", "Only the latest confirmed private commit can be published");
-      const review = this.access.reviews.approval(authority.runId, request, "exact_revision");
+      const review = tracker
+        ? this.record(authority.runId, tracker.parentPublicationId).reviewEvidenceId
+        : this.access.reviews.approval(authority.runId, commit, "exact_revision");
       if (!review)
         return fail(
           "publication_not_verified",
@@ -142,14 +166,15 @@ export class PublicationJournal {
           "publication_base_stale",
           "Expected previous revision must match the recorded published tip or frozen initial baseline",
         );
-      if (repository.publishedRevision === request.revision)
+      const revision = request.kind === "request_publish" ? request.revision : tracker!.revision!;
+      if (repository.publishedRevision === revision)
         fail(
           "publication_exists",
           "This revision already reached the delivery branch; inspect its recorded publication",
         );
       const operation = this.access.agents.beginWorkspaceOperation(
         authority,
-        commit,
+        tracker ?? commit,
         "publication",
         control.controlVersion,
       );
@@ -160,14 +185,21 @@ export class PublicationJournal {
         operationId: action.operationId,
         controllerLeaseId: authority.leaseId,
         commitId: commit.commitId,
+        provenance: tracker
+          ? {
+              kind: "tracker",
+              trackerCommitId: tracker.trackerCommitId,
+              reviewedRevision: tracker.applicationRevision,
+            }
+          : { kind: "application" },
         candidateId: commit.candidateId,
         candidateGeneration: commit.candidateGeneration,
-        workspaceId: commit.workspaceId,
-        workspaceGeneration: commit.workspaceGeneration,
+        workspaceId: (tracker ?? commit).workspaceId,
+        workspaceGeneration: (tracker ?? commit).workspaceGeneration,
         reviewEvidenceId: review,
         policyDigest: control.policyDigest,
         workspaceOperations: [operation.operationId],
-        revision: request.revision,
+        revision,
         expectedPreviousRevision: request.expectedPreviousRevision,
         publicRef: null,
         canonicalRef: null,
@@ -228,14 +260,21 @@ export class PublicationJournal {
         record.policyDigest !== control.policyDigest ||
         action?.status !== "running" ||
         this.access.commits.latestCreated(authority.runId)?.commitId !== record.commitId ||
-        this.access.reviews.approval(authority.runId, record, "exact_revision") !==
-          record.reviewEvidenceId
+        (record.provenance.kind === "application" &&
+          this.access.reviews.approval(authority.runId, record, "exact_revision") !==
+            record.reviewEvidenceId)
       )
         fail(
           "publication_stale",
           "Publication authority, current private tip or exact-SHA evidence changed",
         );
-      this.access.commits.exact(authority.runId, record, record.revision);
+      if (record.provenance.kind === "application")
+        this.access.commits.exact(authority.runId, record, record.revision);
+      else
+        this.access.assertTrackerCommitParent(
+          this.access.trackerCommit(authority.runId, record.provenance.trackerCommitId),
+        );
+      this.objectRecord(authority.runId, record);
       const source = this.access.agents.activeWorkspaceOperation(authority.runId, record);
       if (
         !source ||
@@ -293,18 +332,23 @@ export class PublicationJournal {
           digestJson(repository.canonicalRepository) !== digestJson(binding))
       )
         fail("publication_custody_changed", "Canonical delivery workspace identity changed");
-      const operation = this.access.agents.beginWorkspaceOperation(
-        authority,
-        workspace,
-        "publication",
-        this.access.control(authority.runId).controlVersion,
-      );
+      const sameSource =
+        workspace.workspaceId === record.workspaceId &&
+        workspace.workspaceGeneration === record.workspaceGeneration;
+      const operation = sameSource
+        ? null
+        : this.access.agents.beginWorkspaceOperation(
+            authority,
+            workspace,
+            "publication",
+            this.access.control(authority.runId).controlVersion,
+          );
       repository.workspace = {
         workspaceId: workspace.workspaceId,
         workspaceGeneration: workspace.workspaceGeneration,
       };
       repository.canonicalRepository = binding;
-      record.workspaceOperations.push(operation.operationId);
+      if (operation) record.workspaceOperations.push(operation.operationId);
       record.canonicalRef = PublicationRefIntentSchema.parse({
         schemaVersion: 1,
         publicationId,
@@ -464,7 +508,14 @@ export class PublicationJournal {
           ? [this.repository(authority.runId)!.workspace!]
           : []),
       ];
-      for (const identity of identities) {
+      for (const identity of identities.filter(
+        (entry, index, all) =>
+          all.findIndex(
+            (other) =>
+              other.workspaceId === entry.workspaceId &&
+              other.workspaceGeneration === entry.workspaceGeneration,
+          ) === index,
+      )) {
         const operation = this.access.agents.beginWorkspaceOperation(
           authority,
           identity,
@@ -619,6 +670,7 @@ export class PublicationJournal {
       .slice(-10)
       .map((record) => ({
         publicationId: record.publicationId,
+        provenance: record.provenance,
         revision: record.revision,
         outcome: record.outcome,
         ioStopped: record.ioStopped,
@@ -641,7 +693,78 @@ export class PublicationJournal {
       this.repository(runId)?.publishedRevision !== record.revision
     )
       return null;
+    this.objectRecord(runId, record);
     return this.access.reviews.approval(runId, record, "exact_revision");
+  }
+  /** Exact physical object plus a validated chain to its reviewed application ancestor. */
+  trackerDescendsFrom(runId: string, tipId: string, ancestorId: string): boolean {
+    let current = this.record(runId, tipId);
+    this.objectRecord(runId, current);
+    const seen = new Set<string>();
+    while (current.publicationId !== ancestorId) {
+      if (current.provenance.kind !== "tracker" || seen.has(current.publicationId)) return false;
+      seen.add(current.publicationId);
+      current = this.record(
+        runId,
+        this.access.trackerCommit(runId, current.provenance.trackerCommitId).parentPublicationId,
+      );
+    }
+    return current.outcome === "published" && current.ioStopped && !current.intervention;
+  }
+  objectRecord(runId: string, publication: PublicationRecord) {
+    const application = this.access.commits.record(runId, publication.commitId);
+    if (
+      application.status !== "created" ||
+      !application.sourceIntact ||
+      application.policyDigest !== publication.policyDigest ||
+      application.candidateId !== publication.candidateId ||
+      application.candidateGeneration !== publication.candidateGeneration
+    )
+      return fail("publication_ancestry", "Publication has no intact application commitment");
+    let current = publication;
+    const seen = new Set<string>();
+    while (current.provenance.kind === "tracker") {
+      if (seen.has(current.publicationId) || seen.size >= 1024)
+        return fail("publication_ancestry", "Invalid tracker ancestry");
+      seen.add(current.publicationId);
+      const tracker = this.access.trackerCommit(runId, current.provenance.trackerCommitId);
+      const parent = this.record(runId, tracker.parentPublicationId);
+      if (
+        tracker.status !== "created" ||
+        !tracker.sourceIntact ||
+        tracker.applicationCommitId !== application.commitId ||
+        tracker.applicationRevision !== application.revision ||
+        tracker.applicationTree !== application.applicationTree ||
+        tracker.revision !== current.revision ||
+        current.provenance.reviewedRevision !== application.revision ||
+        tracker.policyDigest !== publication.policyDigest ||
+        parent.outcome !== "published" ||
+        !parent.ioStopped ||
+        parent.intervention ||
+        parent.revision !== tracker.parentRevision ||
+        current.expectedPreviousRevision !== tracker.parentRevision ||
+        current.commitId !== parent.commitId ||
+        current.reviewEvidenceId !== parent.reviewEvidenceId ||
+        current.candidateId !== parent.candidateId ||
+        current.candidateGeneration !== parent.candidateGeneration ||
+        current.policyDigest !== parent.policyDigest ||
+        current.workspaceId !== tracker.workspaceId ||
+        current.workspaceGeneration !== tracker.workspaceGeneration
+      )
+        return fail(
+          "publication_ancestry",
+          "Tracker publication lost its exact application-only ancestry proof",
+        );
+      current = parent;
+    }
+    if (current.commitId !== application.commitId || current.revision !== application.revision)
+      return fail(
+        "publication_ancestry",
+        "Tracker ancestry does not end at the reviewed application object",
+      );
+    return publication.provenance.kind === "tracker"
+      ? this.access.trackerCommit(runId, publication.provenance.trackerCommitId)
+      : application;
   }
   run(runId: string) {
     const row = this.db.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as

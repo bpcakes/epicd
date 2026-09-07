@@ -168,6 +168,7 @@ export function observeEpicDelivery(
   journal: OrchestrationJournal,
   runId: string,
   activeTrackerOperationId?: string,
+  reviewedPublicationId?: string,
 ): EpicDeliveryTarget {
   const { scope, checks, context } = epicRequirements(journal, runId, activeTrackerOperationId);
   const repository = journal.publications.repository(runId);
@@ -176,25 +177,36 @@ export function observeEpicDelivery(
       "epic_not_published",
       "Epic review requires a published delivery revision in kernel custody",
     );
-  const publication = journal.publications.record(runId, repository.lastPublishedId);
-  const commit = journal.commits.record(runId, publication.commitId);
-  const captured = journal.delivery.candidate(runId, publication).snapshot;
+  const tip = journal.publications.record(runId, repository.lastPublishedId);
+  const publication = reviewedPublicationId
+    ? journal.publications.record(runId, reviewedPublicationId)
+    : tip;
+  if (
+    !journal.publications.trackerDescendsFrom(runId, tip.publicationId, publication.publicationId)
+  )
+    throw new DeliveryError(
+      "epic_ancestry_changed",
+      "Final review does not cover the current application lineage",
+    );
+  const commit = journal.publications.objectRecord(runId, publication);
+  const captured =
+    publication.provenance.kind === "tracker"
+      ? journal.trackerCommits.record(runId, publication.provenance.trackerCommitId).snapshot
+      : journal.delivery.candidate(runId, publication).snapshot;
   if (
     publication.outcome !== "published" ||
     !publication.ioStopped ||
     publication.policyDigest !== journal.control(runId).policyDigest ||
     commit.policyDigest !== publication.policyDigest ||
-    repository.publishedRevision !== publication.revision ||
-    repository.privateRevision !== publication.revision ||
-    journal.commits.latestCreated(runId)?.commitId !== commit.commitId ||
+    repository.publishedRevision !== tip.revision ||
+    repository.privateRevision !== tip.revision ||
+    journal.commits.latestCreated(runId)?.commitId !== tip.commitId ||
     commit.status !== "created" ||
     !commit.sourceIntact ||
     commit.revision !== publication.revision ||
-    commit.candidateId !== publication.candidateId ||
-    commit.candidateGeneration !== publication.candidateGeneration ||
     !captured ||
     captured.fullTree !== commit.fullTree ||
-    captured.fingerprint !== commit.fingerprint ||
+    captured.applicationTree !== commit.applicationTree ||
     captured.parentRevision !== commit.parentRevision ||
     journal.commits.records(runId).some((entry) => ["preparing", "writing"].includes(entry.status))
   )

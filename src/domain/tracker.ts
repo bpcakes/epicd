@@ -113,6 +113,7 @@ export const TrackerSnapshotSchema = z.strictObject({
   runId: z.string(),
   operationId: z.string().uuid(),
   digest: z.string().length(64),
+  rawScopeDigest: z.string().length(64),
   graph: TrackerGraphSchema,
 });
 export type TrackerSnapshot = z.infer<typeof TrackerSnapshotSchema>;

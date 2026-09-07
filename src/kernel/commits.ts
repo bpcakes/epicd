@@ -5,9 +5,11 @@ import { WorkspaceError, type WorkspaceManager } from "../adapters/workspaces.js
 import { KernelGitError } from "../adapters/kernel-git.js";
 import { DeliveryError } from "../adapters/delivery-journal.js";
 import { OperationFailed } from "./guards.js";
+import { registerTrackerCommitCapabilities } from "./tracker-commits.js";
 
 export function registerCommitCapabilities(kernel: ActionKernel, workspaces: WorkspaceManager) {
   const journal = kernel.journal;
+  registerTrackerCommitCapabilities(kernel, workspaces);
   kernel.registerExternal(
     "create_implementation_workspace",
     async ({ authority, record, signal }, action) => {

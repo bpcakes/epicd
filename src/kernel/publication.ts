@@ -28,20 +28,21 @@ export function registerPublicationCapabilities(
       artifactIds: [],
     };
   });
-  kernel.registerExternal("request_publish", async ({ authority, record, signal }) => {
-    const intent = journal.publications.reserve(authority, record.actionId);
-    await adapter.publish(authority, intent.publicationId, signal);
-    const settled = await adapter.reconcile(authority, intent.publicationId);
-    if (settled.outcome !== "published")
-      throw new OperationFailed(
-        `Publication ${settled.publicationId}: ${settled.failure ?? settled.outcome}`,
-      );
-    return {
-      kind: "resource",
-      resourceId: settled.publicationId,
-      generation: settled.candidateGeneration,
-    };
-  });
+  for (const kind of ["request_publish", "request_publish_tracker"] as const)
+    kernel.registerExternal(kind, async ({ authority, record, signal }) => {
+      const intent = journal.publications.reserve(authority, record.actionId);
+      await adapter.publish(authority, intent.publicationId, signal);
+      const settled = await adapter.reconcile(authority, intent.publicationId);
+      if (settled.outcome !== "published")
+        throw new OperationFailed(
+          `Publication ${settled.publicationId}: ${settled.failure ?? settled.outcome}`,
+        );
+      return {
+        kind: "resource",
+        resourceId: settled.publicationId,
+        generation: settled.candidateGeneration,
+      };
+    });
   kernel.registerExternal("reconcile_publication", async ({ authority }, action) => {
     const settled = await reconcilePublication(kernel, adapter, authority, action.publicationId);
     return {

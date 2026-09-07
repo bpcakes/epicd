@@ -129,6 +129,7 @@ type Access = {
   policy(runId: string): RepositoryPolicy;
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
   publicationPending(runId: string): import("../domain/publication.js").PublicationRecord | null;
+  assertTrackerCommitIdle(runId: string): void;
   deliveryRepository(runId: string): import("../domain/publication.js").DeliveryRepository | null;
   assertTaskOwned(
     runId: string,
@@ -319,6 +320,12 @@ export class AgentJournal {
       if (kind !== "inspect_materialization") this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, identity);
       const publication = this.access.publicationPending(authority.runId);
+      if (
+        workspace.purpose !== "coordinator" &&
+        kind !== "inspect_materialization" &&
+        kind !== "publication"
+      )
+        this.access.assertTrackerCommitIdle(authority.runId);
       if (
         publication &&
         kind !== "inspect_materialization" &&
@@ -525,6 +532,7 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       const control = this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, input);
+      if (input.purpose !== "coordination") this.access.assertTrackerCommitIdle(authority.runId);
       // Final review is admitted by the evidence-bound review capability after task closure.
       // Its epic root is not an implementation task and must not acquire a fabricated claim.
       const epicRepair =
@@ -890,6 +898,8 @@ export class AgentJournal {
           "publication_unsettled",
           "Publication excludes new worker turns",
         );
+      if (assignment.purpose !== "coordination")
+        this.access.assertTrackerCommitIdle(authority.runId);
       const available =
         (agent.status === "ready" && agent.provider !== null) ||
         (agent.status === "reserved" && agent.provider === null);
