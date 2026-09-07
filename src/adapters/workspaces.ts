@@ -285,7 +285,7 @@ export class WorkspaceManager {
     if (
       !operation ||
       operation.operationId !== operationId ||
-      operation.kind !== "validation" ||
+      !["validation", "review_inspection"].includes(operation.kind) ||
       operation.controllerLeaseId !== authority.leaseId ||
       workspace.sourceMode !== "immutable" ||
       workspace.activeTurnId ||

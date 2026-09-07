@@ -77,6 +77,19 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("inspect_candidate"), ...CandidateTarget }),
   z.strictObject({ kind: z.literal("inspect_validation_plan"), validationPlanId: Id }),
   z.strictObject({ kind: z.literal("inspect_evidence"), evidenceId: Id }),
+  z.strictObject({ kind: z.literal("inspect_review"), evidenceId: Id }),
+  z.strictObject({
+    kind: z.literal("read_review"),
+    evidenceId: Id,
+    offset: Version,
+    limit: z.number().int().min(1).max(8000),
+  }),
+  z.strictObject({
+    kind: z.literal("inspect_findings"),
+    taskId: Id,
+    offset: Version,
+    limit: z.number().int().positive().max(100),
+  }),
   z.strictObject({
     kind: z.literal("inspect_repo"),
     ...WorkspaceTarget,
@@ -169,6 +182,13 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
     ...CandidateTarget,
     validationPlanId: Id,
     checkId: Id,
+  }),
+  z.strictObject({
+    kind: z.literal("run_review"),
+    ...CandidateTarget,
+    ...WorkspaceTarget,
+    agent: z.strictObject(AgentTarget).nullable(),
+    instructions: z.string().min(1).max(8000),
   }),
   z.strictObject({
     kind: z.literal("request_commit"),

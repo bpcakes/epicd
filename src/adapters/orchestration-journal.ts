@@ -38,8 +38,9 @@ import {
   DELIVERY_TABLES,
   migrateDelivery,
 } from "./delivery-journal.js";
+import { ReviewJournal, REVIEW_TABLES, migrateReviews } from "./review-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 7;
+export const ORCHESTRATION_SCHEMA_VERSION = 8;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -51,6 +52,7 @@ export const ORCHESTRATION_TABLES = [
   ...DECISION_SOURCE_TABLES,
   ...AGENT_TABLES,
   ...DELIVERY_TABLES,
+  ...REVIEW_TABLES,
 ] as const;
 
 /** Called inside StateStore's single forward-migration transaction. */
@@ -111,6 +113,7 @@ export function migrateOrchestration(db: Database.Database): void {
   `);
   migrateAgents(db);
   migrateDelivery(db);
+  migrateReviews(db);
   migrateDecisionSource(db);
 }
 
@@ -166,6 +169,7 @@ export class MemoryReferenceError extends Error {
 export class OrchestrationJournal {
   readonly agents: AgentJournal;
   readonly delivery: DeliveryJournal;
+  readonly reviews: ReviewJournal;
   readonly decisionSource: DecisionJournal;
 
   constructor(private readonly db: Database.Database) {
@@ -189,6 +193,15 @@ export class OrchestrationJournal {
       action: (runId, actionId) => this.action(runId, actionId),
       observe: (authority, input) => this.appendObservation(authority, input),
       agents: this.agents,
+      reviewChecks: (runId, taskId) => this.reviews.requiredChecks(runId, taskId),
+    });
+    this.reviews = new ReviewJournal(db, {
+      transaction: (authority, body) => this.transaction(authority, body),
+      control: (runId) => this.control(runId),
+      action: (runId, actionId) => this.action(runId, actionId),
+      observe: (authority, input) => this.appendObservation(authority, input),
+      agents: this.agents,
+      delivery: this.delivery,
     });
   }
 
@@ -671,10 +684,16 @@ export class OrchestrationJournal {
           throw new MemoryReferenceError("Memory cites an observation outside this run");
       for (const id of entry.evidenceIds) {
         try {
-          const evidence = this.delivery.evidence(authority.runId, id);
+          let evidence;
+          try {
+            evidence = this.delivery.evidence(authority.runId, id);
+          } catch (error) {
+            if (!(error instanceof DeliveryError)) throw error;
+            evidence = this.reviews.evidence(authority.runId, id);
+          }
           if (entry.confidence === "observed" && evidence.status !== "finished")
             throw new MemoryReferenceError(
-              "Observed memory cannot cite an unfinished validation intent as an outcome",
+              "Observed memory cannot cite an unfinished evidence intent as an outcome",
             );
         } catch (error) {
           if (error instanceof DeliveryError)

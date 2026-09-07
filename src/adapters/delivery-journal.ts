@@ -97,6 +97,7 @@ type Access = {
   action(runId: string, actionId: string): ActionRecord | null;
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
   agents: AgentJournal;
+  reviewChecks(runId: string, taskId: string): z.infer<typeof RequiredCheckSchema>[];
 };
 export class DeliveryError extends Error {
   constructor(
@@ -130,7 +131,23 @@ export class DeliveryJournal {
       const checks = action.checks.map((check) => RequiredCheckSchema.parse(check));
       if (new Set(checks.map((check) => check.id)).size !== checks.length)
         throw new DeliveryError("duplicate_check", "Validation check IDs must be unique");
-      for (const required of policy.requiredChecks) {
+      const requirements = new Map<string, z.infer<typeof RequiredCheckSchema>>();
+      for (const required of [
+        ...policy.requiredChecks,
+        ...this.access.reviewChecks(authority.runId, action.taskId),
+      ]) {
+        const previous = requirements.get(required.id);
+        if (previous && digestJson({ ...previous, stage: required.stage }) !== digestJson(required))
+          throw new DeliveryError(
+            "review_check_conflict",
+            `A different required command needs a new check ID: ${required.id}`,
+          );
+        requirements.set(
+          required.id,
+          previous && previous.stage !== required.stage ? { ...required, stage: "both" } : required,
+        );
+      }
+      for (const required of requirements.values()) {
         const index = checks.findIndex((check) => check.id === required.id);
         if (index < 0) checks.push(required);
         else {
@@ -698,6 +715,24 @@ export class DeliveryJournal {
       })),
       approvalWarning:
         "Validation facts are not independent review approval or exact-commit verification",
+    };
+  }
+  preCommitEvidence(runId: string, identity: CandidateIdentity) {
+    const candidate = this.candidate(runId, identity);
+    const checks = this.plan(runId, candidate.validationPlanId).checks.filter(
+      (check) => check.stage !== "exact_revision",
+    );
+    const records = this.all(
+      ValidationEvidenceSchema,
+      "SELECT record_json FROM validation_evidence WHERE run_id = ? AND candidate_id = ? ORDER BY rowid",
+      [runId, candidate.candidateId],
+    );
+    const evidence = records.filter((record) => this.satisfiesCheck(runId, record.evidenceId));
+    return {
+      evidence,
+      missingCheckIds: checks
+        .filter((check) => !evidence.some((record) => record.checkId === check.id))
+        .map((check) => check.id),
     };
   }
   private latestSourceTurn(runId: string, assignmentId: string): string | null {

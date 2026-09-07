@@ -336,7 +336,7 @@ describe("durable agent coordination", () => {
     ).toBeNull();
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 7 });
+    ).toEqual({ version: 8 });
     expect(
       setup.db
         .prepare("SELECT name FROM sqlite_master WHERE name = 'one_turn_native_terminal'")
@@ -934,9 +934,44 @@ describe("durable agent coordination", () => {
     expect(setup.agents.instances(setup.authority.runId)).toEqual([]);
   });
 
+  it("snapshots schema seven before adding reviews and preserves legacy prompt hashes", () => {
+    const setup = fixture();
+    const turn = setup.submit(setup.ready());
+    expect(turn.prompt).not.toHaveProperty("reviewContext");
+    setup.db.exec(
+      "DROP TABLE review_findings; DROP TABLE review_evidence; UPDATE orchestration_schema SET version = 7",
+    );
+    const original = setup.db
+      .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
+      .get(turn.identity.turnId);
+    const upgraded = new StateStore(setup.path);
+    stores.push(upgraded);
+    expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
+    expect(
+      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 8 });
+    expect(
+      setup.db
+        .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
+        .get(turn.identity.turnId),
+    ).toEqual(original);
+    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
+    const snapshot = new Database(join(setup.root, backup), { readonly: true });
+    databases.push(snapshot);
+    expect(
+      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 7 });
+    expect(
+      snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'review_evidence'").get(),
+    ).toBeUndefined();
+    expect(setup.db.pragma("foreign_key_check")).toEqual([]);
+  });
+
   it("snapshots schema-one databases before adding the durable agent tables", () => {
     const setup = fixture();
     for (const table of [
+      "review_findings",
+      "review_evidence",
       "validation_evidence",
       "candidate_workspaces",
       "candidates",
@@ -956,7 +991,7 @@ describe("durable agent coordination", () => {
     stores.push(upgraded);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 7 });
+    ).toEqual({ version: 8 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
     expect(backup).toBeDefined();
     const snapshot = new Database(join(setup.root, backup!), { readonly: true });
@@ -981,7 +1016,7 @@ describe("durable agent coordination", () => {
     const turn = setup.submit(agent);
     const original = setup.agents.instance(setup.authority.runId, agent);
     setup.db.exec(
-      "DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP TABLE workspace_operations; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (2)",
+      "DROP TABLE review_findings; DROP TABLE review_evidence; DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP TABLE workspace_operations; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (2)",
     );
     const upgraded = new StateStore(setup.path);
     stores.push(upgraded);
@@ -989,7 +1024,7 @@ describe("durable agent coordination", () => {
     expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 7 });
+    ).toEqual({ version: 8 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
     const snapshot = new Database(join(setup.root, backup), { readonly: true });
     databases.push(snapshot);

@@ -29,6 +29,12 @@ export function registerAgentCapabilities(
   const agents = kernel.journal.agents;
   const run = async (context: ActionContext, agent: AgentIdentity, instructions: string) => {
     const instance = agents.instance(context.authority.runId, agent);
+    const assignment = agents.assignment(context.authority.runId, instance.assignmentId);
+    if (["review", "verification", "final_review"].includes(assignment.purpose))
+      throw new CapabilityRejected(
+        "review_capability_required",
+        "Use run_review for candidate-bound independent evidence; exact-commit review is not wired yet",
+      );
     if (instance.role === "orchestrator")
       throw new CapabilityRejected(
         "coordinator_owned",
@@ -58,6 +64,11 @@ export function registerAgentCapabilities(
     };
   };
   kernel.registerExternal("start_agent", async (context, action) => {
+    if (["review", "verification", "final_review"].includes(action.purpose))
+      throw new CapabilityRejected(
+        "review_capability_required",
+        "Use run_review to start independent candidate review",
+      );
     const contract = contractFor(action.role);
     if (contract.runtime !== driver.kind)
       throw new CapabilityRejected(

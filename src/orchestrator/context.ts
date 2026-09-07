@@ -17,6 +17,7 @@ export type OrchestratorContext = {
   capabilities: ReturnType<ActionKernel["capabilities"]>;
   agents: ReturnType<ActionKernel["journal"]["agents"]["summaries"]>;
   delivery: ReturnType<ActionKernel["journal"]["delivery"]["summaries"]>;
+  reviews: ReturnType<ActionKernel["journal"]["reviews"]["summaries"]>;
   constraints: string[];
   policy: Pick<RepositoryPolicy, "coordinator" | "budgets" | "writableScratch"> & {
     requiredCheckIds: string[];
@@ -38,6 +39,7 @@ export function buildOrchestratorContext(kernel: ActionKernel, runId: string): O
     capabilities: kernel.capabilities(),
     agents: kernel.journal.agents.summaries(runId),
     delivery: kernel.journal.delivery.summaries(runId),
+    reviews: kernel.journal.reviews.summaries(runId),
     policy: {
       coordinator: policy.coordinator,
       budgets: policy.budgets,

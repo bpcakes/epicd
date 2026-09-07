@@ -347,7 +347,7 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
     const db = new Database(setup.path);
     try {
       db.exec(
-        "DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP INDEX workspace_creation_operation; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema VALUES (3)",
+        "DROP TABLE review_findings; DROP TABLE review_evidence; DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP INDEX workspace_creation_operation; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema VALUES (3)",
       );
       db.exec(
         "UPDATE workspaces SET record_json = json_remove(record_json, '$.creationOperationId')",
@@ -381,7 +381,7 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
         backup.close();
       }
       expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 7,
+        version: 8,
       });
       expect(db.pragma("foreign_key_check")).toEqual([]);
     } finally {

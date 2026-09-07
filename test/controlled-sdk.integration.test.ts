@@ -424,7 +424,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       );
       setup.reopen();
       expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 7,
+        version: 8,
       });
       const backup = (await readdir(setup.root)).find((name) =>
         name.includes("before-orchestration"),

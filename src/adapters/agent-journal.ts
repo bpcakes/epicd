@@ -767,6 +767,7 @@ export class AgentJournal {
     instructions: string,
     outputSchema: unknown,
     expectedControlVersion: number,
+    reviewContext?: JsonValue,
   ): TurnRecord {
     return this.access.transaction(authority, () => {
       const previous = this.all(
@@ -785,7 +786,8 @@ export class AgentJournal {
               instructions,
               previous.prompt.assignment.purpose === "coordination" ? 98304 : 16000,
             ) ||
-          digestJson(previous.outputSchema) !== digestJson(z.json().parse(outputSchema))
+          digestJson(previous.outputSchema) !== digestJson(z.json().parse(outputSchema)) ||
+          digestJson(previous.prompt.reviewContext ?? null) !== digestJson(reviewContext ?? null)
         )
           throw new AgentCoordinationError(
             "turn_replay_mismatch",
@@ -812,6 +814,11 @@ export class AgentJournal {
         );
       const active = this.turns(authority.runId).filter((turn) => !terminal(turn));
       const assignment = this.assignment(authority.runId, agent.assignmentId);
+      if (reviewContext !== undefined && assignment.purpose !== "review")
+        throw new AgentCoordinationError(
+          "review_context_role",
+          "Only an independent review turn may carry review context",
+        );
       const workers = active.filter(
         (turn) => this.instance(authority.runId, turn.identity).role !== "orchestrator",
       );
@@ -856,6 +863,9 @@ export class AgentJournal {
           messageId: message.messageId,
           content: message.content,
         })),
+        ...(reviewContext === undefined
+          ? {}
+          : { reviewContext: JsonValueSchema.parse(reviewContext) }),
       };
       if (
         Buffer.byteLength(JSON.stringify(prompt)) > (agent.role === "orchestrator" ? 131072 : 65536)

@@ -110,6 +110,9 @@ export const TurnPromptSchema = z.strictObject({
   // retain their smaller limit in AgentJournal, including during replay.
   instructions: z.string().min(1).max(98304),
   messages: z.array(z.strictObject({ messageId: Id, content: Text })).max(100),
+  // Kernel-supplied review facts, covered by the complete prompt digest. Optional
+  // preserves hashes of historical prompts rather than inserting a new default.
+  reviewContext: z.json().optional(),
 });
 export const TurnRecordSchema = z.strictObject({
   identity: TurnIdentitySchema,
