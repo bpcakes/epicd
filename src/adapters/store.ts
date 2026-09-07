@@ -244,16 +244,21 @@ export class StateStore {
   readonly orchestration: OrchestrationJournal;
   private readonly fileIdentity: StateFileIdentity;
 
-  constructor(path = defaultStatePath()) {
+  constructor(path = defaultStatePath(), expectedFile?: StateFileIdentity) {
     this.path = path;
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new Database(path, { timeout: 5_000 });
+    if (expectedFile) {
+      if (JSON.stringify(this.currentStorageIdentity()) !== JSON.stringify(expectedFile))
+        throw new Error("State file differs from the trusted worker's recorded identity");
+    } else mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    this.db = new Database(path, { timeout: 5_000, fileMustExist: expectedFile !== undefined });
     this.orchestration = new OrchestrationJournal(this.db, () => {
       this.storageIdentity();
     });
     try {
       this.fileIdentity = this.currentStorageIdentity();
-      this.initialize();
+      if (expectedFile && JSON.stringify(this.fileIdentity) !== JSON.stringify(expectedFile))
+        throw new Error("State file changed before trusted worker attachment");
+      this.initialize(expectedFile === undefined);
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
       this.db.pragma("foreign_keys = ON");
@@ -282,7 +287,7 @@ export class StateStore {
   }
 
   /** Hard cut: initialize empty storage or reopen this exact format. Never migrate existing data. */
-  private initialize(): void {
+  private initialize(allowEmpty: boolean): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const tables = this.db
@@ -301,6 +306,7 @@ export class StateStore {
         this.db.exec("COMMIT");
         return;
       }
+      if (!allowEmpty) throw new Error("Trusted workers cannot initialize empty state storage");
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,

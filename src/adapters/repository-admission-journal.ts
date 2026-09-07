@@ -3,7 +3,11 @@ import type Database from "better-sqlite3";
 import type { ControllerAuthority } from "../domain/orchestration.js";
 import {
   RepositoryAdmissionSchema,
+  RepositoryIOStopSchema,
+  repositoryIOBinding,
   type RepositoryAdmission,
+  type RepositoryIOStop,
+  type StateFileIdentity,
 } from "../domain/repository-admission.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
@@ -67,7 +71,11 @@ export class RepositoryAdmissionJournal {
     });
   }
 
-  begin(authority: ControllerAuthority, phase: "acquiring" | "releasing") {
+  begin(
+    authority: ControllerAuthority,
+    phase: "acquiring" | "releasing",
+    ioDirectory: StateFileIdentity,
+  ) {
     return this.transaction(authority, () => {
       const record = this.required(authority.runId);
       if (!record.ioStopped || record.phase !== (phase === "acquiring" ? "reserved" : "owned"))
@@ -80,6 +88,8 @@ export class RepositoryAdmissionJournal {
       record.ioStopped = false;
       record.controllerLeaseId = authority.leaseId;
       record.ioId = randomUUID();
+      record.ioDirectory = ioDirectory;
+      record.ioReceipt = null;
       record.detail = null;
       return this.save(authority, "io_started", record);
     });
@@ -97,16 +107,20 @@ export class RepositoryAdmissionJournal {
       throw new Error("Repository I/O dispatch no longer owns its exact intent");
   }
 
-  stopped(authority: ControllerAuthority, ioId: string) {
+  /** The adapter validates the private physical receipt; this transaction binds it to the original intent. */
+  stopped(authority: ControllerAuthority, input: RepositoryIOStop) {
     return this.transaction(authority, () => {
       const record = this.required(authority.runId);
+      const receipt = RepositoryIOStopSchema.parse(input);
       if (
-        record.ioId !== ioId ||
-        record.controllerLeaseId !== authority.leaseId ||
-        !["acquiring", "releasing"].includes(record.phase)
+        record.ioId !== receipt.ioId ||
+        record.controllerLeaseId !== receipt.controllerLeaseId ||
+        record.phase !== receipt.operation ||
+        repositoryIOBinding(record) !== receipt.bindingDigest
       )
-        throw new Error("Only the original controller may attest its exact repository I/O stop");
+        throw new Error("Repository stop receipt differs from its exact admitted intent");
       record.ioStopped = true;
+      record.ioReceipt = receipt;
       return this.save(authority, "io_stopped", record);
     });
   }
@@ -155,7 +169,7 @@ export class RepositoryAdmissionJournal {
       source: "repository-kernel",
       sourceEventId: randomUUID(),
       kind: `repository_admission.${event}`,
-      summary: `Repository reservation ${record.reservationId}: ${record.phase}; I/O stopped: ${record.ioStopped}`,
+      summary: `Repository reservation ${record.reservationId}: ${record.phase}; I/O stopped: ${record.ioStopped}. ${JSON.stringify({ ioId: record.ioId, controllerLeaseId: record.controllerLeaseId, directory: record.ioDirectory, receipt: record.ioReceipt })}`,
       identity: null,
       artifactIds: [],
       wakesOrchestrator: false,

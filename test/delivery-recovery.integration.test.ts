@@ -10,6 +10,7 @@ import { reconcileActions } from "../src/kernel/reconcile.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
 import { OrchestratorController, controlledDriver } from "../src/controller.js";
+import { runRepositoryIO } from "../dist/adapters/repository-io.js";
 import { closureFixture } from "./fixtures/tracker-closure.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
 import { fixture, check, git, success, target, waitFor } from "./fixtures/review.js";
@@ -458,6 +459,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     const store = s.reopen();
     let decisions = 0;
     const controller = new OrchestratorController(store, run, {
+      repositoryIO: runRepositoryIO,
       driver: (selected, state) => {
         const actual = controlledDriver(selected, state);
         return {

@@ -43,6 +43,7 @@ import { OrchestratorLoop } from "./orchestrator/loop.js";
 import { runStatusView } from "./status.js";
 import { redactSensitiveText } from "./util/redact.js";
 import { RepositoryAdmission } from "./kernel/repository-admission.js";
+import type { runRepositoryIO } from "./adapters/repository-io.js";
 
 export function agentContract(state: RunState, role: AgentRole) {
   const settings = resolveAgentRoleSettings(state, role);
@@ -83,6 +84,7 @@ export class OrchestratorController {
     private readonly options: {
       driver?: (store: StateStore, state: RunState) => ControlledAgentDriver;
       drainTimeoutMs?: number;
+      repositoryIO?: typeof runRepositoryIO;
     } = {},
   ) {}
 
@@ -115,7 +117,13 @@ export class OrchestratorController {
         throw new Error(
           "Repository metadata identity changed; the recorded run cannot attach to this checkout",
         );
-      repositoryAdmission = new RepositoryAdmission(this.store, authority, currentRepository);
+      repositoryAdmission = new RepositoryAdmission(
+        this.store,
+        authority,
+        currentRepository,
+        undefined,
+        this.options.repositoryIO,
+      );
       await repositoryAdmission.enter(signal);
       if (journal.control(this.runId).status === "complete") return this.status();
       const admission = repositoryAdmission;

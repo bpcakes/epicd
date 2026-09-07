@@ -15,6 +15,7 @@ import { registerTrackerCapabilities, reconcileTracker } from "../src/kernel/tra
 import { OrchestratorLoop, type DecisionSource } from "../src/orchestrator/loop.js";
 import { reconcileActions } from "../src/kernel/reconcile.js";
 import { RepositoryAdmission } from "../src/kernel/repository-admission.js";
+import { runRepositoryIO } from "../dist/adapters/repository-io.js";
 import { PublicationGit, RUN_OWNERSHIP_REF } from "../src/adapters/publication-git.js";
 import { OrchestratorController } from "../src/controller.js";
 
@@ -93,6 +94,8 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
       s.store,
       s.authority,
       await new PublicationGit().bind(s.source),
+      undefined,
+      runRepositoryIO,
     );
     await admission.enter();
     await deliverTask(s);
@@ -138,6 +141,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     s.store.releaseLease(run, s.authority.ownerToken);
     const reopened = s.reopen();
     const controller = new OrchestratorController(reopened, run, {
+      repositoryIO: runRepositoryIO,
       driver: () => {
         throw new Error("Completed-run cleanup must not initialize a model");
       },

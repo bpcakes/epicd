@@ -8,6 +8,7 @@ import { StateStore } from "../src/adapters/store.js";
 import { PublicationGit, RUN_OWNERSHIP_REF } from "../src/adapters/publication-git.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { RepositoryAdmission } from "../src/kernel/repository-admission.js";
+import { runRepositoryIO } from "../dist/adapters/repository-io.js";
 import { handoffRuntime } from "../src/bootstrap.js";
 import * as codexSettings from "../src/adapters/codex-settings.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
@@ -75,7 +76,13 @@ async function fixture() {
   const lease = store.acquireLease(state.runId);
   let authority = { runId: state.runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
   const journal = store.orchestration;
-  const admission = new RepositoryAdmission(store, authority, repository);
+  const admission = new RepositoryAdmission(
+    store,
+    authority,
+    repository,
+    undefined,
+    runRepositoryIO,
+  );
   await admission.enter();
   const manager = new WorkspaceManager(journal, state.runtimeConfiguration!.workspaceRoot);
   const workspace = await manager.create(authority, repo, state.epicBaseRevision, "coordinator");
@@ -315,7 +322,10 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
       const record = f.journal.repositoryAdmission.record(run)!;
       f.db
         .prepare("UPDATE repository_admissions SET record_json = ? WHERE run_id = ?")
-        .run(JSON.stringify({ ...record, phase: "acquiring", ioStopped: false }), run);
+        .run(
+          JSON.stringify({ ...record, phase: "acquiring", ioStopped: false, ioReceipt: null }),
+          run,
+        );
     }
     if (reason === "unsettled_decision") {
       const context = buildOrchestratorContext(new ActionKernel(f.journal), run);

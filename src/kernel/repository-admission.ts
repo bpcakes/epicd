@@ -8,6 +8,11 @@ import {
 } from "../domain/repository-admission.js";
 import { digestJson } from "../domain/repository-policy.js";
 import type { PublicationRepository } from "../domain/publication.js";
+import {
+  prepareRepositoryIO,
+  recoverRepositoryIO,
+  runRepositoryIO,
+} from "../adapters/repository-io.js";
 
 /** Admission is a kernel prerequisite, not delivery strategy or an agent capability. */
 export class RepositoryAdmission {
@@ -16,6 +21,7 @@ export class RepositoryAdmission {
     private readonly authority: ControllerAuthority,
     private readonly repository: PublicationRepository,
     private readonly git = new PublicationGit("run"),
+    private readonly executeIO = runRepositoryIO,
   ) {}
   private get journal() {
     return this.store.orchestration;
@@ -59,6 +65,8 @@ export class RepositoryAdmission {
           ioStopped: true,
           controllerLeaseId: this.authority.leaseId,
           ioId: null,
+          ioDirectory: null,
+          ioReceipt: null,
           detail: null,
           createdAt: at,
           updatedAt: at,
@@ -66,6 +74,7 @@ export class RepositoryAdmission {
       );
     }
     this.assertIdentity(record);
+    if (!record.ioStopped) record = await this.recover(record);
     if (!record.ioStopped)
       throw new Error(
         "Repository admission I/O has no independent stop proof; preserve the reservation and do not repeat it",
@@ -83,22 +92,7 @@ export class RepositoryAdmission {
       throw new Error(
         `Another run owns this repository, possibly through another state file or linked checkout; inspect ${RUN_OWNERSHIP_REF} for its recorded run and state location, then resume the owning run. Do not delete its reservation to bypass ownership.`,
       );
-    const intent = this.records.begin(this.authority, "acquiring");
-    try {
-      await this.git.acquireLock(
-        this.repository,
-        intent.revision,
-        intent.objectContent,
-        async () => {
-          this.assertIdentity(intent);
-          this.records.assertIO(this.authority, intent.ioId!, "acquiring");
-        },
-        signal ?? new AbortController().signal,
-      );
-    } finally {
-      // KernelGit awaits process closure and its prepared-ref guard. A lost lease cannot attest it.
-      this.records.stopped(this.authority, intent.ioId!);
-    }
+    await this.execute(record, "acquiring", signal);
     const settled = await this.inspectStopped(this.records.record(this.authority.runId)!, signal);
     if (settled.phase !== "owned")
       throw new Error("Repository acquisition did not establish ownership");
@@ -136,31 +130,44 @@ export class RepositoryAdmission {
     let record = this.records.record(this.authority.runId);
     if (!record || record.phase === "released") return;
     this.assertIdentity(record);
+    if (!record.ioStopped) record = await this.recover(record);
     if (!record.ioStopped) throw new Error("Repository release cannot infer old I/O stop");
     if (record.phase === "releasing") record = await this.inspectStopped(record, signal);
     if (record.phase === "released") return;
     if (record.phase !== "owned")
       throw new Error("Unsettled repository reservation cannot be released");
     await this.assertOwned(signal);
-    const intent = this.records.begin(this.authority, "releasing");
-    try {
-      await this.git.releaseLock(
-        this.repository,
-        intent.revision,
-        async () => {
-          this.assertIdentity(intent);
-          this.records.assertIO(this.authority, intent.ioId!, "releasing");
-          if (this.journal.control(this.authority.runId).status !== "complete")
-            throw new Error("Run completion changed before ownership release");
-        },
-        signal ?? new AbortController().signal,
-      );
-    } finally {
-      this.records.stopped(this.authority, intent.ioId!);
-    }
+    await this.execute(record, "releasing", signal);
     record = await this.inspectStopped(this.records.record(this.authority.runId)!, signal);
     if (record.phase !== "released")
       throw new Error("Repository release remains incomplete; preserve its intent");
+  }
+
+  private async execute(
+    record: AdmissionRecord,
+    phase: "acquiring" | "releasing",
+    signal?: AbortSignal,
+  ) {
+    const directory = await prepareRepositoryIO(record);
+    this.assertIdentity(record);
+    const intent = this.records.begin(this.authority, phase, directory);
+    const receipt = await this.executeIO(intent, this.authority, signal);
+    this.records.stopped(this.authority, receipt);
+    if (receipt.kind !== "stopped" || receipt.code !== 0 || receipt.interrupted)
+      throw new Error(
+        receipt.detail ??
+          `Repository I/O stopped without a successful acknowledgement (${receipt.kind}, code ${receipt.code}, interrupted ${receipt.interrupted}); reconcile its physical outcome`,
+      );
+  }
+
+  private async recover(record: AdmissionRecord) {
+    this.journal.assertAuthority(this.authority);
+    // Only lease replacement may defeat an unused dispatch. Otherwise a concurrent call
+    // could prevent the active controller's about-to-start worker.
+    if (record.controllerLeaseId === this.authority.leaseId) return record;
+    const receipt = await recoverRepositoryIO(record);
+    this.assertIdentity(record);
+    return receipt ? this.records.stopped(this.authority, receipt) : record;
   }
 
   private async inspectStopped(record: AdmissionRecord, signal?: AbortSignal) {

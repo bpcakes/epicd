@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 26. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 27. Use a fresh state path; unsupported existing data is left intact.
 
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
@@ -55,7 +55,15 @@ Export alone does not commit, publish, close an issue or approve completion. Tho
 
 A retained result can settle its historical acknowledgement; current review and publication eligibility are checked separately. Failed checks remain failed. A stopped review without a durably recorded verdict needs a fresh independent review. Changed or unbound copies are preserved, not restored or adopted. Missing process or controller-I/O stop proof leaves the operation unresolved and its workspace excluded. Other resource types keep their dedicated reconciliation capabilities.
 
-This works through the shared kernel for both SDK and native Herdr runtimes. It is current-format restart recovery, not migration support, and does not yet resolve abandoned controller I/O or clean up retained resources.
+This works through the shared kernel for both SDK and native Herdr runtimes. It is current-format restart recovery, not migration support. Abandoned controller I/O for these delivery actions and retained-resource cleanup remain unfinished; repository ownership has the separate recovery boundary below.
+
+### Repository ownership after a controller crash
+
+Acquiring and releasing `refs/epicd/run-owner` now run as whole trusted operations under a detached supervisor and the existing PID-namespace lifetime boundary. The supervisor detects loss of the controller's private pipe, stops the namespace, waits for its descendants to be reaped, and retains an operation-specific stop receipt. Git guards still require the original lease, repository binding and exact ownership intent; release still requires completed-run control.
+
+A replacement controller can acknowledge that receipt and inspect the actual ref without repeating the original write. If dispatch never started, it can atomically prevent that generation from starting. Neither a matching ref, an absent process nor a replacement lease proves termination. Missing or invalid receipts, replaced control directories and killed namespace monitors preserve uncertainty and the repository reservation. A failed operation can be retried as a new generation only after its stop and physical outcome have been settled.
+
+Private control directories live beside the state file under `<state-path>.repository-io`; that location must be outside the checkout and Git metadata. The journal binds their filesystem identity before dispatch and records the operation and receipt identities. Control files are retained, not automatically deleted. Worker attachment cannot create missing state, initialize empty state or adopt a replaced state file. This boundary is shared by SDK and native Herdr; it does not yet supervise all controller-side Git, workspace, tracker or fixture I/O.
 
 ## Declare policy
 

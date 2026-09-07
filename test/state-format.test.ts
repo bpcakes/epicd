@@ -1,4 +1,12 @@
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
@@ -19,6 +27,30 @@ function fixture() {
 }
 
 describe("hard-cut state format", () => {
+  it("does not initialize state truncated in place before trusted-worker attachment", () => {
+    const { path } = fixture();
+    const store = new StateStore(path),
+      identity = store.storageIdentity();
+    store.close();
+    writeFileSync(path, "");
+    expect(() => new StateStore(path, identity)).toThrow("cannot initialize empty state");
+    expect(readFileSync(path)).toHaveLength(0);
+  });
+  it.each(["missing", "replaced"])(
+    "refuses a %s trusted-worker state file without recreating or initializing it",
+    (variant) => {
+      const { path } = fixture();
+      const store = new StateStore(path),
+        identity = store.storageIdentity();
+      store.close();
+      renameSync(path, `${path}.retained`);
+      if (variant === "replaced") writeFileSync(path, "user-owned unrelated file");
+      expect(() => new StateStore(path, identity)).toThrow();
+      if (variant === "missing") expect(existsSync(path)).toBe(false);
+      else expect(readFileSync(path, "utf8")).toBe("user-owned unrelated file");
+      expect(existsSync(`${path}.retained`)).toBe(true);
+    },
+  );
   it("requires persisted fields instead of supplying historical defaults", () => {
     for (const field of [
       "stateSchemaVersion",
@@ -107,7 +139,7 @@ describe("hard-cut state format", () => {
     expect(reopened.get(run.runId)).toEqual(run);
     expect(reopened.orchestration.policy(run.runId).coordinator.model).toBe("gpt-6-astra");
     expect(db.prepare("SELECT * FROM runs").all()).toEqual(before);
-    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 26 }]);
+    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 27 }]);
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE name = 'diagnostic_artifacts'").get(),
     ).toBeDefined();
@@ -118,9 +150,10 @@ describe("hard-cut state format", () => {
     { label: "unmarked", versions: null },
     { label: "empty marker", versions: [] },
     { label: "older format", versions: [23] },
-    { label: "newer format", versions: [27] },
+    { label: "previous format without durable repository I/O", versions: [26] },
+    { label: "newer format", versions: [28] },
     { label: "previous format without evidence-preserving retirement", versions: [25] },
-    { label: "multiple format markers", versions: [25, 26] },
+    { label: "multiple format markers", versions: [26, 27] },
   ])("refuses $label without migration, backups or deletion", ({ versions }) => {
     const { root, path } = fixture();
     const db = new Database(path);
