@@ -49,7 +49,7 @@ export const ReviewEvidenceSchema = z
     validationPlanId: Id,
     workspaceId: Id,
     workspaceGeneration: z.number().int().positive(),
-    phase: z.literal("pre_commit"),
+    phase: z.enum(["pre_commit", "exact_revision"]),
     revision: Id,
     parentRevision: Id,
     fullTree: Id,

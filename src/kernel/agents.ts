@@ -33,7 +33,7 @@ export function registerAgentCapabilities(
     if (["review", "verification", "final_review"].includes(assignment.purpose))
       throw new CapabilityRejected(
         "review_capability_required",
-        "Use run_review for candidate-bound independent evidence; exact-commit review is not wired yet",
+        "Use run_review for candidate-bound independent review or exact-SHA verification; final epic review is not wired yet",
       );
     if (instance.role === "orchestrator")
       throw new CapabilityRejected(

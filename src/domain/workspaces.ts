@@ -35,6 +35,7 @@ export const WorkspaceOperationSchema = WorkspaceIdentitySchema.extend({
     "copy_source",
     "validation",
     "review_inspection",
+    "commit",
   ]),
   status: z.enum(["running", "indeterminate", "succeeded", "failed"]),
   stopEvidence: z.string().min(1).max(4000).nullable(),

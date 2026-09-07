@@ -91,10 +91,10 @@ describe("orchestration storage migration", () => {
     stores.push(store);
     const database = new Database(path);
     databases.push(database);
-    database.exec("UPDATE orchestration_schema SET version = 9");
+    database.exec("UPDATE orchestration_schema SET version = 10");
     expect(() => new StateStore(path)).toThrow("different Epicd schema version");
     expect(database.prepare("SELECT version FROM orchestration_schema").get()).toEqual({
-      version: 9,
+      version: 10,
     });
   });
 

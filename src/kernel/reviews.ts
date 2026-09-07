@@ -24,9 +24,12 @@ export function registerReviewCapabilities(
     );
     const content = {
       ...review,
-      currentApproval: journal.reviews.approval(authority.runId, review) === review.evidenceId,
+      currentApproval:
+        journal.reviews.approval(authority.runId, review, review.phase) === review.evidenceId,
       evidenceWarning:
-        "Independent judgment on a synthetic pre-commit snapshot, not exact-commit verification",
+        review.phase === "pre_commit"
+          ? "Independent judgment on a synthetic pre-commit snapshot, not exact-commit verification"
+          : "Independent judgment on the actual private commit SHA; publication and tracker closure are separate obligations",
     };
     if (Buffer.byteLength(JSON.stringify(content)) > 64000)
       return {
@@ -100,7 +103,11 @@ export function registerReviewCapabilities(
         "Review contract and controlled runtime must agree",
       );
     let review = journal.reviews.reserve(authority, record.actionId);
-    const snapshot = journal.delivery.candidate(authority.runId, review).snapshot!;
+    const snapshot = journal.delivery.snapshotAtRevision(
+      authority.runId,
+      review,
+      review.phase === "pre_commit" ? null : review.revision,
+    );
     try {
       await workspaces.verifyValidationWorkspace(
         authority,

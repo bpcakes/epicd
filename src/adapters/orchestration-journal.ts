@@ -39,8 +39,9 @@ import {
   migrateDelivery,
 } from "./delivery-journal.js";
 import { ReviewJournal, REVIEW_TABLES, migrateReviews } from "./review-journal.js";
+import { CommitJournal, COMMIT_TABLES, migrateCommits } from "./commit-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 8;
+export const ORCHESTRATION_SCHEMA_VERSION = 9;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -53,6 +54,7 @@ export const ORCHESTRATION_TABLES = [
   ...AGENT_TABLES,
   ...DELIVERY_TABLES,
   ...REVIEW_TABLES,
+  ...COMMIT_TABLES,
 ] as const;
 
 /** Called inside StateStore's single forward-migration transaction. */
@@ -114,6 +116,7 @@ export function migrateOrchestration(db: Database.Database): void {
   migrateAgents(db);
   migrateDelivery(db);
   migrateReviews(db);
+  migrateCommits(db);
   migrateDecisionSource(db);
 }
 
@@ -170,6 +173,7 @@ export class OrchestrationJournal {
   readonly agents: AgentJournal;
   readonly delivery: DeliveryJournal;
   readonly reviews: ReviewJournal;
+  readonly commits: CommitJournal;
   readonly decisionSource: DecisionJournal;
 
   constructor(private readonly db: Database.Database) {
@@ -194,6 +198,7 @@ export class OrchestrationJournal {
       observe: (authority, input) => this.appendObservation(authority, input),
       agents: this.agents,
       reviewChecks: (runId, taskId) => this.reviews.requiredChecks(runId, taskId),
+      exactCommit: (runId, candidate, revision) => this.commits.exact(runId, candidate, revision),
     });
     this.reviews = new ReviewJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -202,6 +207,15 @@ export class OrchestrationJournal {
       observe: (authority, input) => this.appendObservation(authority, input),
       agents: this.agents,
       delivery: this.delivery,
+    });
+    this.commits = new CommitJournal(db, {
+      transaction: (authority, body) => this.transaction(authority, body),
+      control: (runId) => this.control(runId),
+      action: (runId, actionId) => this.action(runId, actionId),
+      observe: (authority, input) => this.appendObservation(authority, input),
+      agents: this.agents,
+      delivery: this.delivery,
+      reviews: this.reviews,
     });
   }
 

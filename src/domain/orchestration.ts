@@ -78,6 +78,11 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("inspect_validation_plan"), validationPlanId: Id }),
   z.strictObject({ kind: z.literal("inspect_evidence"), evidenceId: Id }),
   z.strictObject({ kind: z.literal("inspect_review"), evidenceId: Id }),
+  z.strictObject({ kind: z.literal("inspect_commit"), commitId: Id }),
+  z.strictObject({
+    kind: z.literal("create_implementation_workspace"),
+    baseCommitId: Id.nullable(),
+  }),
   z.strictObject({
     kind: z.literal("read_review"),
     evidenceId: Id,

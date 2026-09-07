@@ -26,6 +26,7 @@ import {
   type WorkspaceSnapshot,
 } from "../domain/workspaces.js";
 import { digestJson } from "../domain/repository-policy.js";
+import type { CommitRecord } from "../domain/commits.js";
 
 const FILE_LIMIT = 64 * 1024 * 1024;
 const CHECKOUT_LIMIT = 512 * 1024 * 1024;
@@ -220,6 +221,7 @@ export class WorkspaceManager {
     snapshotInput: WorkspaceSnapshot,
     signal?: AbortSignal,
     creationOperationId?: string,
+    purpose: "review" | "verification" = "review",
   ): Promise<WorkspaceRecord> {
     const snapshot = WorkspaceSnapshotSchema.parse(snapshotInput);
     if (snapshot.runId !== authority.runId)
@@ -230,7 +232,7 @@ export class WorkspaceManager {
         authority,
         source.path,
         snapshot.snapshotRevision,
-        "review",
+        purpose,
         signal,
         creationOperationId,
       );
@@ -242,6 +244,189 @@ export class WorkspaceManager {
           "Review copy does not match the captured candidate",
         );
       return copy;
+    });
+  }
+
+  /** New writable files at the retained private tip; never reset or amend an older assignment. */
+  async createImplementationCopy(
+    authority: ControllerAuthority,
+    commit: CommitRecord,
+    creationOperationId: string,
+    signal?: AbortSignal,
+  ) {
+    return this.exclusive(authority, commit, "copy_source", async () => {
+      const source = await this.owned(authority, commit);
+      const git = new KernelGit(source.path);
+      await this.assertPrivateGit(git, signal);
+      if (
+        !commit.revision ||
+        (await git.text(["cat-file", "commit", commit.revision], optionalSignal(signal))) !==
+          commit.objectContent
+      )
+        throw new WorkspaceError(
+          "commit_object_conflict",
+          "Implementation base differs from its retained commit intent",
+        );
+      return this.create(
+        authority,
+        source.path,
+        commit.revision,
+        "implementation",
+        signal,
+        creationOperationId,
+      );
+    });
+  }
+
+  /** Construct only the approved object and a private retention ref; never advance a checkout or public branch. */
+  async writeCandidateCommit(
+    authority: ControllerAuthority,
+    input: CommitRecord,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const record = this.journal.commits.assertWritable(authority, input.commitId);
+    let succeeded = false;
+    try {
+      const workspace = await this.owned(authority, record);
+      this.assertStopped(workspace);
+      const git = new KernelGit(workspace.path);
+      await this.assertPrivateGit(git, signal);
+      const snapshot = this.journal.delivery.candidate(authority.runId, record).snapshot!;
+      if (
+        (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() !==
+        record.parentRevision
+      )
+        throw new WorkspaceError(
+          "commit_parent_changed",
+          "Commit source no longer has the approved parent",
+        );
+      const files = await this.scan(git, record.parentRevision, signal);
+      if (digestJson(files.map((file) => file.entry)) !== record.fingerprint)
+        throw new WorkspaceError(
+          "commit_source_changed",
+          "Commit source differs from the independent approval",
+        );
+      await this.assertProtectedTracker(git, record.parentRevision, files, signal);
+      // A separate, kernel-built index ignores arbitrary existing staging.
+      const tree = await this.writeTree(git, snapshot.manifest, signal);
+      if (tree !== record.fullTree)
+        throw new WorkspaceError(
+          "commit_tree_changed",
+          "Temporary index differs from the approved tree",
+        );
+      const revision = (
+        await git.text(["hash-object", "-t", "commit", "--stdin"], {
+          input: record.objectContent,
+          ...optionalSignal(signal),
+        })
+      ).trim();
+      this.journal.commits.prepareWrite(authority, record.commitId, revision);
+      this.journal.commits.assertWritable(authority, record.commitId);
+      const written = (
+        await git.text(["hash-object", "-w", "-t", "commit", "--stdin"], {
+          input: record.objectContent,
+          ...optionalSignal(signal),
+        })
+      ).trim();
+      if (written !== revision)
+        throw new WorkspaceError(
+          "commit_object_changed",
+          "Stored commit differs from its persisted write intent",
+        );
+      this.journal.commits.assertWritable(authority, record.commitId);
+      await git.text(
+        ["update-ref", `refs/epicd/commits/${record.commitId}`, revision, ""],
+        optionalSignal(signal),
+      );
+      succeeded = true;
+    } finally {
+      this.journal.agents.finishWorkspaceOperation(
+        authority,
+        record.workspaceOperationId,
+        succeeded ? "succeeded" : "failed",
+        "Trusted commit adapter awaited every Git process and filesystem operation",
+      );
+    }
+  }
+
+  /** Read-only reconciliation after independently confirmed I/O stop, including the object/ref crash window. */
+  async inspectCandidateCommit(
+    authority: ControllerAuthority,
+    input: CommitRecord,
+    signal?: AbortSignal,
+  ): Promise<{ created: boolean; sourceIntact: boolean; detail: string | null }> {
+    const record = this.journal.commits.record(authority.runId, input.commitId);
+    if (
+      !this.journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId)
+        .stopEvidence
+    )
+      throw new WorkspaceError(
+        "commit_io_unsettled",
+        "An old commit exclusion cannot be cleared from Git state alone",
+      );
+    return this.exclusive(authority, record, "inspect_materialization", async () => {
+      const workspace = await this.owned(authority, record);
+      this.assertStopped(workspace);
+      const git = new KernelGit(workspace.path);
+      await this.assertPrivateGit(git, signal);
+      if (!record.revision)
+        return {
+          created: false,
+          sourceIntact: false,
+          detail: "No commit-object write was admitted",
+        };
+      const retained = (
+        await git.text(
+          ["rev-parse", "--verify", "--quiet", `refs/epicd/commits/${record.commitId}`],
+          { allowedExitCodes: [0, 1], ...optionalSignal(signal) },
+        )
+      ).trim();
+      if (retained && retained !== record.revision)
+        throw new WorkspaceError(
+          "commit_ref_conflict",
+          "Private commit ref changed outside its intent",
+        );
+      const object = (
+        await git.text(["cat-file", "--batch-check"], {
+          input: `${record.revision}\n`,
+          ...optionalSignal(signal),
+        })
+      ).trim();
+      if (object === `${record.revision} missing` && !retained)
+        return {
+          created: false,
+          sourceIntact: false,
+          detail: "Commit object and retention ref are absent after confirmed stop",
+        };
+      if (
+        object !== `${record.revision} commit ${Buffer.byteLength(record.objectContent)}` ||
+        (await git.text(["cat-file", "commit", record.revision], optionalSignal(signal))) !==
+          record.objectContent
+      )
+        throw new WorkspaceError(
+          "commit_object_conflict",
+          "Private commit object differs from its reserved content",
+        );
+      if (!retained)
+        return {
+          created: false,
+          sourceIntact: false,
+          detail:
+            "Commit object exists but its retention ref was not installed; preserve the private object and recapture before retry",
+        };
+      const sourceIntact =
+        (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() ===
+          record.parentRevision &&
+        digestJson(
+          (await this.scan(git, record.parentRevision, signal)).map((file) => file.entry),
+        ) === record.fingerprint;
+      return {
+        created: true,
+        sourceIntact,
+        detail: sourceIntact
+          ? null
+          : "Private commit exists, but its source changed after approval; recapture and review",
+      };
     });
   }
 
@@ -564,7 +749,10 @@ export class WorkspaceManager {
   ): Promise<CapturedFile[]> {
     const tracked = await this.treeEntries(git, baseline, signal);
     const untracked = decode(
-      await git.bytes(["ls-files", "--others", "--exclude-standard", "-z"], optionalSignal(signal)),
+      await git.bytes(
+        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        optionalSignal(signal),
+      ),
     )
       .split("\0")
       .filter(Boolean);

@@ -814,7 +814,7 @@ export class AgentJournal {
         );
       const active = this.turns(authority.runId).filter((turn) => !terminal(turn));
       const assignment = this.assignment(authority.runId, agent.assignmentId);
-      if (reviewContext !== undefined && assignment.purpose !== "review")
+      if (reviewContext !== undefined && !["review", "verification"].includes(assignment.purpose))
         throw new AgentCoordinationError(
           "review_context_role",
           "Only an independent review turn may carry review context",

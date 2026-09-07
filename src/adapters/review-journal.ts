@@ -87,15 +87,20 @@ export class ReviewJournal {
       const candidate = this.access.delivery.candidate(authority.runId, action);
       const binding = this.access.delivery.binding(authority.runId, action);
       const workspace = this.access.agents.workspace(authority.runId, action);
+      const snapshot = this.access.delivery.snapshotAtRevision(
+        authority.runId,
+        candidate,
+        binding.phase === "pre_commit" ? null : binding.revision,
+      );
       if (
         !this.access.delivery.candidateCurrent(authority.runId, candidate) ||
         !candidate.snapshot ||
         binding.candidateId !== candidate.candidateId ||
         binding.candidateGeneration !== candidate.candidateGeneration ||
-        binding.phase !== "pre_commit" ||
-        workspace.purpose !== "review" ||
+        workspace.purpose !== (binding.phase === "pre_commit" ? "review" : "verification") ||
         workspace.sourceMode !== "immutable" ||
-        workspace.baselineRevision !== candidate.snapshot.snapshotRevision ||
+        workspace.baselineRevision !== snapshot.snapshotRevision ||
+        binding.revision !== snapshot.snapshotRevision ||
         workspace.baselineFingerprint !== candidate.snapshot.fingerprint
       )
         throw new DeliveryError(
@@ -109,6 +114,7 @@ export class ReviewJournal {
           candidate.taskId,
           candidate.candidateId,
           workspace.workspaceId,
+          binding.phase,
         );
       else if (
         this.access.agents
@@ -140,8 +146,8 @@ export class ReviewJournal {
         validationPlanId: candidate.validationPlanId,
         workspaceId: workspace.workspaceId,
         workspaceGeneration: workspace.workspaceGeneration,
-        phase: "pre_commit",
-        revision: candidate.snapshot.snapshotRevision,
+        phase: binding.phase,
+        revision: snapshot.snapshotRevision,
         parentRevision: candidate.snapshot.parentRevision,
         fullTree: candidate.snapshot.fullTree,
         fingerprint: candidate.snapshot.fingerprint,
@@ -154,7 +160,7 @@ export class ReviewJournal {
         report: null,
         failure: null,
         validationEvidenceIds: this.access.delivery
-          .preCommitEvidence(authority.runId, candidate)
+          .validationEvidence(authority.runId, candidate, binding.phase, binding.revision)
           .evidence.map((entry) => entry.evidenceId),
         findingIds,
         createdAt: at(),
@@ -208,6 +214,7 @@ export class ReviewJournal {
             review.taskId,
             review.candidateId,
             review.workspaceId,
+            review.phase,
           )
         : this.access.agents.reserveAgent(
             authority,
@@ -215,7 +222,7 @@ export class ReviewJournal {
               workspaceId: review.workspaceId,
               workspaceGeneration: review.workspaceGeneration,
               role: "review",
-              purpose: "review",
+              purpose: review.phase === "pre_commit" ? "review" : "verification",
               taskId: review.taskId,
               candidateId: review.candidateId,
               instructions: REVIEW_INSTRUCTIONS,
@@ -233,10 +240,20 @@ export class ReviewJournal {
           "Reviewer requires the selected controlled runtime",
         );
       const plan = this.access.delivery.plan(authority.runId, review.validationPlanId);
-      const validation = this.access.delivery.preCommitEvidence(authority.runId, review);
+      const validation = this.access.delivery.validationEvidence(
+        authority.runId,
+        review,
+        review.phase,
+        review.revision,
+      );
       review.validationEvidenceIds = validation.evidence.map((entry) => entry.evidenceId);
       const findings = this.openFindings(authority.runId, review);
       const context = {
+        phase: review.phase,
+        revisionWarning:
+          review.phase === "pre_commit"
+            ? "Synthetic pre-commit snapshot, not delivered commit"
+            : "Actual kernel-created commit SHA; independently verify this exact revision",
         candidateId: review.candidateId,
         candidateGeneration: review.candidateGeneration,
         revision: review.revision,
@@ -504,9 +521,13 @@ export class ReviewJournal {
       review.failure === null ? (review.report?.requiredChecks ?? []) : [],
     );
   }
-  approval(runId: string, candidate: CandidateIdentity): string | null {
+  approval(
+    runId: string,
+    candidate: CandidateIdentity,
+    phase: ReviewEvidence["phase"] = "pre_commit",
+  ): string | null {
     const captured = this.access.delivery.candidate(runId, candidate);
-    const records = this.records(runId, captured.taskId);
+    const records = this.records(runId, captured.taskId).filter((record) => record.phase === phase);
     const latest = records.at(-1);
     if (
       !latest ||
@@ -521,7 +542,20 @@ export class ReviewJournal {
       this.openFindings(runId, candidate).length
     )
       return null;
-    const validation = this.access.delivery.preCommitEvidence(runId, candidate);
+    if (phase === "exact_revision") {
+      try {
+        this.access.delivery.snapshotAtRevision(runId, candidate, latest.revision);
+      } catch (error) {
+        if (error instanceof DeliveryError) return null;
+        throw error;
+      }
+    }
+    const validation = this.access.delivery.validationEvidence(
+      runId,
+      candidate,
+      phase,
+      latest.revision,
+    );
     if (
       validation.missingCheckIds.length ||
       validation.evidence.some(
@@ -560,7 +594,8 @@ export class ReviewJournal {
         status: review.status,
         verdict: review.report?.verdict ?? null,
         failure: review.failure ? redactSensitiveText(review.failure, 500) : null,
-        approved: this.approval(runId, review) === review.evidenceId,
+        phase: review.phase,
+        approved: this.approval(runId, review, review.phase) === review.evidenceId,
         openFindings: this.openFindings(runId, review).length,
       }));
   }
@@ -588,7 +623,9 @@ export class ReviewJournal {
       context.revision === review.revision &&
       context.validationPlanId === review.validationPlanId &&
       context.parentRevision === review.parentRevision &&
-      context.fullTree === review.fullTree;
+      context.fullTree === review.fullTree &&
+      (context.phase === review.phase ||
+        (review.phase === "pre_commit" && context.phase === undefined));
     return (
       turn.resultEligible &&
       turn.status === "completed" &&
@@ -597,7 +634,8 @@ export class ReviewJournal {
       agent.role === "review" &&
       agent.status !== "revoked" &&
       agent.confinementProfile === "epicd-isolated" &&
-      turn.prompt.assignment.purpose === "review" &&
+      turn.prompt.assignment.purpose ===
+        (review.phase === "pre_commit" ? "review" : "verification") &&
       turn.prompt.assignment.candidateId === review.candidateId &&
       turn.prompt.assignment.taskId === review.taskId &&
       turn.policyDigest === review.policyDigest &&
@@ -627,12 +665,13 @@ export class ReviewJournal {
     taskId: string,
     candidateId: string,
     workspaceId: string,
+    phase: ReviewEvidence["phase"],
   ) {
     const agent = this.access.agents.instance(runId, identity);
     const assignment = this.access.agents.assignment(runId, agent.assignmentId);
     if (
       agent.role !== "review" ||
-      assignment.purpose !== "review" ||
+      assignment.purpose !== (phase === "pre_commit" ? "review" : "verification") ||
       assignment.taskId !== taskId ||
       assignment.candidateId !== candidateId ||
       agent.workspaceId !== workspaceId ||

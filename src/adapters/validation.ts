@@ -45,10 +45,15 @@ export async function runCandidateValidation(
   let handle: ConfinedCommandHandle | null = null;
   let outcomeObserved = false;
   try {
+    const snapshot = journal.delivery.snapshotAtRevision(
+      authority.runId,
+      candidate,
+      evidence.phase === "pre_commit" ? null : evidence.revision,
+    );
     const workspace = await workspaces.verifyValidationWorkspace(
       authority,
       evidence,
-      candidate.snapshot!,
+      snapshot,
       evidence.workspaceOperationId,
       writablePaths,
       true,
@@ -60,7 +65,7 @@ export async function runCandidateValidation(
         workspace: workspace.path,
         sourceMode: "read-only",
         writablePaths,
-        immutablePaths: candidate.snapshot!.manifest.map((entry) => entry.path),
+        immutablePaths: snapshot.manifest.map((entry) => entry.path),
         command: check.command,
         args: check.args,
         cwd: check.cwd,
@@ -76,7 +81,7 @@ export async function runCandidateValidation(
       await workspaces.verifyValidationWorkspace(
         authority,
         evidence,
-        candidate.snapshot!,
+        snapshot,
         evidence.workspaceOperationId,
         writablePaths,
         false,

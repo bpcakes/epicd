@@ -53,7 +53,7 @@ export const CandidateWorkspaceSchema = WorkspaceIdentitySchema.extend({
   operationId: Id,
   ...CandidateIdentitySchema.shape,
   revision: Id,
-  phase: z.literal("pre_commit"),
+  phase: z.enum(["pre_commit", "exact_revision"]),
   createdAt: At,
 });
 export type CandidateWorkspace = z.infer<typeof CandidateWorkspaceSchema>;
@@ -82,7 +82,7 @@ export const ValidationEvidenceSchema = WorkspaceIdentitySchema.extend({
   checkId: Id,
   commandDigest: Id,
   policyDigest: Id,
-  phase: z.literal("pre_commit"),
+  phase: z.enum(["pre_commit", "exact_revision"]),
   revision: Id,
   fingerprint: Id,
   confinementProfile: z.literal("bwrap-read-only-source-v1"),

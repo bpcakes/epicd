@@ -115,11 +115,6 @@ export function registerDeliveryCapabilities(
     "create_review_workspace",
     async ({ authority, record, signal }, action) => {
       const candidate = journal.delivery.candidate(authority.runId, action);
-      if (action.revision !== null)
-        throw new CapabilityRejected(
-          "exact_revision_unavailable",
-          "Exact-commit copies require the delivery commit registry; synthetic snapshots cannot substitute",
-        );
       if (!candidate.snapshot)
         throw new CapabilityRejected(
           "candidate_not_captured",
@@ -127,9 +122,10 @@ export function registerDeliveryCapabilities(
         );
       const workspace = await workspaces.createReviewCopy(
         authority,
-        candidate.snapshot,
+        journal.delivery.snapshotAtRevision(authority.runId, candidate, action.revision),
         signal,
         record.operationId,
+        action.revision === null ? "review" : "verification",
       );
       journal.delivery.bindReviewCopy(authority, record.actionId, workspace);
       return {

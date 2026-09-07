@@ -336,7 +336,7 @@ describe("durable agent coordination", () => {
     ).toBeNull();
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 8 });
+    ).toEqual({ version: 9 });
     expect(
       setup.db
         .prepare("SELECT name FROM sqlite_master WHERE name = 'one_turn_native_terminal'")
@@ -939,7 +939,7 @@ describe("durable agent coordination", () => {
     const turn = setup.submit(setup.ready());
     expect(turn.prompt).not.toHaveProperty("reviewContext");
     setup.db.exec(
-      "DROP TABLE review_findings; DROP TABLE review_evidence; UPDATE orchestration_schema SET version = 7",
+      "DROP TABLE delivery_commits; DROP TABLE review_findings; DROP TABLE review_evidence; UPDATE orchestration_schema SET version = 7",
     );
     const original = setup.db
       .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
@@ -949,7 +949,7 @@ describe("durable agent coordination", () => {
     expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 8 });
+    ).toEqual({ version: 9 });
     expect(
       setup.db
         .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
@@ -970,6 +970,7 @@ describe("durable agent coordination", () => {
   it("snapshots schema-one databases before adding the durable agent tables", () => {
     const setup = fixture();
     for (const table of [
+      "delivery_commits",
       "review_findings",
       "review_evidence",
       "validation_evidence",
@@ -991,7 +992,7 @@ describe("durable agent coordination", () => {
     stores.push(upgraded);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 8 });
+    ).toEqual({ version: 9 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
     expect(backup).toBeDefined();
     const snapshot = new Database(join(setup.root, backup!), { readonly: true });
@@ -1016,7 +1017,7 @@ describe("durable agent coordination", () => {
     const turn = setup.submit(agent);
     const original = setup.agents.instance(setup.authority.runId, agent);
     setup.db.exec(
-      "DROP TABLE review_findings; DROP TABLE review_evidence; DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP TABLE workspace_operations; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (2)",
+      "DROP TABLE delivery_commits; DROP TABLE review_findings; DROP TABLE review_evidence; DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP TABLE workspace_operations; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (2)",
     );
     const upgraded = new StateStore(setup.path);
     stores.push(upgraded);
@@ -1024,7 +1025,7 @@ describe("durable agent coordination", () => {
     expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 8 });
+    ).toEqual({ version: 9 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
     const snapshot = new Database(join(setup.root, backup), { readonly: true });
     databases.push(snapshot);

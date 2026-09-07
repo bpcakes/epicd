@@ -117,6 +117,7 @@ export class ActionKernel {
         agents: journal.agents.summaries(authority.runId),
         delivery: journal.delivery.summaries(authority.runId),
         reviews: journal.reviews.summaries(authority.runId),
+        commits: journal.commits.summaries(authority.runId),
         memory: journal
           .memory(authority.runId)
           .slice(-20)

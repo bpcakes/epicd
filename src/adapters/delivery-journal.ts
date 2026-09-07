@@ -30,6 +30,7 @@ import {
 } from "../domain/repository-policy.js";
 import type { AgentJournal } from "./agent-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
+import type { CommitRecord } from "../domain/commits.js";
 
 export const DELIVERY_TABLES = [
   "validation_plans",
@@ -98,6 +99,7 @@ type Access = {
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
   agents: AgentJournal;
   reviewChecks(runId: string, taskId: string): z.infer<typeof RequiredCheckSchema>[];
+  exactCommit(runId: string, candidate: CandidateIdentity, revision: string): CommitRecord;
 };
 export class DeliveryError extends Error {
   constructor(
@@ -380,14 +382,14 @@ export class DeliveryJournal {
       const { record, action } = this.action(authority, actionId, "create_review_workspace", true);
       const candidate = this.candidate(authority.runId, action);
       const workspace = this.access.agents.workspace(authority.runId, identity);
+      const snapshot = this.snapshotAtRevision(authority.runId, candidate, action.revision);
       if (
-        action.revision !== null ||
         !candidate.snapshot ||
         workspace.sourceMode !== "immutable" ||
         workspace.status !== "ready" ||
-        workspace.purpose !== "review" ||
+        workspace.purpose !== (action.revision === null ? "review" : "verification") ||
         workspace.creationOperationId !== record.operationId ||
-        workspace.baselineRevision !== candidate.snapshot.snapshotRevision ||
+        workspace.baselineRevision !== snapshot.snapshotRevision ||
         workspace.baselineFingerprint !== candidate.snapshot.fingerprint
       )
         throw new DeliveryError(
@@ -419,8 +421,8 @@ export class DeliveryJournal {
         workspaceGeneration: workspace.workspaceGeneration,
         candidateId: candidate.candidateId,
         candidateGeneration: candidate.candidateGeneration,
-        revision: candidate.snapshot.snapshotRevision,
-        phase: "pre_commit",
+        revision: snapshot.snapshotRevision,
+        phase: action.revision === null ? "pre_commit" : "exact_revision",
         createdAt: now(),
       });
       this.db
@@ -458,6 +460,11 @@ export class DeliveryJournal {
       const plan = this.plan(authority.runId, action.validationPlanId);
       const binding = this.binding(authority.runId, action);
       const workspace = this.access.agents.workspace(authority.runId, action);
+      const snapshot = this.snapshotAtRevision(
+        authority.runId,
+        candidate,
+        binding.phase === "pre_commit" ? null : binding.revision,
+      );
       if (
         !candidate.snapshot ||
         candidate.validationPlanId !== plan.planId ||
@@ -465,7 +472,8 @@ export class DeliveryJournal {
         binding.candidateId !== candidate.candidateId ||
         binding.candidateGeneration !== candidate.candidateGeneration ||
         workspace.sourceMode !== "immutable" ||
-        workspace.baselineRevision !== candidate.snapshot.snapshotRevision ||
+        workspace.baselineRevision !== snapshot.snapshotRevision ||
+        binding.revision !== snapshot.snapshotRevision ||
         workspace.baselineFingerprint !== candidate.snapshot.fingerprint
       )
         throw new DeliveryError(
@@ -473,10 +481,10 @@ export class DeliveryJournal {
           "Validation target, plan, and candidate do not match",
         );
       const check = plan.checks.find((item) => item.id === action.checkId);
-      if (!check || check.stage === "exact_revision")
+      if (!check || (check.stage !== "both" && check.stage !== binding.phase))
         throw new DeliveryError(
           "validation_stage",
-          "This synthetic snapshot cannot supply exact-commit verification",
+          "This validation check is not required at the selected revision stage",
         );
       if (check.environmentBindings.length)
         throw new DeliveryError(
@@ -504,8 +512,8 @@ export class DeliveryJournal {
         checkId: check.id,
         commandDigest: digestJson(check),
         policyDigest: record.policyDigest,
-        phase: "pre_commit",
-        revision: candidate.snapshot.snapshotRevision,
+        phase: binding.phase,
+        revision: snapshot.snapshotRevision,
         fingerprint: candidate.snapshot.fingerprint,
         confinementProfile: "bwrap-read-only-source-v1",
         environmentGenerations: [],
@@ -658,16 +666,28 @@ export class DeliveryJournal {
     );
     const latest = this.all(
       ValidationEvidenceSchema,
-      "SELECT record_json FROM validation_evidence WHERE run_id = ? AND candidate_id = ? AND json_extract(record_json, '$.checkId') = ? ORDER BY rowid DESC LIMIT 1",
-      [runId, evidence.candidateId, evidence.checkId],
+      "SELECT record_json FROM validation_evidence WHERE run_id = ? AND candidate_id = ? AND json_extract(record_json, '$.checkId') = ? AND json_extract(record_json, '$.phase') = ? AND json_extract(record_json, '$.revision') = ? ORDER BY rowid DESC LIMIT 1",
+      [runId, evidence.candidateId, evidence.checkId, evidence.phase, evidence.revision],
     )[0];
+    let revision: string;
+    try {
+      revision = this.snapshotAtRevision(
+        runId,
+        evidence,
+        evidence.phase === "pre_commit" ? null : evidence.revision,
+      ).snapshotRevision;
+    } catch (error) {
+      if (error instanceof DeliveryError) return false;
+      throw error;
+    }
     return (
       latest?.evidenceId === evidence.evidenceId &&
       this.candidateCurrent(runId, evidence) &&
       !!check &&
       digestJson(check) === evidence.commandDigest &&
       candidate.validationPlanId === evidence.validationPlanId &&
-      candidate.snapshot?.snapshotRevision === evidence.revision &&
+      revision === evidence.revision &&
+      !!candidate.snapshot &&
       candidate.snapshot.fingerprint === evidence.fingerprint &&
       evidence.policyDigest === this.access.control(runId).policyDigest &&
       evidence.sourceUnchanged &&
@@ -718,22 +738,57 @@ export class DeliveryJournal {
     };
   }
   preCommitEvidence(runId: string, identity: CandidateIdentity) {
+    return this.validationEvidence(runId, identity, "pre_commit");
+  }
+  validationEvidence(
+    runId: string,
+    identity: CandidateIdentity,
+    phase: "pre_commit" | "exact_revision",
+    revision?: string,
+  ) {
     const candidate = this.candidate(runId, identity);
     const checks = this.plan(runId, candidate.validationPlanId).checks.filter(
-      (check) => check.stage !== "exact_revision",
+      (check) => check.stage === "both" || check.stage === phase,
     );
     const records = this.all(
       ValidationEvidenceSchema,
       "SELECT record_json FROM validation_evidence WHERE run_id = ? AND candidate_id = ? ORDER BY rowid",
       [runId, candidate.candidateId],
     );
-    const evidence = records.filter((record) => this.satisfiesCheck(runId, record.evidenceId));
+    const evidence = records.filter(
+      (record) =>
+        record.phase === phase &&
+        (!revision || record.revision === revision) &&
+        this.satisfiesCheck(runId, record.evidenceId),
+    );
     return {
       evidence,
       missingCheckIds: checks
         .filter((check) => !evidence.some((record) => record.checkId === check.id))
         .map((check) => check.id),
     };
+  }
+  /** Physical copy target; an actual SHA must come from the kernel's created commit registry. */
+  snapshotAtRevision(
+    runId: string,
+    identity: CandidateIdentity,
+    revision: string | null,
+  ): WorkspaceSnapshot {
+    const candidate = this.candidate(runId, identity);
+    if (!candidate.snapshot)
+      throw new DeliveryError("candidate_not_captured", "Candidate has no immutable snapshot");
+    if (revision === null) return candidate.snapshot;
+    const commit = this.access.exactCommit(runId, identity, revision);
+    if (
+      commit.fullTree !== candidate.snapshot.fullTree ||
+      commit.parentRevision !== candidate.snapshot.parentRevision ||
+      commit.fingerprint !== candidate.snapshot.fingerprint
+    )
+      throw new DeliveryError(
+        "commit_candidate_mismatch",
+        "Commit registry does not match its candidate snapshot",
+      );
+    return { ...candidate.snapshot, snapshotRevision: revision };
   }
   private latestSourceTurn(runId: string, assignmentId: string): string | null {
     return (
