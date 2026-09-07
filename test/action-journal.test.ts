@@ -290,7 +290,7 @@ describe("durable action admission", () => {
     const setup = fixture();
     expect(() =>
       setup.store.saveWithLease(
-        { ...setup.run, stateSchemaVersion: 1, orchestrationMode: "legacy" },
+        { ...setup.run, orchestrationMode: "legacy" },
         setup.authority.ownerToken,
       ),
     ).toThrow("legacy state snapshot");

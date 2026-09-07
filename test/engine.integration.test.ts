@@ -1018,36 +1018,6 @@ describe.sequential("EpicEngine workflow", () => {
     30_000,
   );
 
-  it("reports a one-time rotation of an unverifiable legacy SDK session", async () => {
-    const setup = await fixture();
-    const created = await EpicEngine.create(
-      { repoPath: setup.repo, epicId: "demo", codexPath: setup.codex },
-      setup.store,
-    );
-    const state = created.snapshot();
-    state.phase = "complete";
-    state.completedTasks = state.totalTasks;
-    state.pendingAgentCleanup.push({
-      kind: "session",
-      runtime: "sdk",
-      role: "implementation",
-      sessionId: "thr-legacy",
-      reason: "unverifiable-session-contract",
-    });
-    setup.store.save(state);
-    const engine = EpicEngine.resume(state.runId, {}, setup.store);
-
-    const completed = await engine.run();
-
-    expect(completed.phase, completed.lastError ?? undefined).toBe("complete");
-    expect(
-      setup.store
-        .events(completed.runId)
-        .some((event) => event.kind === "agent.legacy_session_rotated"),
-    ).toBe(true);
-    setup.store.close();
-  }, 30_000);
-
   it("stops when cleanup completion cannot be persisted under the controller lease", async () => {
     const setup = await fixture();
     const engine = await EpicEngine.create(

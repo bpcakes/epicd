@@ -1,13 +1,28 @@
 import {
   createInactiveAgentSessions,
   DEFAULT_AGENT_PREFERENCES,
+  SdkAgentSessionContractSchema,
   type RunState,
 } from "../../../src/domain/types.js";
+
+export function currentSession(sessionId: string) {
+  const settings = { model: "gpt-pinned", reasoningEffort: "xhigh" };
+  return {
+    status: "active" as const,
+    sessionId,
+    contract: SdkAgentSessionContractSchema.parse({
+      runtime: "sdk",
+      requested: settings,
+      effective: settings,
+    }),
+  };
+}
 
 export function initialRun(runId = "adaptive-test"): RunState {
   const at = new Date().toISOString();
   return {
-    stateSchemaVersion: 1,
+    stateSchemaVersion: 2,
+    orchestrationMode: "legacy",
     runId,
     agentNamespace: "0123456789abcdef0123",
     repoPath: `/repo/${runId}`,

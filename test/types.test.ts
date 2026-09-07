@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { currentSession } from "./fixtures/orchestration/state.js";
 import {
   createInactiveAgentSessions,
   AgentSessionContractSchema,
@@ -54,27 +55,16 @@ describe("run recovery classification", () => {
     expect(
       runRecoveryKind({ ...state, pendingAgentCleanup: [{ kind: "run", runtime: "herdr" }] }),
     ).toBe("cleanup");
-    state.agentSessions.review = {
-      status: "unresolved",
-      sessionId: "review",
-      settings: { model: null, reasoningEffort: "high" },
-    };
+    state.agentSessions.review = currentSession("review");
     expect(runRecoveryKind(state)).toBe("cleanup");
     expect(runRecoveryKind({ ...state, phase: "paused" })).toBe("workflow");
   });
 });
 
 describe("agent session identity", () => {
-  it("exposes IDs for active and unresolved sessions but not inactive sessions", () => {
+  it("exposes IDs for active sessions but not inactive sessions", () => {
     const agentSessions = createInactiveAgentSessions();
     expect(runAgentSessionId({ agentSessions }, "review")).toBeNull();
-
-    agentSessions.review = {
-      status: "unresolved",
-      sessionId: "unresolved-review",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    };
-    expect(runAgentSessionId({ agentSessions }, "review")).toBe("unresolved-review");
 
     agentSessions.review = {
       status: "active",

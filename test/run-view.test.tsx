@@ -1,3 +1,4 @@
+import { initialRun } from "./fixtures/orchestration/state.js";
 import { setImmediate } from "node:timers/promises";
 import { cleanup, render } from "ink-testing-library";
 import type { ComponentProps } from "react";
@@ -39,6 +40,7 @@ function runViewEngine(
   configureFutureAgentSettings: (settings: AgentPreferences) => void = () => undefined,
 ): EpicEngine {
   const current = RunStateSchema.parse({
+    ...initialRun(),
     runId: "run-view-test",
     agentNamespace: "0123456789abcdef0123",
     repoPath: "/repo",

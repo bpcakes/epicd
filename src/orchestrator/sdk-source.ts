@@ -93,6 +93,3 @@ export class ControlledDecisionSource implements DecisionSource {
     await this.runtime.reconcile(this.authority, attempt.turnIdentity);
   }
 }
-
-// Preserve the existing SDK constructor export while the bootstrap adopts the shared source.
-export { ControlledDecisionSource as SdkDecisionSource };

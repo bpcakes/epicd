@@ -579,9 +579,6 @@ export class EpicEngine {
     signal?: AbortSignal,
   ): Promise<OpenedAgentSession> {
     const activeSession = this.state.agentSessions[role];
-    if (activeSession.status === "unresolved") {
-      throw new Error(`Cannot open unresolved ${role} session before compatibility migration`);
-    }
     if (activeSession.status === "active") {
       return await this.openPreparedSession(
         role,
@@ -849,14 +846,6 @@ export class EpicEngine {
       } catch (error) {
         this.state.pendingAgentCleanup = pendingBeforeSave;
         throw error;
-      }
-      if (action.kind === "session" && action.reason === "unverifiable-session-contract") {
-        this.emit(
-          "warning",
-          "agent.legacy_session_rotated",
-          `Retired legacy ${action.role} session ${action.sessionId.slice(0, 12)}`,
-          "Its exact SDK model contract could not be proven; the next turn will use a fresh session",
-        );
       }
     }
   }

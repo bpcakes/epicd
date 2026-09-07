@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
+import { currentSession } from "./fixtures/orchestration/state.js";
 import {
   RunAlreadyControlledError,
   RunNotFoundError,
@@ -13,13 +14,12 @@ import {
 } from "../src/adapters/store.js";
 import {
   createInactiveAgentSessions,
-  DEFAULT_AGENT_SETTINGS,
   DEFAULT_AGENT_PREFERENCES,
-  prepareRunStateForControl,
+  prepareCompletedSessionCleanup,
   RunStateSchema,
   type RunState,
 } from "../src/domain/types.js";
-import { humanRunStatus, RunStatusV1Schema, runStatusView } from "../src/status.js";
+import { humanRunStatus, RunStatusSchema, runStatusView } from "../src/status.js";
 
 const tempDirs: string[] = [];
 
@@ -30,7 +30,8 @@ afterEach(() => {
 function state(runId: string, epicId = "epic-1"): RunState {
   const now = new Date().toISOString();
   return {
-    stateSchemaVersion: 1,
+    stateSchemaVersion: 2,
+    orchestrationMode: "legacy",
     runId,
     agentNamespace: "0123456789abcdef0123",
     repoPath: "/repo",
@@ -67,7 +68,7 @@ function state(runId: string, epicId = "epic-1"): RunState {
 }
 
 describe("StateStore", () => {
-  it("projects a versioned status contract with legacy session aliases", () => {
+  it("projects current session contracts without legacy status aliases", () => {
     const run = state("status-view");
     run.agentSessions.review = {
       status: "active",
@@ -89,8 +90,6 @@ describe("StateStore", () => {
     expect(status).toMatchObject({
       schemaVersion: 1,
       agentNamespace: run.agentNamespace,
-      reviewThreadId: "thr-review",
-      orchestratorThreadId: null,
       agentSessions: { review: { status: "active", sessionId: "thr-review" } },
       baseRevision: run.baseRevision,
       epicBaseRevision: run.epicBaseRevision,
@@ -106,9 +105,11 @@ describe("StateStore", () => {
       },
       agentPreferences: run.agentSettings,
     });
-    expect(() => RunStatusV1Schema.parse({ ...status, schemaVersion: 2 })).toThrow();
+    expect(() => RunStatusSchema.parse({ ...status, schemaVersion: 2 })).toThrow();
+    expect(status).not.toHaveProperty("reviewThreadId");
+    expect(() => RunStatusSchema.parse({ ...status, reviewThreadId: "thr-review" })).toThrow();
     expect(
-      RunStatusV1Schema.parse({
+      RunStatusSchema.parse({
         ...status,
         controllerLease: { ...controllerLease, leaseId: "opaque-lease-token" },
       }).controllerLease?.leaseId,
@@ -122,15 +123,11 @@ describe("StateStore", () => {
     const run = state("status-recovery");
     run.phase = "complete";
     run.lastError = "cleanup completion could not be recorded";
-    run.agentSessions.review = {
-      status: "unresolved",
-      sessionId: "legacy-review",
-      settings: DEFAULT_AGENT_SETTINGS.review,
-    };
+    run.agentSessions.review = currentSession("review");
 
     const status = humanRunStatus(run);
 
-    expect(status).toContain("session recovery: review (unresolved)");
+    expect(status).toContain("session recovery: review (active)");
     expect(status).toContain("last error: cleanup completion could not be recorded");
   });
 
@@ -143,49 +140,10 @@ describe("StateStore", () => {
     );
   });
 
-  it("defaults legacy persisted runs to the SDK runtime", () => {
-    const legacy = { ...state("legacy") } as Record<string, unknown>;
-    delete legacy.runtime;
-    delete legacy.agentSettings;
-    delete legacy.agentAccessMode;
-    delete legacy.agentNamespace;
-    delete legacy.agentSessions;
-    delete legacy.pendingAgentCleanup;
-    delete legacy.maxReviewPasses;
-    delete legacy.stateSchemaVersion;
-    expect(RunStateSchema.parse(legacy).stateSchemaVersion).toBe(1);
-    expect(RunStateSchema.parse(legacy).runtime).toBe("sdk");
-    expect(RunStateSchema.parse(legacy).agentSettings).toEqual(DEFAULT_AGENT_PREFERENCES);
-    expect(RunStateSchema.parse(legacy).agentAccessMode).toBe("sandboxed");
-    expect(RunStateSchema.parse(legacy).agentNamespace).toMatch(/^[a-f0-9]{20}$/);
-    expect(RunStateSchema.parse(legacy).agentSessions).toEqual(createInactiveAgentSessions());
-    expect(RunStateSchema.parse(legacy).pendingAgentCleanup).toEqual([]);
-    expect(RunStateSchema.parse(legacy).maxReviewPasses).toBe(5);
-    const firstDefaults = RunStateSchema.parse(legacy);
-    const secondDefaults = RunStateSchema.parse(legacy);
-    expect(firstDefaults.agentSessions).not.toBe(secondDefaults.agentSessions);
-    expect(firstDefaults.agentSettings.orchestrator).not.toBe(
-      secondDefaults.agentSettings.orchestrator,
-    );
-  });
-
   it("rejects persisted state written by an unsupported future schema", () => {
     expect(() =>
       RunStateSchema.parse({ ...state("future-state"), stateSchemaVersion: 3 }),
     ).toThrow();
-  });
-
-  it("preserves concrete reasoning from legacy runs as explicit role overrides", () => {
-    const legacy = {
-      ...state("legacy-reasoning"),
-      agentSettings: DEFAULT_AGENT_SETTINGS,
-    } as Record<string, unknown>;
-    delete legacy.reasoningEffort;
-
-    expect(RunStateSchema.parse(legacy)).toMatchObject({
-      reasoningEffort: null,
-      agentSettings: DEFAULT_AGENT_SETTINGS,
-    });
   });
 
   it("rejects blank model identifiers at the persisted state boundary", () => {
@@ -196,74 +154,12 @@ describe("StateStore", () => {
     );
   });
 
-  it("migrates the legacy dangerous permission boolean to a named access mode", () => {
-    const legacy = { ...state("legacy-danger") } as Record<string, unknown>;
-    delete legacy.agentAccessMode;
-    legacy.dangerouslyBypassApprovalsAndSandbox = true;
-
-    expect(RunStateSchema.parse(legacy).agentAccessMode).toBe("danger-full-access");
-  });
-
-  it("decodes an unpinned legacy SDK session without applying a state transition", () => {
-    const legacy = { ...state("legacy-unresolved-session") } as Record<string, unknown>;
-    delete legacy.agentSessions;
-    legacy.implementationThreadId = "thr-implementation";
-
-    const migrated = RunStateSchema.parse(legacy);
-    expect(migrated.agentSessions.implementation).toEqual({
-      status: "unresolved",
-      sessionId: "thr-implementation",
-      settings: { model: null, reasoningEffort: "high" },
-    });
-    expect(migrated.pendingAgentCleanup).toEqual([]);
-
-    const controlled = prepareRunStateForControl(migrated);
-    expect(controlled.agentSessions.implementation).toEqual({ status: "inactive" });
-    expect(controlled.pendingAgentCleanup).toContainEqual({
-      kind: "session",
-      runtime: "sdk",
-      role: "implementation",
-      sessionId: "thr-implementation",
-      reason: "unverifiable-session-contract",
-    });
-  });
-
-  it("rotates a locally persisted unresolved SDK session only for a controller", () => {
-    const persisted = state("persisted-unresolved-session");
-    (persisted.agentSessions as Record<string, unknown>).review = {
-      status: "unresolved",
-      sessionId: "thr-review",
-      settings: DEFAULT_AGENT_SETTINGS.review,
-    };
-
-    const decoded = RunStateSchema.parse(persisted);
-    expect(decoded.agentSessions.review).toMatchObject({
-      status: "unresolved",
-      sessionId: "thr-review",
-    });
-    expect(decoded.pendingAgentCleanup).toEqual([]);
-
-    const migrated = prepareRunStateForControl(decoded);
-    expect(migrated.agentSessions.review).toEqual({ status: "inactive" });
-    expect(migrated.pendingAgentCleanup).toContainEqual({
-      kind: "session",
-      runtime: "sdk",
-      role: "review",
-      sessionId: "thr-review",
-      reason: "unverifiable-session-contract",
-    });
-  });
-
-  it("turns terminal legacy sessions into durable cleanup work", () => {
-    const completed = state("completed-legacy-session");
+  it("turns surviving current sessions into durable cleanup work", () => {
+    const completed = state("completed-session");
     completed.phase = "complete";
-    completed.agentSessions.review = {
-      status: "unresolved",
-      sessionId: "thr-completed-review",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    };
+    completed.agentSessions.review = currentSession("thr-completed-review");
 
-    const controlled = prepareRunStateForControl(completed);
+    const controlled = prepareCompletedSessionCleanup(completed);
 
     expect(controlled.agentSessions.review).toEqual({ status: "inactive" });
     expect(controlled.pendingAgentCleanup).toContainEqual({
@@ -271,67 +167,6 @@ describe("StateStore", () => {
       runtime: "sdk",
       role: "review",
       sessionId: "thr-completed-review",
-      reason: "unverifiable-session-contract",
-    });
-  });
-
-  it("migrates legacy pinned settings into one atomic active-session record", () => {
-    const legacy = { ...state("legacy-active-session") } as Record<string, unknown>;
-    delete legacy.agentSessions;
-    legacy.reviewThreadId = "thr-review";
-    legacy.activeAgentSettings = {
-      orchestrator: null,
-      implementation: null,
-      review: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-    };
-    expect(RunStateSchema.parse(legacy).agentSessions.review).toEqual({
-      status: "active",
-      sessionId: "thr-review",
-      contract: {
-        runtime: "sdk",
-        requested: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-        effective: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-      },
-    });
-  });
-
-  it("migrates the intermediate active-session shape into an explicit contract", () => {
-    const persisted = state("intermediate-session") as unknown as Record<string, unknown>;
-    const sessions = structuredClone(persisted.agentSessions) as Record<string, unknown>;
-    sessions.review = {
-      status: "active",
-      sessionId: "thr-review",
-      settings: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-    };
-    persisted.agentSessions = sessions;
-
-    expect(RunStateSchema.parse(persisted).agentSessions.review).toEqual({
-      status: "active",
-      sessionId: "thr-review",
-      contract: {
-        runtime: "sdk",
-        requested: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-        effective: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-      },
-    });
-  });
-
-  it("migrates pre-runtime session contracts into runtime-discriminated contracts", () => {
-    const persisted = state("pre-runtime-contract") as unknown as Record<string, unknown>;
-    const sessions = structuredClone(persisted.agentSessions) as Record<string, unknown>;
-    sessions.review = {
-      status: "active",
-      sessionId: "thr-review",
-      contract: {
-        requested: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-        effective: { model: "gpt-pinned", reasoningEffort: "xhigh" },
-      },
-    };
-    persisted.agentSessions = sessions;
-
-    expect(RunStateSchema.parse(persisted).agentSessions.review).toMatchObject({
-      status: "active",
-      contract: { runtime: "sdk" },
     });
   });
 
@@ -350,22 +185,6 @@ describe("StateStore", () => {
     persisted.agentSessions = sessions;
 
     expect(() => RunStateSchema.parse(persisted)).toThrow("session runtime must match");
-  });
-
-  it("rejects unresolved SDK compatibility state on a Herdr run", () => {
-    const persisted = state("unresolved-runtime-mismatch") as unknown as Record<string, unknown>;
-    persisted.runtime = "herdr";
-    const sessions = structuredClone(persisted.agentSessions) as Record<string, unknown>;
-    sessions.review = {
-      status: "unresolved",
-      sessionId: "thr-review",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    };
-    persisted.agentSessions = sessions;
-
-    expect(() => RunStateSchema.parse(persisted)).toThrow(
-      "unresolved sessions are valid only for the SDK runtime",
-    );
   });
 
   it("rejects an SDK contract without a concrete effective model", () => {
@@ -971,17 +790,13 @@ describe("StateStore", () => {
     store.close();
   });
 
-  it("keeps a terminal unresolved session reachable for controller migration", () => {
+  it("keeps a surviving session reachable for controller-owned cleanup", () => {
     const dir = mkdtempSync(join(tmpdir(), "epicd-store-"));
     tempDirs.push(dir);
     const store = new StateStore(join(dir, "state.sqlite3"));
     const unresolved = state("terminal-unresolved");
     unresolved.phase = "complete";
-    unresolved.agentSessions.review = {
-      status: "unresolved",
-      sessionId: "thr-terminal",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    };
+    unresolved.agentSessions.review = currentSession("thr-terminal");
     store.create(unresolved);
 
     expect(store.inspectRecoverable("/repo", "epic-1")).toMatchObject({
@@ -997,7 +812,6 @@ describe("StateStore", () => {
           runtime: "sdk",
           role: "review",
           sessionId: "thr-terminal",
-          reason: "unverifiable-session-contract",
         },
       ],
     });
@@ -1267,60 +1081,20 @@ describe("StateStore", () => {
     store.close();
   });
 
-  it("persists stateful session migration only when a controller acquires the lease", () => {
-    const dir = mkdtempSync(join(tmpdir(), "epicd-store-"));
-    tempDirs.push(dir);
-    const store = new StateStore(join(dir, "state.sqlite3"));
-    const unresolved = state("migration-on-control");
-    unresolved.agentSessions.review = {
-      status: "unresolved",
-      sessionId: "thr-legacy",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    };
-    store.create(unresolved);
-
-    expect(store.get(unresolved.runId)).toMatchObject({
-      agentSessions: { review: { status: "unresolved" } },
-      pendingAgentCleanup: [],
-    });
-
-    const lease = store.acquireLease(unresolved.runId);
-    expect(lease.state).toMatchObject({
-      agentSessions: { review: { status: "inactive" } },
-      pendingAgentCleanup: [
-        {
-          kind: "session",
-          runtime: "sdk",
-          role: "review",
-          sessionId: "thr-legacy",
-          reason: "unverifiable-session-contract",
-        },
-      ],
-    });
-    store.releaseLease(unresolved.runId, lease.ownerToken);
-    expect(store.get(unresolved.runId)).toMatchObject(lease.state);
-    store.close();
-  });
-
-  it("updates settings atomically without taking a lease or performing controller migration", () => {
+  it("updates settings atomically without taking a lease or rewriting an active contract", () => {
     const dir = mkdtempSync(join(tmpdir(), "epicd-store-"));
     tempDirs.push(dir);
     const store = new StateStore(join(dir, "state.sqlite3"));
     const unresolved = state("settings-lease-no-migration");
-    unresolved.agentSessions.review = {
-      status: "unresolved",
-      sessionId: "thr-legacy",
-      settings: { model: null, reasoningEffort: "xhigh" },
-    };
+    unresolved.agentSessions.review = currentSession("thr-current");
     store.create(unresolved);
 
     const settings = structuredClone(unresolved.agentSettings);
     settings.review = { model: "gpt-next", reasoningEffort: null };
     const updated = store.updateAgentSettings(unresolved.runId, settings);
-    expect(store.get(unresolved.runId)?.agentSessions.review).toMatchObject({
-      status: "unresolved",
-      sessionId: "thr-legacy",
-    });
+    expect(store.get(unresolved.runId)?.agentSessions.review).toEqual(
+      currentSession("thr-current"),
+    );
     expect(updated.agentSettings).toEqual(settings);
     expect(store.get(unresolved.runId)?.pendingAgentCleanup).toEqual([]);
     expect(store.controllerLease(unresolved.runId)).toBeNull();

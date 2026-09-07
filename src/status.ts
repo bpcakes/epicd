@@ -10,7 +10,6 @@ import {
   ReasoningEffortSchema,
   ReviewFindingSchema,
   resolveAgentSettings,
-  runAgentSessionId,
   RunPhaseSchema,
   RuntimeKindSchema,
   type RunState,
@@ -25,7 +24,7 @@ export const ControllerLeaseInfoSchema = z.object({
   alive: z.boolean(),
 });
 
-export const RunStatusV1Schema = z.object({
+export const RunStatusSchema = z.strictObject({
   schemaVersion: z.literal(1),
   runId: z.string(),
   agentNamespace: z.string(),
@@ -42,9 +41,6 @@ export const RunStatusV1Schema = z.object({
   agentPreferences: AgentPreferencesSchema,
   controllerLease: ControllerLeaseInfoSchema.nullable(),
   agentSessions: AgentSessionsSchema,
-  orchestratorThreadId: z.string().nullable(),
-  implementationThreadId: z.string().nullable(),
-  reviewThreadId: z.string().nullable(),
   maxReviewPasses: z.number().int().positive(),
   currentBeadId: z.string().nullable(),
   currentBeadTitle: z.string().nullable(),
@@ -73,7 +69,7 @@ export const RunStatusV1Schema = z.object({
   updatedAt: z.string(),
 });
 
-export type RunStatus = z.infer<typeof RunStatusV1Schema>;
+export type RunStatus = z.infer<typeof RunStatusSchema>;
 
 function humanStatusField(label: string, value: string): string {
   const [first = "", ...continuation] = value.split(/\r?\n/);
@@ -103,7 +99,7 @@ export function runStatusView(
   state: RunState,
   controllerLease: ControllerLeaseInfo | null = null,
 ): RunStatus {
-  return RunStatusV1Schema.parse({
+  return RunStatusSchema.parse({
     schemaVersion: 1,
     runId: state.runId,
     agentNamespace: state.agentNamespace,
@@ -120,10 +116,6 @@ export function runStatusView(
     agentPreferences: state.agentSettings,
     controllerLease,
     agentSessions: state.agentSessions,
-    // Retained aliases for the original v0.1 JSON shape.
-    orchestratorThreadId: runAgentSessionId(state, "orchestrator"),
-    implementationThreadId: runAgentSessionId(state, "implementation"),
-    reviewThreadId: runAgentSessionId(state, "review"),
     maxReviewPasses: state.maxReviewPasses,
     currentBeadId: state.currentBeadId,
     currentBeadTitle: state.currentBeadTitle,

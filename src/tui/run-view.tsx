@@ -57,7 +57,7 @@ function effectiveFutureSettings(state: RunState, role: AgentRole): AgentRoleSet
 function displayedSettings(state: RunState, role: AgentRole): AgentRoleSettings {
   const session = state.agentSessions[role];
   if (session.status === "inactive") return effectiveFutureSettings(state, role);
-  return session.status === "active" ? session.contract.effective : session.settings;
+  return session.contract.effective;
 }
 
 export function AgentConfig({
@@ -177,8 +177,6 @@ export function AgentConfig({
                 <Text
                   dimColor
                 >{`    active ${session.contract.effective.model ?? "default"} · ${session.contract.effective.reasoningEffort}`}</Text>
-              ) : session.status === "unresolved" ? (
-                <Text dimColor>{`    legacy session pending rotation`}</Text>
               ) : (
                 <Text dimColor> active —</Text>
               )}

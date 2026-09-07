@@ -4,7 +4,8 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
-import { initialRun } from "./fixtures/orchestration/state.js";
+import { RunStateSchema, AgentSessionStateSchema } from "../src/domain/types.js";
+import { currentSession, initialRun } from "./fixtures/orchestration/state.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -18,6 +19,88 @@ function fixture() {
 }
 
 describe("hard-cut state format", () => {
+  it("requires persisted fields instead of supplying historical defaults", () => {
+    for (const field of [
+      "stateSchemaVersion",
+      "orchestrationMode",
+      "runtime",
+      "reasoningEffort",
+      "agentSettings",
+      "agentNamespace",
+      "agentAccessMode",
+      "maxReviewPasses",
+      "agentSessions",
+      "pendingAgentCleanup",
+      "reviewBaselineFingerprint",
+      "reviewedFingerprint",
+      "reviewedTree",
+    ]) {
+      const input: Record<string, unknown> = initialRun();
+      delete input[field];
+      expect(RunStateSchema.safeParse(input).success, field).toBe(false);
+      expect(input).not.toHaveProperty(field);
+    }
+  });
+
+  it("rejects obsolete session contracts instead of inventing settings or a cleanup transition", () => {
+    const active = currentSession("session");
+    for (const obsolete of [
+      { status: "unresolved", sessionId: "session", settings: active.contract.requested },
+      { status: "active", sessionId: "session", settings: active.contract.requested },
+      {
+        ...active,
+        contract: { requested: active.contract.requested, effective: active.contract.effective },
+      },
+      {
+        ...active,
+        contract: { ...active.contract, effective: { model: null, reasoningEffort: "xhigh" } },
+      },
+    ])
+      expect(AgentSessionStateSchema.safeParse(obsolete).success).toBe(false);
+    expect(AgentSessionStateSchema.parse(JSON.parse(JSON.stringify(active)))).toEqual(active);
+    for (const alias of [
+      "reviewThreadId",
+      "implementationThreadId",
+      "orchestratorThreadId",
+      "activeAgentSettings",
+      "dangerouslyBypassApprovalsAndSandbox",
+    ]) {
+      expect(
+        RunStateSchema.safeParse({ ...initialRun(), [alias]: "obsolete" }).success,
+        alias,
+      ).toBe(false);
+    }
+  });
+
+  it.each(["old-version", "session-alias"])(
+    "refuses %s persisted JSON on reads and lease acquisition without rewriting it",
+    (variant) => {
+      const { path } = fixture();
+      const store = new StateStore(path);
+      cleanups.push(() => store.close());
+      const run = store.createAdaptive(
+        initialRun(),
+        RepositoryPolicySchema.parse({ schemaVersion: 1 }),
+      );
+      const db = new Database(path);
+      cleanups.push(() => db.close());
+      const obsolete =
+        variant === "old-version"
+          ? { ...run, stateSchemaVersion: 1 }
+          : { ...run, reviewThreadId: "do-not-revive" };
+      const raw = JSON.stringify(obsolete);
+      db.prepare("UPDATE runs SET state_json = ? WHERE run_id = ?").run(raw, run.runId);
+      expect(() => store.get(run.runId)).toThrow("Persisted state");
+      expect(store.inspect(run.repoPath)[0]?.kind).toBe("invalid");
+      expect(() => store.acquireLease(run.runId)).toThrow("Persisted state");
+      expect(store.controllerLease(run.runId)).toBeNull();
+      expect(db.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(run.runId)).toEqual({
+        state_json: raw,
+      });
+      expect(store.orchestration.agents.turns(run.runId)).toEqual([]);
+    },
+  );
+
   it("creates the current schema once and reopens current runs without rewriting their state", () => {
     const { root, path } = fixture();
     const store = new StateStore(path);

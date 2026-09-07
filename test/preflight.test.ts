@@ -9,7 +9,8 @@ import { resolveRunPreflight } from "../src/preflight.js";
 function run(runtime: RunState["runtime"], phase: RunState["phase"]): RunState {
   const now = new Date().toISOString();
   return {
-    stateSchemaVersion: 1,
+    stateSchemaVersion: 2,
+    orchestrationMode: "legacy",
     runId: "run-1",
     agentNamespace: "0123456789abcdef0123",
     repoPath: "/repo",

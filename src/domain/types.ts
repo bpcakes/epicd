@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { z } from "zod";
 
 export const IssueStatusSchema = z.enum([
@@ -108,12 +107,11 @@ export const AgentAccessModeSchema = z.enum(["sandboxed", "danger-full-access"])
 export type AgentAccessMode = z.infer<typeof AgentAccessModeSchema>;
 
 export const AgentCleanupActionSchema = z.discriminatedUnion("kind", [
-  z.object({
+  z.strictObject({
     kind: z.literal("session"),
     runtime: RuntimeKindSchema,
     role: AgentRoleSchema,
     sessionId: z.string().min(1),
-    reason: z.literal("unverifiable-session-contract").optional(),
   }),
   z.object({
     kind: z.literal("run"),
@@ -232,7 +230,7 @@ export const ResolvedAgentRoleSettingsSchema = AgentRoleSettingsSchema.extend({
 export type ResolvedAgentRoleSettings = z.infer<typeof ResolvedAgentRoleSettingsSchema>;
 
 export const SdkAgentSessionContractSchema = z
-  .object({
+  .strictObject({
     runtime: z.literal("sdk"),
     requested: AgentRoleSettingsSchema.readonly(),
     effective: ResolvedAgentRoleSettingsSchema.readonly(),
@@ -241,7 +239,7 @@ export const SdkAgentSessionContractSchema = z
 export type SdkAgentSessionContract = z.infer<typeof SdkAgentSessionContractSchema>;
 
 export const HerdrAgentSessionContractSchema = z
-  .object({
+  .strictObject({
     runtime: z.literal("herdr"),
     requested: AgentRoleSettingsSchema.readonly(),
     effective: AgentRoleSettingsSchema.readonly(),
@@ -256,13 +254,8 @@ export const AgentSessionContractSchema = z.discriminatedUnion("runtime", [
 export type AgentSessionContract = z.infer<typeof AgentSessionContractSchema>;
 
 export const AgentSessionStateSchema = z.discriminatedUnion("status", [
-  z.object({ status: z.literal("inactive") }),
-  z.object({
-    status: z.literal("unresolved"),
-    sessionId: z.string().min(1),
-    settings: AgentRoleSettingsSchema,
-  }),
-  z.object({
+  z.strictObject({ status: z.literal("inactive") }),
+  z.strictObject({
     status: z.literal("active"),
     sessionId: z.string().min(1),
     contract: AgentSessionContractSchema,
@@ -270,7 +263,7 @@ export const AgentSessionStateSchema = z.discriminatedUnion("status", [
 ]);
 export type AgentSessionState = z.infer<typeof AgentSessionStateSchema>;
 
-export const AgentSessionsSchema = z.object({
+export const AgentSessionsSchema = z.strictObject({
   orchestrator: AgentSessionStateSchema,
   implementation: AgentSessionStateSchema,
   review: AgentSessionStateSchema,
@@ -305,36 +298,31 @@ export type RunPhase = z.infer<typeof RunPhaseSchema>;
 
 export const RUN_STATE_SCHEMA_VERSION = 2;
 
-const RunStateBaseSchema = z.object({
-  stateSchemaVersion: z.union([z.literal(1), z.literal(2)]),
-  orchestrationMode: z.enum(["legacy", "adaptive"]).optional(),
+const RunStateBaseSchema = z.strictObject({
+  stateSchemaVersion: z.literal(RUN_STATE_SCHEMA_VERSION),
+  orchestrationMode: z.enum(["legacy", "adaptive"]),
   runId: z.string(),
   agentNamespace: z.string().regex(/^[a-f0-9]{20}$/),
   repoPath: z.string(),
   epicId: z.string(),
   epicTitle: z.string(),
   model: ModelIdSchema.nullable(),
-  reasoningEffort: ReasoningEffortSchema.nullable().default(null),
-  runtime: RuntimeKindSchema.default("sdk"),
-  agentSettings: AgentPreferencesSchema.default(() => ({
-    orchestrator: { ...DEFAULT_AGENT_PREFERENCES.orchestrator },
-    implementation: { ...DEFAULT_AGENT_PREFERENCES.implementation },
-    review: { ...DEFAULT_AGENT_PREFERENCES.review },
-  })),
-  agentAccessMode: AgentAccessModeSchema.default("sandboxed"),
-  // Runs persisted before this setting existed used the historical default of five.
-  maxReviewPasses: z.number().int().positive().default(5),
+  reasoningEffort: ReasoningEffortSchema.nullable(),
+  runtime: RuntimeKindSchema,
+  agentSettings: AgentPreferencesSchema,
+  agentAccessMode: AgentAccessModeSchema,
+  maxReviewPasses: z.number().int().positive(),
   phase: RunPhaseSchema,
   currentBeadId: z.string().nullable(),
   currentBeadTitle: z.string().nullable(),
-  agentSessions: AgentSessionsSchema.default(createInactiveAgentSessions),
-  pendingAgentCleanup: z.array(AgentCleanupActionSchema).default([]),
+  agentSessions: AgentSessionsSchema,
+  pendingAgentCleanup: z.array(AgentCleanupActionSchema),
   baseRevision: z.string().nullable(),
   epicBaseRevision: z.string(),
   candidateRevision: z.string().nullable(),
-  reviewBaselineFingerprint: z.string().nullable().default(null),
-  reviewedFingerprint: z.string().nullable().default(null),
-  reviewedTree: z.string().nullable().default(null),
+  reviewBaselineFingerprint: z.string().nullable(),
+  reviewedFingerprint: z.string().nullable(),
+  reviewedTree: z.string().nullable(),
   completedTasks: z.number().int().nonnegative(),
   totalTasks: z.number().int().nonnegative(),
   reviewPass: z.number().int().nonnegative(),
@@ -354,141 +342,6 @@ const RunStateBaseSchema = z.object({
   updatedAt: z.string(),
 });
 
-function migrateRunStateInput(input: unknown): unknown {
-  if (!isUnknownRecord(input)) return input;
-  const state = { ...input };
-  if (
-    state.stateSchemaVersion !== undefined &&
-    state.stateSchemaVersion !== 1 &&
-    state.stateSchemaVersion !== RUN_STATE_SCHEMA_VERSION
-  )
-    return state;
-  state.stateSchemaVersion ??= 1;
-  if (state.agentAccessMode === undefined) {
-    state.agentAccessMode =
-      state.dangerouslyBypassApprovalsAndSandbox === true ? "danger-full-access" : "sandboxed";
-  }
-  if (state.agentNamespace === undefined && typeof state.runId === "string") {
-    state.agentNamespace = createHash("sha256").update(state.runId).digest("hex").slice(0, 20);
-  }
-  const sessions =
-    state.agentSessions === undefined ? migrateLegacyAgentSessions(state) : state.agentSessions;
-  state.agentSessions = migrateSessionContracts(state, sessions);
-  return state;
-}
-
-function migrateSessionContracts(state: Record<string, unknown>, sessions: unknown): unknown {
-  if (!isUnknownRecord(sessions)) return sessions;
-  const runtime = state.runtime === "herdr" ? "herdr" : "sdk";
-  return Object.fromEntries(
-    Object.entries(sessions).map(([role, session]) => {
-      if (!isUnknownRecord(session) || session.status !== "active") return [role, session];
-
-      if (session.contract === undefined) {
-        const settings = AgentRoleSettingsSchema.safeParse(session.settings);
-        if (!settings.success) return [role, session];
-        if (runtime === "sdk" && settings.data.model === null) {
-          return [
-            role,
-            { status: "unresolved", sessionId: session.sessionId, settings: settings.data },
-          ];
-        }
-        return [
-          role,
-          {
-            status: "active",
-            sessionId: session.sessionId,
-            contract: {
-              runtime,
-              requested: settings.data,
-              effective: settings.data,
-            },
-          },
-        ];
-      }
-
-      if (!isUnknownRecord(session.contract) || session.contract.runtime !== undefined) {
-        return [role, session];
-      }
-      const requested = AgentRoleSettingsSchema.safeParse(session.contract.requested);
-      const effective = AgentRoleSettingsSchema.safeParse(session.contract.effective);
-      if (!requested.success || !effective.success) return [role, session];
-      if (runtime === "sdk" && effective.data.model === null) {
-        return [
-          role,
-          { status: "unresolved", sessionId: session.sessionId, settings: requested.data },
-        ];
-      }
-      return [
-        role,
-        {
-          status: "active",
-          sessionId: session.sessionId,
-          contract: { runtime, requested: requested.data, effective: effective.data },
-        },
-      ];
-    }),
-  );
-}
-
-function isUnknownRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-const LegacyActiveAgentSettingsSchema = z.object({
-  orchestrator: AgentRoleSettingsSchema.nullable(),
-  implementation: AgentRoleSettingsSchema.nullable(),
-  review: AgentRoleSettingsSchema.nullable(),
-});
-
-function migrateLegacyAgentSessions(state: Record<string, unknown>): AgentSessions {
-  const configured = AgentPreferencesSchema.safeParse(state.agentSettings);
-  const activeSettings = LegacyActiveAgentSettingsSchema.safeParse(state.activeAgentSettings);
-  const fallbackModel = typeof state.model === "string" && state.model ? state.model : null;
-  const legacySessionIds: Record<AgentRole, unknown> = {
-    orchestrator: state.orchestratorThreadId,
-    implementation: state.implementationThreadId,
-    review: state.reviewThreadId,
-  };
-  const sessions = createInactiveAgentSessions();
-
-  for (const role of AGENT_ROLES) {
-    const sessionId = legacySessionIds[role];
-    if (typeof sessionId !== "string" || !sessionId) continue;
-    const configuredSettings =
-      (activeSettings.success ? activeSettings.data[role] : null) ??
-      (configured.success ? configured.data[role] : DEFAULT_AGENT_PREFERENCES[role]);
-    const settings = {
-      ...configuredSettings,
-      model: configuredSettings.model ?? fallbackModel,
-      reasoningEffort:
-        configuredSettings.reasoningEffort ??
-        ReasoningEffortSchema.safeParse(state.reasoningEffort).data ??
-        DEFAULT_AGENT_SETTINGS[role].reasoningEffort,
-    };
-    if (state.runtime === "herdr") {
-      sessions[role] = {
-        status: "active",
-        sessionId,
-        contract: { runtime: "herdr", requested: settings, effective: settings },
-      };
-    } else if (settings.model === null) {
-      sessions[role] = { status: "unresolved", sessionId, settings };
-    } else {
-      sessions[role] = {
-        status: "active",
-        sessionId,
-        contract: {
-          runtime: "sdk",
-          requested: settings,
-          effective: { ...settings, model: settings.model },
-        },
-      };
-    }
-  }
-  return sessions;
-}
-
 type RequiredRunStateField =
   "currentBeadId" | "baseRevision" | "candidateRevision" | "reviewedFingerprint" | "reviewedTree";
 
@@ -502,102 +355,86 @@ const requiredFieldsByPhase: Partial<Record<RunPhase, readonly RequiredRunStateF
   closing: ["currentBeadId", "baseRevision", "candidateRevision"],
 };
 
-export const RunStateSchema = z
-  .preprocess(migrateRunStateInput, RunStateBaseSchema)
-  .superRefine((state, context) => {
-    if (state.stateSchemaVersion === 2 && state.orchestrationMode === undefined) {
+export const RunStateSchema = RunStateBaseSchema.superRefine((state, context) => {
+  if (state.orchestrationMode === "adaptive") {
+    if (state.agentAccessMode !== "sandboxed") {
       context.addIssue({
         code: "custom",
         path: ["orchestrationMode"],
-        message: "Version 2 requires an explicit orchestration mode",
+        message: "Adaptive runs require version 2 and confined access",
       });
     }
-    if (state.orchestrationMode === "adaptive") {
-      if (state.stateSchemaVersion !== 2 || state.agentAccessMode !== "sandboxed") {
+    try {
+      resolveAdaptiveAgentRoleSettings(state, "orchestrator");
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        path: ["agentSettings", "orchestrator"],
+        message: error instanceof Error ? error.message : "Invalid adaptive settings",
+      });
+    }
+  }
+  const activePhase =
+    state.phase === "paused" || state.phase === "blocked" ? state.resumePhase : state.phase;
+  if (activePhase && state.orchestrationMode !== "adaptive") {
+    const requiredFields: readonly RequiredRunStateField[] =
+      requiredFieldsByPhase[activePhase] ?? [];
+    for (const field of requiredFields) {
+      if (!state[field]) {
         context.addIssue({
           code: "custom",
-          path: ["orchestrationMode"],
-          message: "Adaptive runs require version 2 and confined access",
-        });
-      }
-      try {
-        resolveAdaptiveAgentRoleSettings(state, "orchestrator");
-      } catch (error) {
-        context.addIssue({
-          code: "custom",
-          path: ["agentSettings", "orchestrator"],
-          message: error instanceof Error ? error.message : "Invalid adaptive settings",
+          path: [field],
+          message: `${field} is required while the run is ${activePhase}`,
         });
       }
     }
-    const activePhase =
-      state.phase === "paused" || state.phase === "blocked" ? state.resumePhase : state.phase;
-    if (activePhase && state.orchestrationMode !== "adaptive") {
-      const requiredFields: readonly RequiredRunStateField[] =
-        requiredFieldsByPhase[activePhase] ?? [];
-      for (const field of requiredFields) {
-        if (!state[field]) {
-          context.addIssue({
-            code: "custom",
-            path: [field],
-            message: `${field} is required while the run is ${activePhase}`,
-          });
-        }
-      }
-      if (activePhase === "fixing" && state.pendingFindings.length === 0) {
-        context.addIssue({
-          code: "custom",
-          path: ["pendingFindings"],
-          message: "pendingFindings must not be empty while the run is fixing",
-        });
-      }
+    if (activePhase === "fixing" && state.pendingFindings.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["pendingFindings"],
+        message: "pendingFindings must not be empty while the run is fixing",
+      });
     }
-    const activeSessionIds = new Set(
-      AGENT_ROLES.flatMap((role) => {
-        const session = state.agentSessions[role];
-        return session.status === "inactive" ? [] : [session.sessionId];
-      }),
-    );
-    for (const role of AGENT_ROLES) {
+  }
+  const activeSessionIds = new Set(
+    AGENT_ROLES.flatMap((role) => {
       const session = state.agentSessions[role];
-      if (session.status === "active" && session.contract.runtime !== state.runtime) {
-        context.addIssue({
-          code: "custom",
-          path: ["agentSessions", role, "contract", "runtime"],
-          message: `${role} session runtime must match the run runtime`,
-        });
-      }
-      if (session.status === "unresolved" && state.runtime !== "sdk") {
-        context.addIssue({
-          code: "custom",
-          path: ["agentSessions", role, "status"],
-          message: `${role} unresolved sessions are valid only for the SDK runtime`,
-        });
-      }
+      return session.status === "inactive" ? [] : [session.sessionId];
+    }),
+  );
+  for (const role of AGENT_ROLES) {
+    const session = state.agentSessions[role];
+    if (session.status === "active" && session.contract.runtime !== state.runtime) {
+      context.addIssue({
+        code: "custom",
+        path: ["agentSessions", role, "contract", "runtime"],
+        message: `${role} session runtime must match the run runtime`,
+      });
     }
-    const cleanupKeys = new Set<string>();
-    for (const [index, action] of state.pendingAgentCleanup.entries()) {
-      const key =
-        action.kind === "run"
-          ? `run:${action.runtime}`
-          : `session:${action.runtime}:${action.sessionId}`;
-      if (cleanupKeys.has(key)) {
-        context.addIssue({
-          code: "custom",
-          path: ["pendingAgentCleanup", index],
-          message: "pendingAgentCleanup must not contain duplicate actions",
-        });
-      }
-      cleanupKeys.add(key);
-      if (action.kind === "session" && activeSessionIds.has(action.sessionId)) {
-        context.addIssue({
-          code: "custom",
-          path: ["pendingAgentCleanup", index, "sessionId"],
-          message: "a session cannot be active and pending cleanup at the same time",
-        });
-      }
+  }
+  const cleanupKeys = new Set<string>();
+  for (const [index, action] of state.pendingAgentCleanup.entries()) {
+    const key =
+      action.kind === "run"
+        ? `run:${action.runtime}`
+        : `session:${action.runtime}:${action.sessionId}`;
+    if (cleanupKeys.has(key)) {
+      context.addIssue({
+        code: "custom",
+        path: ["pendingAgentCleanup", index],
+        message: "pendingAgentCleanup must not contain duplicate actions",
+      });
     }
-  });
+    cleanupKeys.add(key);
+    if (action.kind === "session" && activeSessionIds.has(action.sessionId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["pendingAgentCleanup", index, "sessionId"],
+        message: "a session cannot be active and pending cleanup at the same time",
+      });
+    }
+  }
+});
 
 export type RunState = z.infer<typeof RunStateSchema>;
 
@@ -628,8 +465,8 @@ export function runNeedsResume(state: Parameters<typeof runRecoveryKind>[0]): bo
   return runRecoveryKind(state) !== null;
 }
 
-/** Applies stateful compatibility migrations only after a controller owns the run lease. */
-export function prepareRunStateForControl(state: RunState): RunState {
+/** Enqueue surviving current-format sessions for cleanup after workflow completion. */
+export function prepareCompletedSessionCleanup(state: RunState): RunState {
   const source = RunStateSchema.parse(state);
   const agentSessions: AgentSessions = { ...source.agentSessions };
   const pendingAgentCleanup: AgentCleanupAction[] = [...source.pendingAgentCleanup];
@@ -650,29 +487,8 @@ export function prepareRunStateForControl(state: RunState): RunState {
           runtime: source.runtime,
           role,
           sessionId: session.sessionId,
-          ...(session.status === "unresolved" && source.runtime === "sdk"
-            ? { reason: "unverifiable-session-contract" as const }
-            : {}),
         });
       }
-      continue;
-    }
-    if (session.status !== "unresolved") continue;
-    agentSessions[role] = { status: "inactive" };
-    const duplicate = pendingAgentCleanup.some(
-      (action) =>
-        action.kind === "session" &&
-        action.runtime === "sdk" &&
-        action.sessionId === session.sessionId,
-    );
-    if (!duplicate) {
-      pendingAgentCleanup.push({
-        kind: "session",
-        runtime: "sdk",
-        role,
-        sessionId: session.sessionId,
-        reason: "unverifiable-session-contract",
-      });
     }
   }
 

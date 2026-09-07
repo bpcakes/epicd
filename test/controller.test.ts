@@ -1,3 +1,4 @@
+import { initialRun } from "./fixtures/orchestration/state.js";
 import { describe, expect, it, vi } from "vitest";
 import { RunAlreadyControlledError } from "../src/adapters/store.js";
 import { RunStateSchema } from "../src/domain/types.js";
@@ -18,6 +19,7 @@ import {
 } from "../src/controller.js";
 
 const state = RunStateSchema.parse({
+  ...initialRun(),
   runId: "controller-test",
   agentNamespace: "0123456789abcdef0123",
   repoPath: "/repo",

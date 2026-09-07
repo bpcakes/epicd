@@ -1,3 +1,4 @@
+import { initialRun } from "./fixtures/orchestration/state.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -88,6 +89,7 @@ async function fixture(entry: Entry, flags: string[] = [], recovered?: "workflow
     try {
       store.create(
         domain.RunStateSchema.parse({
+          ...initialRun(),
           runId: "existing-run",
           agentNamespace: "0123456789abcdef0123",
           repoPath: root,

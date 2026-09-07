@@ -1,3 +1,4 @@
+import { initialRun } from "./fixtures/orchestration/state.js";
 import { execFileSync, spawnSync, type SpawnSyncReturns } from "node:child_process";
 import {
   chmodSync,
@@ -37,6 +38,7 @@ function fixture(): { repo: string; stateRoot: string; statePath: string; bin: s
 
 function state(repoPath: string, runId: string): RunState {
   return RunStateSchema.parse({
+    ...initialRun(),
     runId,
     agentNamespace: "0123456789abcdef0123",
     repoPath,
@@ -119,11 +121,13 @@ describe("CLI integration", () => {
     const json = runCli(setup, ["status", "--json"]);
     expect(json.status).toBe(0);
     const statuses = JSON.parse(json.stdout) as Array<{
-      agentSessions: { review: { contract: { effective: { model: string | null } } } };
-      reviewThreadId: string | null;
+      agentSessions: {
+        review: { sessionId: string; contract: { effective: { model: string | null } } };
+      };
     }>;
     expect(statuses[0]?.agentSessions.review.contract.effective.model).toBeNull();
-    expect(statuses[0]?.reviewThreadId).toBe("herdr-review");
+    expect(statuses[0]?.agentSessions.review.sessionId).toBe("herdr-review");
+    expect(statuses[0]).not.toHaveProperty("reviewThreadId");
   });
 
   it("omits corrupt rows from JSON status and exits unsuccessfully", () => {

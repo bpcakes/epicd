@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { agentOptions } from "../src/agent-options.js";
 import { createInactiveAgentSessions, runNeedsResume } from "../src/domain/types.js";
+import { currentSession } from "./fixtures/orchestration/state.js";
 
 describe("CLI agent options", () => {
   it("represents explicit per-role inheritance resets", () => {
@@ -63,11 +64,7 @@ describe("run ownership", () => {
         phase: "complete",
         agentSessions: {
           ...inactive,
-          review: {
-            status: "unresolved",
-            sessionId: "thr-legacy",
-            settings: { model: null, reasoningEffort: "xhigh" },
-          },
+          review: currentSession("review"),
         },
         pendingAgentCleanup: [],
       }),

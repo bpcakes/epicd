@@ -27,7 +27,7 @@ import { ActionKernel } from "../src/kernel/actions.js";
 import { registerAgentCapabilities } from "../src/kernel/agents.js";
 import { buildOrchestratorContext } from "../src/orchestrator/context.js";
 import { OrchestratorLoop } from "../src/orchestrator/loop.js";
-import { SdkDecisionSource } from "../src/orchestrator/sdk-source.js";
+import { ControlledDecisionSource } from "../src/orchestrator/sdk-source.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -539,7 +539,12 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
         evidenceIds: [],
       }),
     );
-    const source = new SdkDecisionSource(journal, setup.authority, setup.agent, setup.driver());
+    const source = new ControlledDecisionSource(
+      journal,
+      setup.authority,
+      setup.agent,
+      setup.driver(),
+    );
     expect(await new OrchestratorLoop(kernel, source, { pollMs: 5 }).run(setup.authority)).toBe(
       "awaiting_user",
     );
@@ -574,7 +579,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       setup.authority,
       input.ticket.decisionId,
     );
-    const source = new SdkDecisionSource(
+    const source = new ControlledDecisionSource(
       setup.store.orchestration,
       setup.authority,
       setup.agent,
@@ -606,7 +611,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       input.ticket.decisionId,
     );
     const oldAuthority = setup.authority;
-    const source = new SdkDecisionSource(
+    const source = new ControlledDecisionSource(
       setup.store.orchestration,
       oldAuthority,
       setup.agent,
@@ -629,7 +634,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     ).toThrow("no confirmed stop");
     setup.newLease();
     setup.reopen();
-    const recoveredSource = new SdkDecisionSource(
+    const recoveredSource = new ControlledDecisionSource(
       setup.store.orchestration,
       setup.authority,
       setup.agent,
@@ -769,7 +774,12 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
   it("reconciles a real stopped decision turn when the operator pauses the loop", async () => {
     const setup = await fixture("hang", true);
     const journal = setup.store.orchestration;
-    const source = new SdkDecisionSource(journal, setup.authority, setup.agent, setup.driver());
+    const source = new ControlledDecisionSource(
+      journal,
+      setup.authority,
+      setup.agent,
+      setup.driver(),
+    );
     const running = new OrchestratorLoop(new ActionKernel(journal), source, { pollMs: 5 }).run(
       setup.authority,
     );
@@ -808,7 +818,12 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     const input = decisionInput(setup, new ActionKernel(journal));
     await setup.setResponse(decision(input.ticket, { kind: "inspect_run" }));
     const attempt = journal.decisionSource.start(setup.authority, input.ticket.decisionId);
-    const source = new SdkDecisionSource(journal, setup.authority, setup.agent, setup.driver());
+    const source = new ControlledDecisionSource(
+      journal,
+      setup.authority,
+      setup.agent,
+      setup.driver(),
+    );
     await source.decide({ ...input, attemptId: attempt.attemptId });
     expect(
       journal.agents.turns(setup.authority.runId)[0]!.prompt.instructions.length,
@@ -820,7 +835,12 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
   it("settles an SDK error without an uncaught late spawn abort or an automatic retry", async () => {
     const setup = await fixture("provider_error", true);
     const journal = setup.store.orchestration;
-    const source = new SdkDecisionSource(journal, setup.authority, setup.agent, setup.driver());
+    const source = new ControlledDecisionSource(
+      journal,
+      setup.authority,
+      setup.agent,
+      setup.driver(),
+    );
     expect(
       await new OrchestratorLoop(new ActionKernel(journal), source, { pollMs: 5 }).run(
         setup.authority,
@@ -846,7 +866,12 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     async () => {
       const setup = await fixture("live", true);
       const journal = setup.store.orchestration;
-      const source = new SdkDecisionSource(journal, setup.authority, setup.agent, setup.driver());
+      const source = new ControlledDecisionSource(
+        journal,
+        setup.authority,
+        setup.agent,
+        setup.driver(),
+      );
       const status = await new OrchestratorLoop(new ActionKernel(journal), source, {
         pollMs: 50,
       }).run(setup.authority);

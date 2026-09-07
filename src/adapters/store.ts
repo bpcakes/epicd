@@ -7,7 +7,7 @@ import { ZodError } from "zod";
 import {
   AgentPreferencesSchema,
   EngineEventSchema,
-  prepareRunStateForControl,
+  prepareCompletedSessionCleanup,
   RUN_STATE_SCHEMA_VERSION,
   runNeedsResume,
   runRecoveryKind,
@@ -934,7 +934,7 @@ export class StateStore {
           processMarker(process.pid),
         );
       const controlledState =
-        state.orchestrationMode === "adaptive" ? state : prepareRunStateForControl(state);
+        state.orchestrationMode === "adaptive" ? state : prepareCompletedSessionCleanup(state);
       if (encodeRunState(controlledState) !== encodeRunState(state)) {
         state = RunStateSchema.parse({
           ...controlledState,

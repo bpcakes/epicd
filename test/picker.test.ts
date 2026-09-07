@@ -1,3 +1,4 @@
+import { initialRun } from "./fixtures/orchestration/state.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setImmediate } from "node:timers/promises";
 import { createElement } from "react";
@@ -51,6 +52,7 @@ describe("epic picker selection", () => {
       status: "closed",
     });
     const run = RunStateSchema.parse({
+      ...initialRun(),
       runId: "diagnostic-run",
       agentNamespace: "0123456789abcdef0123",
       repoPath: "/repo",

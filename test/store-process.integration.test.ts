@@ -1,3 +1,4 @@
+import { initialRun } from "./fixtures/orchestration/state.js";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -18,6 +19,7 @@ afterEach(() => {
 
 function state(runId: string, epicId = "epic") {
   return RunStateSchema.parse({
+    ...initialRun(),
     runId,
     agentNamespace: "0123456789abcdef0123",
     repoPath: "/repo",
