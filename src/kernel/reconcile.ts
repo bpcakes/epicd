@@ -21,29 +21,51 @@ export async function reconcileActions(
     journal.assertAuthority(authority);
     const outcome = await inspect(action);
     journal.assertAuthority(authority);
-    if (outcome.status === "succeeded") {
-      journal.settleAction(authority, action.actionId, "indeterminate", {
-        status: "succeeded",
-        actionId: action.actionId,
-        result: outcome.result,
-      });
-      continue;
-    }
-    const problemId = randomUUID();
-    journal.appendObservation(authority, {
-      source: "reconciler",
-      sourceEventId: problemId,
-      kind: `recovery.${outcome.status}`,
-      summary: redactSensitiveText(outcome.detail, 7999),
-      artifactIds: [],
-      identity: null,
-      wakesOrchestrator: true,
+    settleRecoveryObservation(journal, authority, action, outcome);
+  }
+}
+
+/** Settle only the inspected parent. Another observer may already have settled it. */
+export function settleRecoveryObservation(
+  journal: OrchestrationJournal,
+  authority: ControllerAuthority,
+  action: ActionRecord,
+  input: RecoveryObservation,
+) {
+  journal.assertAuthority(authority);
+  const current = journal.action(authority.runId, action.actionId);
+  if (!current) throw new Error("Recovery parent is missing");
+  if (current.status !== "indeterminate") return current;
+  const outcome: RecoveryObservation =
+    input.status === "succeeded" &&
+    current.policyDigest !== journal.control(authority.runId).policyDigest
+      ? {
+          status: "failed",
+          detail:
+            "The recorded resource remains available, but superseded policy cannot authorize successful action settlement",
+        }
+      : input;
+  if (outcome.status === "succeeded")
+    return journal.settleAction(authority, action.actionId, "indeterminate", {
+      status: "succeeded",
+      actionId: action.actionId,
+      result: outcome.result,
     });
-    if (outcome.status === "failed")
-      journal.settleAction(authority, action.actionId, "indeterminate", {
+  const problemId = randomUUID();
+  journal.appendObservation(authority, {
+    source: "reconciler",
+    sourceEventId: problemId,
+    kind: `recovery.${outcome.status}`,
+    summary: redactSensitiveText(outcome.detail, 7999),
+    artifactIds: [],
+    identity: null,
+    wakesOrchestrator: true,
+  });
+  return outcome.status === "failed"
+    ? journal.settleAction(authority, action.actionId, "indeterminate", {
         status: "failed",
         actionId: action.actionId,
         problemId,
-      });
-  }
+      })
+    : current;
 }

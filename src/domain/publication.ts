@@ -179,6 +179,7 @@ export function concurrentWithPublication(kind: KernelAction["kind"]): boolean {
       "interrupt_agent",
       "escalate",
       "reconcile_publication",
+      "reconcile_action",
     ].includes(kind)
   );
 }

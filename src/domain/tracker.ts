@@ -307,6 +307,7 @@ export function concurrentWithTracker(kind: KernelAction["kind"]): boolean {
       "interrupt_agent",
       "escalate",
       "reconcile_tracker_operation",
+      "reconcile_action",
     ].includes(kind)
   );
 }

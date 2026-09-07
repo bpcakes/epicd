@@ -87,11 +87,12 @@ export async function reconcileCommit(
   workspaces: WorkspaceManager,
   authority: ControllerAuthority,
   commitId: string,
+  signal?: AbortSignal,
 ) {
   journal.assertAuthority(authority);
   const record = journal.commits.record(authority.runId, commitId);
   if (["created", "failed"].includes(record.status)) return record;
-  const observed = await workspaces.inspectCandidateCommit(authority, record);
+  const observed = await workspaces.inspectCandidateCommit(authority, record, signal);
   return journal.commits.finish(
     authority,
     commitId,

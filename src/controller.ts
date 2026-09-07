@@ -34,6 +34,10 @@ import {
   reconcileDiagnosticWorkspace,
 } from "./kernel/diagnostic-workspaces.js";
 import { reconcileActions } from "./kernel/reconcile.js";
+import {
+  registerDeliveryRecoveryCapabilities,
+  reconcileDeliveryAction,
+} from "./kernel/delivery-recovery.js";
 import { ControlledDecisionSource } from "./orchestrator/sdk-source.js";
 import { OrchestratorLoop } from "./orchestrator/loop.js";
 import { runStatusView } from "./status.js";
@@ -120,6 +124,7 @@ export class OrchestratorController {
       registerInspectionCapabilities(kernel, workspaces);
       registerReviewCapabilities(kernel, workspaces, driver, () => contractFor("review"));
       registerCommitCapabilities(kernel, workspaces);
+      registerDeliveryRecoveryCapabilities(kernel, workspaces, driver);
       registerPublicationCapabilities(kernel, workspaces);
       const tracker = registerTrackerCapabilities(
         kernel,
@@ -148,6 +153,15 @@ export class OrchestratorController {
         }
       }
       await reconcileActions(journal, authority, async (action) => {
+        const delivery = await reconcileDeliveryAction(
+          journal,
+          workspaces,
+          driver,
+          authority!,
+          action,
+          signal,
+        );
+        if (delivery) return delivery;
         if (action.request.action.kind === "reconcile_tracker_commit")
           return {
             status: "failed",

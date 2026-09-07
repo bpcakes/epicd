@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { OperationFailed } from "../src/kernel/guards.js";
@@ -115,5 +115,36 @@ describe("external action uncertainty", () => {
     await reconcileActions(store.orchestration, authority, async () => {
       throw new Error("Terminal actions need no replay");
     });
+  });
+
+  it("does not let successful recovery bypass the journal's superseded-policy settlement guard", async () => {
+    const { store, authority, decision } = fixture();
+    const journal = store.orchestration;
+    const accepted = journal.acceptAction(authority, decision);
+    if (accepted.kind !== "accepted") throw new Error("Expected accepted intent");
+    journal.startAction(authority, accepted.action.actionId);
+    // Fault injection: a recovered physical fact is not successful action authority.
+    const current = journal.control(authority.runId);
+    const policy = vi.spyOn(journal, "control").mockReturnValue({
+      ...current,
+      policyDigest: "f".repeat(64),
+    });
+    try {
+      await reconcileActions(journal, authority, async () => ({
+        status: "succeeded",
+        result: { kind: "resource", resourceId: "retained-resource", generation: 1 },
+      }));
+      expect(journal.action(authority.runId, accepted.action.actionId)?.status).toBe("failed");
+      expect(journal.observations(authority.runId)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "recovery.failed",
+            summary: expect.stringContaining("superseded policy"),
+          }),
+        ]),
+      );
+    } finally {
+      policy.mockRestore();
+    }
   });
 });

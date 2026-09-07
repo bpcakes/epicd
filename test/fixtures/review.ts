@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach } from "vitest";
 import { StateStore } from "../../src/adapters/store.js";
+import { registerDeliveryRecoveryCapabilities } from "../../src/kernel/delivery-recovery.js";
 import { WorkspaceManager } from "../../src/adapters/workspaces.js";
 import { ControlledSdkRuntime } from "../../src/adapters/controlled-sdk.js";
 import { ActionKernel } from "../../src/kernel/actions.js";
@@ -188,6 +189,7 @@ export async function fixture(
   const publication = registerPublicationCapabilities(kernel, manager);
   registerAgentCapabilities(kernel, driver, () => contract);
   registerReviewCapabilities(kernel, manager, driver, () => contract);
+  registerDeliveryRecoveryCapabilities(kernel, manager, driver);
   const decision = (action: KernelAction) => {
     const ticket = journal.beginDecision(
       authority,

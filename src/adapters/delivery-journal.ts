@@ -827,6 +827,15 @@ export class DeliveryJournal {
       [runId, evidenceId],
     );
   }
+  candidateForOperation(runId: string, operationId: string): CandidateRecord | null {
+    return this.byOperation(CandidateRecordSchema, "candidates", runId, operationId);
+  }
+  validationForOperation(runId: string, operationId: string): ValidationEvidence | null {
+    return this.byOperation(ValidationEvidenceSchema, "validation_evidence", runId, operationId);
+  }
+  reviewCopyForOperation(runId: string, operationId: string): CandidateWorkspace | null {
+    return this.byOperation(CandidateWorkspaceSchema, "candidate_workspaces", runId, operationId);
+  }
   latestPlan(runId: string, taskId: string): ValidationPlan | null {
     return (
       this.all(

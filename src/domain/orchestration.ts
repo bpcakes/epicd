@@ -222,6 +222,7 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({ kind: z.literal("inspect_publication"), publicationId: Id }),
   z.strictObject({ kind: z.literal("reconcile_publication"), publicationId: Id }),
+  z.strictObject({ kind: z.literal("reconcile_action"), actionId: z.uuid() }),
   z.strictObject({ kind: z.literal("refresh_tracker") }),
   z.strictObject({ kind: z.literal("export_tracker") }),
   z.strictObject({

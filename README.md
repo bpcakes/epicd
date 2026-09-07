@@ -47,7 +47,15 @@ The orchestrator can request `request_tracker_commit` with a retained export ope
 
 Tracker commits retain explicit ancestry to the reviewed application object. They do not invent a review of their own SHA. A final review may inspect the tracker-updated SHA directly, or remain valid at its original revision through a proven tracker-only chain with unchanged requirements, evidence and writer generations. After root closure, completion requires another exported and published tracker descendant whose recorded scope matches the live closed epic. `inspect_tracker_commit` and `reconcile_tracker_commit` expose the durable object outcome; replay does not construct another object, and reconciliation requires independently confirmed I/O stop or a provably unused dispatch gate.
 
-Export alone does not commit, publish, close an issue or approve completion. Tracker-only commits on the actual delivery branch and their reviewed-application ancestry proof remain unimplemented. Neither runtime substitutes a shell command or legacy workflow for those missing capabilities.
+Export alone does not commit, publish, close an issue or approve completion. Those are separately requested capabilities with their own kernel checks; neither runtime substitutes a shell command or legacy workflow for them.
+
+## Interrupted delivery actions
+
+`reconcile_action({ actionId })` inspects an interrupted capture, implementation/review-copy creation, validation, review or application commit by its original action ID. The controller uses the same recovery code on restart. Neither path reruns the original command, copy, review turn or commit write, and the capability cannot interrupt a live action.
+
+A retained result can settle its historical acknowledgement; current review and publication eligibility are checked separately. Failed checks remain failed. A stopped review without a durably recorded verdict needs a fresh independent review. Changed or unbound copies are preserved, not restored or adopted. Missing process or controller-I/O stop proof leaves the operation unresolved and its workspace excluded. Other resource types keep their dedicated reconciliation capabilities.
+
+This works through the shared kernel for both SDK and native Herdr runtimes. It is current-format restart recovery, not migration support, and does not yet resolve abandoned controller I/O or clean up retained resources.
 
 ## Declare policy
 
