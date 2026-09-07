@@ -1,9 +1,16 @@
 import type { ControllerAuthority } from "../domain/orchestration.js";
 import type { ValidationEvidence } from "../domain/delivery.js";
+import { NamespaceStopUnprovenError } from "./pid-namespace.js";
 import { startConfinedCommand, type ConfinedCommandHandle } from "./sandbox.js";
 import type { WorkspaceManager } from "./workspaces.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
+import {
+  bindValidationService,
+  verifyValidationServices,
+  withValidationServices,
+  type BoundValidationService,
+} from "./validation-services.js";
 
 /** Executes a persisted check. There is no shell on the host, synthetic pass, or agent-report input. */
 export async function runCandidateValidation(
@@ -44,6 +51,7 @@ export async function runCandidateValidation(
   }, 250);
   let handle: ConfinedCommandHandle | null = null;
   let outcomeObserved = false;
+  let services: BoundValidationService[] = [];
   try {
     const snapshot = journal.delivery.snapshotAtRevision(
       authority.runId,
@@ -60,22 +68,67 @@ export async function runCandidateValidation(
       controller.signal,
     );
     assertDispatch();
+    if (evidence.environmentGenerations.length) {
+      const definitions = evidence.environmentGenerations.map((entry) =>
+        journal
+          .policy(authority.runId)
+          .validationServices.find((service) => service.id === entry.bindingId)!,
+      );
+      const runtimes = await Promise.all(definitions.map(bindValidationService));
+      assertDispatch();
+      const bound = journal.delivery.bindValidationServices(
+        authority,
+        evidence.evidenceId,
+        runtimes,
+      );
+      services = bound.environmentGenerations.map((environment, index) => ({
+        definition: definitions[index]!,
+        environment,
+      }));
+    }
     handle = await startConfinedCommand(
+      withValidationServices(
+        {
+          workspace: workspace.path,
+          sourceMode: "read-only",
+          writablePaths,
+          immutablePaths: snapshot.manifest.map((entry) => entry.path),
+          command: check.command,
+          args: check.args,
+          cwd: check.cwd,
+          timeoutMs: check.timeoutMs,
+        },
+        services,
+      ),
       {
-        workspace: workspace.path,
-        sourceMode: "read-only",
-        writablePaths,
-        immutablePaths: snapshot.manifest.map((entry) => entry.path),
-        command: check.command,
-        args: check.args,
-        cwd: check.cwd,
-        timeoutMs: check.timeoutMs,
+        signal: controller.signal,
+        beforeSpawn: async () => {
+          await verifyValidationServices(services);
+          assertDispatch();
+        },
       },
-      { signal: controller.signal, beforeSpawn: assertDispatch },
     );
     const result = await handle.result;
     outcomeObserved = true;
     let sourceUnchanged = false;
+    let environmentVerified = services.length === 0;
+    if (services.length) {
+      try {
+        await verifyValidationServices(services);
+        environmentVerified = true;
+      } catch (error) {
+        journal.assertAuthority(authority);
+        journal.appendObservation(authority, {
+          source: "validation",
+          sourceEventId: `environment-${evidence.evidenceId}`,
+          kind: "validation.environment_invalid",
+          summary: redactSensitiveText(String(error), 7999),
+          artifactIds: [],
+          identity: null,
+          wakesOrchestrator: true,
+        });
+      }
+    }
     try {
       // After a cancelled process, still inspect the stopped copy without the cancelled signal.
       await workspaces.verifyValidationWorkspace(
@@ -107,6 +160,7 @@ export async function runCandidateValidation(
       evidence.evidenceId,
       result,
       sourceUnchanged,
+      environmentVerified,
     );
   } catch (error) {
     // A returned handle remains owned until its result proves process closure, including startup errors.
@@ -115,6 +169,7 @@ export async function runCandidateValidation(
       await handle.result.catch(() => undefined);
     }
     journal.assertAuthority(authority); // A replaced lease cannot turn late results into evidence.
+    if (error instanceof NamespaceStopUnprovenError) throw error;
     if (outcomeObserved) throw error; // Do not replace an observed result with an invented startup failure.
     const at = new Date().toISOString();
     return journal.delivery.finishValidation(

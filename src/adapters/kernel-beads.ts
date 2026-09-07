@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { startNamespaceProcess } from "./pid-namespace.js";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -286,28 +286,20 @@ export class KernelBeads {
     signal.throwIfAborted();
     guard();
     const output = await new Promise<string>((resolve, reject) => {
-      const child = spawn(this.bwrapPath, mounts, {
+      const namespace = startNamespaceProcess(this.bwrapPath, mounts, {
         cwd: binding.repository.path,
         env: { PATH: "/usr/bin:/bin" },
-        stdio: ["ignore", "pipe", "pipe"],
-        shell: false,
+        stdio: "pipe",
       });
+      const { child } = namespace;
       const chunks: Buffer[] = [],
         errors: Buffer[] = [];
       let size = 0,
         errorSize = 0,
-        stopped = false,
-        exited = false,
         failure: Error | null = null;
-      let killTimer: NodeJS.Timeout | undefined;
       const stop = (error: Error) => {
         failure ??= error;
-        if (exited || stopped) return;
-        stopped = true;
-        child.kill("SIGTERM");
-        killTimer = setTimeout(() => {
-          if (!exited) child.kill("SIGKILL");
-        }, 500);
+        namespace.interrupt();
       };
       const abort = () =>
         stop(new TrackerTransportError("Tracker command cancelled; inspect its recorded effect"));
@@ -324,12 +316,12 @@ export class KernelBeads {
           stop(error instanceof Error ? error : new Error("Tracker authority lost"));
         }
       }, 250);
-      child.stdout.on("data", (chunk: Buffer) => {
+      child.stdout!.on("data", (chunk: Buffer) => {
         size += chunk.length;
         if (size <= LIMIT) chunks.push(chunk);
         else stop(new TrackerTransportError("Tracker output exceeds 4 MiB"));
       });
-      child.stderr.on("data", (chunk: Buffer) => {
+      child.stderr!.on("data", (chunk: Buffer) => {
         errorSize += chunk.length;
         if (errorSize <= 65536) errors.push(chunk);
         else stop(new TrackerTransportError("Tracker diagnostics exceed 64 KiB"));
@@ -337,15 +329,13 @@ export class KernelBeads {
       child.on("error", (error) => {
         failure ??= error;
       });
-      child.once("exit", () => {
-        exited = true;
-      });
       child.once("close", (code) => {
         clearTimeout(timer);
         clearInterval(health);
-        if (killTimer) clearTimeout(killTimer);
         signal.removeEventListener("abort", abort);
-        if (failure) reject(failure);
+        const namespaceError = namespace.failure();
+        if (namespaceError) reject(namespaceError);
+        else if (failure) reject(failure);
         else if (code !== 0)
           reject(
             new TrackerTransportError(

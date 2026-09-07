@@ -69,6 +69,6 @@ describe.runIf(process.platform === "linux")("fixture provider file admission", 
       ["--input-type=module", "-e", script, JSON.stringify(f.definition), fifo],
       { encoding: "utf8", timeout: 2000, killSignal: "SIGKILL" },
     );
-    expect(output).toContain("bounded native psql executable");
+    expect(output).toContain("bounded native fixture executable");
   });
 });

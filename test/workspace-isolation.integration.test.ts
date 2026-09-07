@@ -155,15 +155,15 @@ describe.skipIf(process.platform !== "linux")("outer workspace confinement", () 
 
   it("kills background descendants on normal command exit too", async () => {
     const { workspace, request } = await fixture();
-    const childScript = `const fs = require('node:fs'); setInterval(() => fs.appendFileSync('scratch/ticks', 'x'), 10);`;
+    const childScript = `const fs = require('node:fs'); fs.appendFileSync('scratch/ticks', 'x'); console.log('ready'); setInterval(() => fs.appendFileSync('scratch/ticks', 'x'), 10);`;
     const handle = await startConfinedCommand({
       ...request,
       args: [
         "-e",
         `
       const { spawn } = require("node:child_process");
-      spawn(process.execPath, ["-e", ${JSON.stringify(childScript)}], { detached: true, stdio: "ignore" }).unref();
-      setTimeout(() => {}, 200);
+      const child = spawn(process.execPath, ["-e", ${JSON.stringify(childScript)}], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+      child.stdout.once("data", () => process.exit(0));
     `,
       ],
     });
@@ -239,17 +239,33 @@ describe.skipIf(process.platform !== "linux")("outer workspace confinement", () 
   });
 
   it("times out a running command without reporting a pass", async () => {
-    const { request } = await fixture();
+    const { workspace, request } = await fixture();
     const handle = await startConfinedCommand({
       ...request,
-      timeoutMs: 600,
-      args: ["-e", "console.log('ready'); setInterval(() => {}, 1000)"],
+      timeoutMs: 5000,
+      args: [
+        "-e",
+        "require('node:fs').writeFileSync('scratch/ready', 'ready'); console.log('ready'); setInterval(() => {}, 1000)",
+      ],
     });
+    await expect
+      .poll(() => readFile(join(workspace, "scratch/ready"), "utf8"), { timeout: 4000 })
+      .toBe("ready");
     expect(await handle.result).toMatchObject({
       status: "timed_out",
       stdout: "ready\n",
       processTreeStopped: true,
     });
+  });
+
+  it("enforces a deadline that expires before guardian startup without claiming a pass", async () => {
+    const { request } = await fixture();
+    const handle = await startConfinedCommand({
+      ...request,
+      timeoutMs: 1,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+    });
+    expect(await handle.result).toMatchObject({ status: "timed_out", processTreeStopped: true });
   });
 
   it("bounds and redacts command output", async () => {

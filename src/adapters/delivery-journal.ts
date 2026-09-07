@@ -13,6 +13,8 @@ import {
   type ValidationEvidence,
   type ValidationOutcome,
   type ValidationPlan,
+  ValidationServiceRuntimeSchema,
+  type ValidationServiceRuntime,
 } from "../domain/delivery.js";
 import { WorkspaceSnapshotSchema, type WorkspaceSnapshot } from "../domain/workspaces.js";
 import type { WorkspaceIdentity } from "../domain/agents.js";
@@ -163,7 +165,10 @@ export class DeliveryJournal {
           checks[index] = required;
         }
       }
-      const bindings = new Set(policy.fixtures.map((fixture) => fixture.environmentBinding));
+      const bindings = new Set([
+        ...policy.fixtures.map((fixture) => fixture.environmentBinding),
+        ...policy.validationServices.map((service) => service.id),
+      ]);
       if (
         checks.some((check) => check.environmentBindings.some((binding) => !bindings.has(binding)))
       )
@@ -488,10 +493,11 @@ export class DeliveryJournal {
           "validation_stage",
           "This validation check is not required at the selected revision stage",
         );
-      if (check.environmentBindings.length)
+      const services = this.access.policy(authority.runId).validationServices;
+      if (check.environmentBindings.some((id) => !services.some((service) => service.id === id)))
         throw new DeliveryError(
           "fixture_bridge_unavailable",
-          "Fixture-bound validation requires a configured confined service bridge",
+          "Host fixture bindings cannot enter validation; declare a separate check-scoped service or configure a restricted bridge",
         );
       const exclusion = this.access.agents.beginWorkspaceOperation(
         authority,
@@ -518,7 +524,14 @@ export class DeliveryJournal {
         revision: snapshot.snapshotRevision,
         fingerprint: candidate.snapshot.fingerprint,
         confinementProfile: "bwrap-read-only-source-v1",
-        environmentGenerations: [],
+        environmentGenerations: check.environmentBindings.map((id) => ({
+          bindingId: id,
+          instanceId: randomUUID(),
+          generation: 1,
+          definitionDigest: digestJson(services.find((service) => service.id === id)!),
+          runtime: null,
+        })),
+        environmentVerified: false,
         status: "running",
         outcome: null,
         sourceUnchanged: false,
@@ -543,12 +556,66 @@ export class DeliveryJournal {
     });
   }
 
+  /** Freeze executable observations before setup/command dispatch; never accept model input. */
+  bindValidationServices(
+    authority: ControllerAuthority,
+    evidenceId: string,
+    inputs: readonly ValidationServiceRuntime[],
+  ): ValidationEvidence {
+    return this.access.transaction(authority, () => {
+      const evidence = this.evidence(authority.runId, evidenceId),
+        control = this.access.control(authority.runId);
+      const action = this.db
+        .prepare("SELECT status FROM actions WHERE run_id = ? AND operation_id = ?")
+        .get(authority.runId, evidence.operationId) as { status: string } | undefined;
+      if (
+        evidence.status !== "running" ||
+        action?.status !== "running" ||
+        inputs.length === 0 ||
+        evidence.controllerLeaseId !== authority.leaseId ||
+        control.status !== "active" ||
+        control.policyDigest !== evidence.policyDigest ||
+        inputs.length !== evidence.environmentGenerations.length ||
+        evidence.environmentGenerations.some((entry) => entry.runtime !== null)
+      )
+        throw new DeliveryError(
+          "service_binding_stale",
+          "Validation runtime binding is one-use and requires its active owner",
+        );
+      const definitions = this.access.policy(authority.runId).validationServices;
+      evidence.environmentGenerations = evidence.environmentGenerations.map((entry, index) => {
+        const definition = definitions.find((item) => item.id === entry.bindingId);
+        const runtime = ValidationServiceRuntimeSchema.parse(inputs[index]);
+        if (
+          !definition ||
+          digestJson(definition) !== entry.definitionDigest ||
+          Object.entries(runtime).some(
+            ([name, binary]) => binary.path !== `${definition.binDirectory}/${name}`,
+          )
+        )
+          throw new DeliveryError(
+            "service_binding_mismatch",
+            "Validation service runtime differs from frozen policy",
+          );
+        return { ...entry, runtime };
+      });
+      this.db
+        .prepare(
+          "UPDATE validation_evidence SET record_json = ? WHERE run_id = ? AND evidence_id = ?",
+        )
+        .run(JSON.stringify(ValidationEvidenceSchema.parse(evidence)), authority.runId, evidenceId);
+      this.changed(authority, "validation.services_bound", evidenceId);
+      return evidence;
+    });
+  }
+
   /** Trusted supervisor callback; agent reports never call this method. */
   finishValidation(
     authority: ControllerAuthority,
     evidenceId: string,
     input: ValidationOutcome,
     sourceUnchanged: boolean,
+    environmentVerified = false,
   ): ValidationEvidence {
     return this.access.transaction(authority, () => {
       const evidence = this.evidence(authority.runId, evidenceId);
@@ -558,6 +625,10 @@ export class DeliveryJournal {
           "Old validation requires independent process reconciliation",
         );
       const parsed = ValidationOutcomeSchema.parse(input);
+      const verifiedEnvironment =
+        evidence.environmentGenerations.length === 0 ||
+        (environmentVerified &&
+          evidence.environmentGenerations.every((entry) => entry.runtime !== null));
       const outcome = {
         ...parsed,
         stdout: redactSensitiveText(parsed.stdout, 65535),
@@ -566,7 +637,8 @@ export class DeliveryJournal {
       if (evidence.outcome) {
         if (
           digestJson(evidence.outcome) !== digestJson(outcome) ||
-          evidence.sourceUnchanged !== sourceUnchanged
+          evidence.sourceUnchanged !== sourceUnchanged ||
+          evidence.environmentVerified !== verifiedEnvironment
         )
           throw new DeliveryError(
             "validation_outcome_conflict",
@@ -576,6 +648,7 @@ export class DeliveryJournal {
       }
       evidence.outcome = outcome;
       evidence.sourceUnchanged = sourceUnchanged;
+      evidence.environmentVerified = verifiedEnvironment;
       evidence.status = "finished";
       this.db
         .prepare(
@@ -585,7 +658,9 @@ export class DeliveryJournal {
       this.access.agents.finishWorkspaceOperation(
         authority,
         evidence.workspaceOperationId,
-        outcome.status === "succeeded" && sourceUnchanged ? "succeeded" : "failed",
+        outcome.status === "succeeded" && sourceUnchanged && verifiedEnvironment
+          ? "succeeded"
+          : "failed",
         outcome.status === "not_started"
           ? "Validation failed before a repository command started; all admission I/O and any failed supervisor spawn settled"
           : "Trusted validation adapter settled admission I/O and confirmed closure of every process handle it created",
@@ -693,6 +768,21 @@ export class DeliveryJournal {
       candidate.snapshot.fingerprint === evidence.fingerprint &&
       evidence.policyDigest === this.access.control(runId).policyDigest &&
       evidence.sourceUnchanged &&
+      evidence.environmentVerified &&
+      evidence.environmentGenerations.length === check.environmentBindings.length &&
+      check.environmentBindings.every((binding) =>
+        evidence.environmentGenerations.some((entry) => {
+          const definition = this.access
+            .policy(runId)
+            .validationServices.find((service) => service.id === binding);
+          return (
+            entry.bindingId === binding &&
+            entry.runtime !== null &&
+            definition &&
+            digestJson(definition) === entry.definitionDigest
+          );
+        }),
+      ) &&
       evidence.outcome?.status === "succeeded" &&
       evidence.outcome.exitCode === 0 &&
       evidence.outcome.signal === null &&

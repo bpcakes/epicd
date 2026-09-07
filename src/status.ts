@@ -29,6 +29,7 @@ export function runStatusView(store: StateStore, runId: string) {
       declarations: journal.policy(runId).fixtures,
       authority: journal.fixtures.summary(runId),
     },
+    validationServices: journal.policy(runId).validationServices,
     events: store.events(runId, 20),
   };
 }

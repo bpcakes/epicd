@@ -57,7 +57,7 @@ import {
 
 import { FixtureJournal, FIXTURE_TABLES, createFixturesSchema } from "./fixture-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 18;
+export const ORCHESTRATION_SCHEMA_VERSION = 19;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",

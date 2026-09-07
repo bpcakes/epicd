@@ -3,6 +3,7 @@ import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { KernelBeads } from "./kernel-beads.js";
 import { claimable } from "../domain/tracker.js";
 import { PublicationGit, PublicationGitError } from "./publication-git.js";
+import { NamespaceStopUnprovenError } from "./pid-namespace.js";
 
 const detail = (error: unknown) =>
   error instanceof Error ? error.message : "Tracker operation failed";
@@ -16,6 +17,7 @@ export class TrackerAdapter {
     const tracker = this.journal.tracker;
     const record = tracker.start(authority, id); // Duplicate dispatch cannot settle the original I/O.
     let failure: string | null = null;
+    let stopUnproven = false;
     const guard = () => {
       signal.throwIfAborted();
       tracker.assertWritable(authority, id);
@@ -49,6 +51,7 @@ export class TrackerAdapter {
             );
             tracker.closureReport(authority, id, report);
           } catch (error) {
+            if (error instanceof NamespaceStopUnprovenError) throw error;
             failure = detail(error);
           }
           closeGuard();
@@ -75,6 +78,7 @@ export class TrackerAdapter {
           try {
             await this.transport.claim(binding, record.taskId!, record.runId, guard, signal);
           } catch (error) {
+            if (error instanceof NamespaceStopUnprovenError) throw error;
             failure = detail(error);
           }
           guard();
@@ -87,11 +91,15 @@ export class TrackerAdapter {
         }
       }
     } catch (error) {
+      if (error instanceof NamespaceStopUnprovenError) {
+        stopUnproven = true;
+        throw error;
+      }
       failure = detail(error);
       if (record.closure)
         tracker.closureRefs(authority, id, false, error instanceof PublicationGitError);
     } finally {
-      tracker.stopIO(authority, id, failure);
+      if (!stopUnproven) tracker.stopIO(authority, id, failure);
     }
     return tracker.finish(authority, id);
   }
@@ -106,6 +114,7 @@ export class TrackerAdapter {
     const record = tracker.beginInspection(authority, id);
     if (record.closure) tracker.closureRefs(authority, id, false);
     let failure: string | null = null;
+    let stopUnproven = false;
     try {
       if (record.mutationDispatched || (record.kind === "refresh" && initial.dispatched)) {
         const run = tracker.run(authority.runId);
@@ -142,9 +151,13 @@ export class TrackerAdapter {
         }
       }
     } catch (error) {
+      if (error instanceof NamespaceStopUnprovenError) {
+        stopUnproven = true;
+        throw error;
+      }
       failure = detail(error);
     } finally {
-      tracker.stopIO(authority, id, failure);
+      if (!stopUnproven) tracker.stopIO(authority, id, failure);
     }
     if (failure) throw new Error(`Tracker reconciliation remains unsettled: ${failure}`);
     return tracker.finish(authority, id);

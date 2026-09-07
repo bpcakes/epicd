@@ -25,7 +25,11 @@ export const RequiredCheckSchema = z.strictObject({
   args: z.array(z.string().max(4096)).max(100),
   cwd: RelativePath.default("."),
   timeoutMs: z.number().int().positive().max(21_600_000).default(120_000),
-  environmentBindings: z.array(z.string().min(1).max(256)).max(100).default([]),
+  environmentBindings: z
+    .array(z.string().min(1).max(256))
+    .max(100)
+    .refine((ids) => new Set(ids).size === ids.length, "Environment bindings must be unique")
+    .default([]),
   stage: z.enum(["pre_commit", "exact_revision", "both"]).default("both"),
 });
 
@@ -56,6 +60,30 @@ export const FixtureDefinitionSchema = z.strictObject({
   cleanup: z.enum(["retain", "on_completion"]),
 });
 export type FixtureDefinition = z.infer<typeof FixtureDefinitionSchema>;
+
+/** Scratch services inside a check's existing isolation, never a host endpoint. */
+export const ValidationServiceSchema = z.strictObject({
+  id: z.string().min(1).max(256),
+  provider: z.literal("postgresql"),
+  lifetime: z.literal("check"),
+  // These executables are already visible read-only in the validation profile.
+  binDirectory: z
+    .string()
+    .regex(/^\/usr\/(?:[A-Za-z0-9_.+-]+\/)*[A-Za-z0-9_.+-]+$/)
+    .max(1024)
+    .refine((path) => path.split("/").every((part) => part !== "." && part !== "..")),
+  database: PgName.refine(
+    (name) => !["postgres", "template0", "template1"].includes(name),
+    "Choose a non-system fixture database name",
+  ),
+  role: PgName,
+  port: z.number().int().min(1024).max(65535),
+  connectionVariable: z
+    .string()
+    .regex(/^(?:[A-Z][A-Z0-9_]*_)?DATABASE_URL$/)
+    .max(128),
+});
+export type ValidationService = z.infer<typeof ValidationServiceSchema>;
 
 export const RepositoryPolicySchema = z
   .strictObject({
@@ -89,6 +117,7 @@ export const RepositoryPolicySchema = z
       .max(100)
       .default([]),
     fixtures: z.array(FixtureDefinitionSchema).max(100).default([]),
+    validationServices: z.array(ValidationServiceSchema).max(4).default([]),
     budgets: z
       .strictObject({
         maxWorkers: z.number().int().min(1).max(4).default(4),
@@ -116,10 +145,30 @@ export const RepositoryPolicySchema = z
     for (const [field, entries] of [
       ["requiredChecks", policy.requiredChecks],
       ["fixtures", policy.fixtures],
+      ["validationServices", policy.validationServices],
     ] as const) {
       const ids = entries.map((entry) => entry.id);
       if (new Set(ids).size !== ids.length)
         context.addIssue({ code: "custom", path: [field], message: "IDs must be unique" });
+    }
+    const bindings = [
+      ...policy.fixtures.map((fixture) => fixture.environmentBinding),
+      ...policy.validationServices.map((service) => service.id),
+    ];
+    if (new Set(bindings).size !== bindings.length)
+      context.addIssue({
+        code: "custom",
+        path: ["validationServices"],
+        message: "Host fixture and check-service binding IDs must be distinct",
+      });
+    for (const field of ["port", "connectionVariable"] as const) {
+      const values = policy.validationServices.map((service) => service[field]);
+      if (new Set(values).size !== values.length)
+        context.addIssue({
+          code: "custom",
+          path: ["validationServices"],
+          message: `Check-service ${field} values must be distinct`,
+        });
     }
   });
 export type RepositoryPolicy = z.infer<typeof RepositoryPolicySchema>;

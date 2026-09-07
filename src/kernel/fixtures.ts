@@ -7,6 +7,7 @@ import type { FixtureCreationProvider } from "../adapters/fixture-creation.js";
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
 import type { ControllerAuthority } from "../domain/orchestration.js";
 import type { FixtureCreation } from "../domain/fixtures.js";
+import { NamespaceStopUnprovenError } from "../adapters/pid-namespace.js";
 
 export function registerFixtureCapabilities(
   kernel: ActionKernel,
@@ -56,6 +57,7 @@ export function registerFixtureCapabilities(
             signal,
           );
         } catch (error) {
+          if (error instanceof NamespaceStopUnprovenError) throw error;
           failure = error;
         }
         journal.assertAuthority(authority);

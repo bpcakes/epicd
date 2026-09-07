@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { startNamespaceProcess } from "./pid-namespace.js";
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
@@ -291,12 +291,13 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
     );
     await assertBinding();
     const output = await new Promise<string>((resolve, reject) => {
-      const child = spawn(this.bwrapPath, args, {
+      const namespace = startNamespaceProcess(this.bwrapPath, args, {
         cwd: "/",
         env: { PATH: "/usr/bin:/bin" },
-        stdio: ["pipe", "pipe", "pipe"],
-        shell: false,
+        stdio: "pipe",
+        stdin: "pipe",
       });
+      const { child } = namespace;
       let failure: Error | null = null,
         bytes = 0,
         errorBytes = 0,
@@ -307,7 +308,7 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
       const decoder = new StringDecoder("utf8");
       const stop = (error: Error) => {
         failure ??= error;
-        child.kill("SIGKILL");
+        namespace.interrupt();
       };
       const abort = () =>
         stop(
@@ -330,13 +331,13 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
       child.on("error", (error) => {
         failure = error;
       });
-      child.stdin.on("error", (error) => stop(error));
-      child.stderr.on("data", (chunk: Buffer) => {
+      child.stdin!.on("error", (error) => stop(error));
+      child.stderr!.on("data", (chunk: Buffer) => {
         errorBytes += chunk.length;
         if (errorBytes <= 65536) stderr.push(chunk);
         else stop(new FixtureTransportError("Fixture error output exceeded its bound"));
       });
-      child.stdout.on("data", (chunk: Buffer) => {
+      child.stdout!.on("data", (chunk: Buffer) => {
         bytes += chunk.length;
         if (bytes > 65536) {
           stop(new FixtureTransportError("Fixture output exceeded its bound"));
@@ -355,7 +356,7 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
               throw new FixtureTransportError("Duplicate or late PostgreSQL handshake");
             const script = onHandshake(line);
             answered = true;
-            child.stdin.end(script);
+            child.stdin!.end(script);
           } catch (error) {
             stop(error instanceof Error ? error : new Error("Invalid fixture handshake"));
           }
@@ -365,7 +366,9 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
         clearInterval(health);
         clearTimeout(timeout);
         signal.removeEventListener("abort", abort);
-        if (failure) reject(failure);
+        const namespaceError = namespace.failure();
+        if (namespaceError) reject(namespaceError);
+        else if (failure) reject(failure);
         else if (code !== 0)
           reject(
             new FixtureTransportError(
@@ -375,8 +378,8 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
         else resolve(Buffer.concat(stdout).toString("utf8"));
       });
       if (signal.aborted) abort();
-      else if (onHandshake) child.stdin.write(initial);
-      else child.stdin.end(initial);
+      else if (onHandshake) child.stdin!.write(initial);
+      else child.stdin!.end(initial);
     });
     // Client close alone cannot certify CREATE stop; observe() checks the exact backend.
     await assertBinding();

@@ -1,7 +1,7 @@
-import { spawn } from "node:child_process";
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { redactSensitiveText } from "../util/redact.js";
+import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
 
 const OUTPUT_LIMIT = 64 * 1024;
 const PROTECTED_PATHS = [".git", ".beads", ".epicd", ".codex", "AGENTS.md"];
@@ -17,6 +17,8 @@ export type ConfinedCommand = {
   args: readonly string[];
   env?: Readonly<Record<string, string>>;
   timeoutMs: number;
+  /** Minimal private passwd entry for check-local services; never mounts host account files. */
+  syntheticUser?: true;
 };
 
 export type ConfinedCommandResult = {
@@ -44,7 +46,11 @@ export type ConfinedCommandHandle = {
  */
 export async function startConfinedCommand(
   request: ConfinedCommand,
-  options: { signal?: AbortSignal; bwrapPath?: string; beforeSpawn?: () => void } = {},
+  options: {
+    signal?: AbortSignal;
+    bwrapPath?: string;
+    beforeSpawn?: () => void | Promise<void>;
+  } = {},
 ): Promise<ConfinedCommandHandle> {
   if (process.platform !== "linux") throw new Error("Adaptive command confinement requires Linux");
   options.signal?.throwIfAborted();
@@ -54,6 +60,8 @@ export async function startConfinedCommand(
   if (!request.command || request.command.includes("\0")) throw new Error("Invalid command");
   // Own inputs before filesystem admission yields to caller code.
   const spec = structuredClone(request);
+  if (spec.syntheticUser && (!process.getuid || !process.getgid || process.getuid() === 0))
+    throw new Error("Check-local PostgreSQL requires a non-root validation user");
   const workspace = resolve(spec.workspace);
   await canonicalDirectory(workspace);
   await rejectSharedFiles(workspace);
@@ -97,6 +105,7 @@ export async function startConfinedCommand(
     workspace,
     "/workspace",
   );
+  if (spec.syntheticUser) args.push("--ro-bind-data", "3", "/etc/passwd");
   for (const path of PROTECTED_PATHS) {
     const source = join(workspace, path);
     if (await exists(source)) {
@@ -141,24 +150,25 @@ export async function startConfinedCommand(
 
   const startedAt = new Date().toISOString();
   // The trusted caller rechecks its lease/action after asynchronous filesystem admission.
-  options.beforeSpawn?.();
-  const child = spawn(options.bwrapPath ?? "bwrap", args, {
+  if (options.beforeSpawn) await options.beforeSpawn();
+  options.signal?.throwIfAborted();
+  const namespace = startNamespaceProcess(options.bwrapPath ?? "bwrap", args, {
     cwd: workspace,
     env: { PATH: "/usr/bin:/bin" },
-    stdio: ["ignore", "pipe", "pipe"],
-    shell: false,
+    stdio: "pipe",
+    ...(spec.syntheticUser
+      ? {
+          extraInput: `epicd:x:${process.getuid!()}:${process.getgid!()}::/tmp/epicd-home:/bin/sh\n`,
+        }
+      : {}),
   });
+  const { child } = namespace;
   let terminal = false;
   let stoppedFor: "cancelled" | "timed_out" | undefined;
-  let forceKill: NodeJS.Timeout | undefined;
-  let spawnError: Error | undefined;
   const stdout = new BoundedOutput();
   const stderr = new BoundedOutput();
-  child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
-  child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
-  child.once("error", (error) => {
-    spawnError = error;
-  });
+  child.stdout!.on("data", (chunk: Buffer) => stdout.append(chunk));
+  child.stderr!.on("data", (chunk: Buffer) => stderr.append(chunk));
   child.once("exit", () => {
     terminal = true;
   });
@@ -166,11 +176,7 @@ export async function startConfinedCommand(
   const stop = (reason: "cancelled" | "timed_out") => {
     if (terminal || stoppedFor) return;
     stoppedFor = reason;
-    child.kill("SIGTERM");
-    forceKill = setTimeout(() => {
-      // Do not signal a numeric PID after the owning ChildProcess has exited.
-      if (!terminal) child.kill("SIGKILL");
-    }, 500);
+    namespace.interrupt();
   };
   const abort = () => stop("cancelled");
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -179,10 +185,14 @@ export async function startConfinedCommand(
   const result = new Promise<ConfinedCommandResult>((resolveResult, reject) => {
     child.once("close", (code, signal) => {
       clearTimeout(deadline);
-      if (forceKill) clearTimeout(forceKill);
       options.signal?.removeEventListener("abort", abort);
+      const spawnError = namespace.failure();
       if (spawnError) {
-        reject(new Error(`Confined command could not start: ${spawnError.message}`));
+        reject(
+          spawnError instanceof NamespaceStopUnprovenError
+            ? spawnError
+            : new Error(`Confined command could not start: ${spawnError.message}`),
+        );
         return;
       }
       resolveResult({

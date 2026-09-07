@@ -24,6 +24,7 @@ import { ActionKernel } from "../src/kernel/actions.js";
 import { reconcileTracker, registerTrackerCapabilities } from "../src/kernel/tracker.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
 import { KernelBeads } from "../src/adapters/kernel-beads.js";
+import { NamespaceStopUnprovenError } from "../src/adapters/pid-namespace.js";
 import { KernelGitError } from "../src/adapters/kernel-git.js";
 import { digestJson } from "../src/domain/repository-policy.js";
 
@@ -36,6 +37,22 @@ const close = (revision: string, taskId = "demo.1"): KernelAction => ({
 afterEach(() => vi.restoreAllMocks());
 
 describe.skipIf(process.platform !== "linux")("verified task closure", () => {
+  it("preserves unknown client stop through nested publication locks instead of accepting task closure", async () => {
+    const s = await closureFixture("sha1");
+    const { commit } = await publishVerified(s);
+    const graph = vi.spyOn(s.transport, "graph");
+    vi.spyOn(s.transport, "close").mockRejectedValueOnce(
+      new NamespaceStopUnprovenError("Unknown close namespace stop"),
+    );
+    expect((await s.dispatch(close(commit.revision!))).status).toBe("indeterminate");
+    const pending = s.journal.tracker.pending(s.authority.runId)!;
+    expect(pending).toMatchObject({ ioStopped: false, outcome: null, mutationDispatched: true });
+    expect(graph).toHaveBeenCalledOnce();
+    expect(s.readTracker().status).toBe("in_progress");
+    await expect(s.adapter.reconcile(s.authority, pending.trackerOperationId)).rejects.toThrow(
+      "Independently prove",
+    );
+  });
   it.each(["sha1", "sha256"] as const)(
     "closes only the claimed, independently verified and published %s task",
     async (format) => {

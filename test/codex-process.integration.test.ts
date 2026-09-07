@@ -360,10 +360,13 @@ process.on("SIGTERM", () => process.exit(0));
       fixturePath,
       `const { spawn } = require("node:child_process");
 const fs = require("node:fs");
-const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
-fs.writeFileSync(process.env.EPICD_TEST_PARENT_PID, String(process.pid));
-fs.writeFileSync(process.env.EPICD_TEST_CHILD_PID, String(child.pid));
 process.on("SIGTERM", () => {});
+const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)"], { stdio: ["ignore", "pipe", "ignore"] });
+child.stdout.once("data", () => {
+  fs.writeFileSync(process.env.EPICD_TEST_PARENT_PID, String(process.pid));
+  fs.writeFileSync(process.env.EPICD_TEST_CHILD_PID, String(child.pid));
+  console.log("ready");
+});
 process.stdin.resume();
 `,
     );
@@ -373,25 +376,22 @@ process.stdin.resume();
     process.env.EPICD_TEST_CHILD_PID = childPidPath;
     let parentPid: number | undefined;
     let childPid: number | undefined;
+    const server = startCodexProcess(process.execPath, [fixturePath], process.cwd(), process.env);
 
     try {
-      await expect(
-        resolveCodexModel(process.cwd(), {
-          executable: {
-            executablePath: process.execPath,
-            args: [fixturePath],
-          },
-          attempts: 1,
-          timeoutMs: 100,
-        }),
-      ).rejects.toThrow("Timed out while resolving");
+      const [ready] = await once(server.stdout, "data", { signal: AbortSignal.timeout(5000) });
+      expect(String(ready)).toBe("ready\n");
       parentPid = Number(readFileSync(parentPidPath, "utf8"));
       childPid = Number(readFileSync(childPidPath, "utf8"));
+      expect(processExists(parentPid)).toBe(true);
+      expect(processExists(childPid)).toBe(true);
+      await new Promise<void>((resolve) => server.stop(resolve));
       await waitForProcessExit(parentPid);
       await waitForProcessExit(childPid);
       expect(processExists(parentPid)).toBe(false);
       expect(processExists(childPid)).toBe(false);
     } finally {
+      await new Promise<void>((resolve) => server.stop(resolve));
       if (previousParentPidPath === undefined) delete process.env.EPICD_TEST_PARENT_PID;
       else process.env.EPICD_TEST_PARENT_PID = previousParentPidPath;
       if (previousChildPidPath === undefined) delete process.env.EPICD_TEST_CHILD_PID;

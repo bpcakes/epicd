@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
@@ -54,9 +54,21 @@ export async function bindFixtureProvider(
 ): Promise<FixtureProviderBinding> {
   const definition = FixtureDefinitionSchema.parse(definitionInput);
   const directory = await node(definition.socketDirectory, "directory");
+  const binary = await bindFixtureExecutable(executable);
+  let socket = null;
+  try {
+    socket = await node(join(directory.path, `.s.PGSQL.${definition.port}`), "socket");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return FixtureProviderBindingSchema.parse({ executable: binary, directory, socket });
+}
+
+/** Pins a native provider executable without executing it or opening any service. */
+export async function bindFixtureExecutable(executable: string) {
   if (!isAbsolute(executable) || (await realpath(executable)) !== executable)
     throw new FixtureTransportError(
-      "Select the canonical native psql executable, not a wrapper or symlink",
+      "Select the canonical native executable, not a wrapper or symlink",
     );
   // A replacement FIFO must be rejected by fstat, not block open waiting for a writer.
   const file = await open(
@@ -67,7 +79,7 @@ export async function bindFixtureProvider(
   try {
     const stat = await file.stat({ bigint: true });
     if (!stat.isFile() || stat.size > 64n * 1024n * 1024n || (stat.mode & 0o111n) === 0n)
-      throw new FixtureTransportError("Expected a bounded native psql executable");
+      throw new FixtureTransportError("Expected a bounded native fixture executable");
     const bytes = await file.readFile();
     if (!bytes.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70])))
       throw new FixtureTransportError(
@@ -89,13 +101,7 @@ export async function bindFixtureProvider(
   } finally {
     await file.close();
   }
-  let socket = null;
-  try {
-    socket = await node(join(directory.path, `.s.PGSQL.${definition.port}`), "socket");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  return FixtureProviderBindingSchema.parse({ executable: binary, directory, socket });
+  return binary;
 }
 
 /** No identifiers or SQL expressions come from the model. Names are hex-encoded data literals. */
@@ -210,12 +216,12 @@ export class PostgreSqlFixtureInspector implements FixtureInspector {
     );
     await assertBinding();
     const output = await new Promise<string>((resolve, reject) => {
-      const child = spawn(this.bwrapPath, args, {
+      const namespace = startNamespaceProcess(this.bwrapPath, args, {
         cwd: "/",
         env: { PATH: "/usr/bin:/bin" },
-        stdio: ["ignore", "pipe", "pipe"],
-        shell: false,
+        stdio: "pipe",
       });
+      const { child } = namespace;
       const stdout: Buffer[] = [],
         stderr: Buffer[] = [];
       let outBytes = 0,
@@ -223,7 +229,7 @@ export class PostgreSqlFixtureInspector implements FixtureInspector {
       let failure: Error | null = null;
       const stop = (error: Error) => {
         failure ??= error;
-        child.kill("SIGKILL");
+        namespace.interrupt();
       };
       const abort = () => stop(new FixtureTransportError("Fixture inspection interrupted"));
       signal.addEventListener("abort", abort, { once: true });
@@ -239,12 +245,12 @@ export class PostgreSqlFixtureInspector implements FixtureInspector {
           stop(new FixtureTransportError("Fixture authority changed during inspection"));
         }
       }, 100);
-      child.stdout.on("data", (chunk: Buffer) => {
+      child.stdout!.on("data", (chunk: Buffer) => {
         outBytes += chunk.length;
         if (outBytes <= 65536) stdout.push(chunk);
         else stop(new FixtureTransportError("Fixture output exceeded its bound"));
       });
-      child.stderr.on("data", (chunk: Buffer) => {
+      child.stderr!.on("data", (chunk: Buffer) => {
         errBytes += chunk.length;
         if (errBytes <= 65536) stderr.push(chunk);
         else stop(new FixtureTransportError("Fixture error output exceeded its bound"));
@@ -257,7 +263,10 @@ export class PostgreSqlFixtureInspector implements FixtureInspector {
         clearInterval(health);
         clearTimeout(timeout);
         signal.removeEventListener("abort", abort);
-        if (failure) reject(new FixtureTransportError(failure.message));
+        const namespaceError = namespace.failure();
+        failure ??= namespaceError ?? null;
+        if (namespaceError instanceof NamespaceStopUnprovenError) reject(namespaceError);
+        else if (failure) reject(new FixtureTransportError(failure.message));
         else if (code !== 0)
           reject(
             new FixtureTransportError(

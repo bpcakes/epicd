@@ -22,6 +22,7 @@ import type {
 } from "../src/domain/fixtures.js";
 import type { ControllerAuthority, KernelAction } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { NamespaceStopUnprovenError } from "../src/adapters/pid-namespace.js";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -167,6 +168,31 @@ function fixture() {
   };
 }
 describe("durable fixture creation", () => {
+  it.each([false, true])(
+    "does not attest client stop when namespace termination is unknown (dispatched: %s)",
+    async (dispatched) => {
+      const f = fixture();
+      f.grant();
+      f.creator.create.mockImplementationOnce(async (_definition, _intent, dispatch) => {
+        if (dispatched) dispatch(backend);
+        throw new NamespaceStopUnprovenError("Unknown fixture namespace stop");
+      });
+      const request = f.request();
+      const result = await f.dispatch(request);
+      expect(result.status).toBe("indeterminate");
+      const record = f.journal.fixtures.creations(f.state.runId)[0]!;
+      expect(record).toMatchObject({
+        status: dispatched ? "dispatching" : "reserved",
+        clientStopEvidence: null,
+        observation: null,
+      });
+      expect(f.creator.observe).not.toHaveBeenCalled();
+      expect(await f.dispatch(request)).toEqual(result);
+      expect(f.creator.create).toHaveBeenCalledOnce();
+      f.reopen();
+      expect(f.journal.fixtures.creation(f.state.runId, record.creationId)).toEqual(record);
+    },
+  );
   it("requires create authority, freezes one identity before dispatch, and replays without a second mutation", async () => {
     const f = fixture();
     f.grant(["inspect"]);

@@ -15,6 +15,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KernelBeads } from "../src/adapters/kernel-beads.js";
+import { NamespaceStopUnprovenError } from "../src/adapters/pid-namespace.js";
 import { StateStore } from "../src/adapters/store.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { registerTrackerCapabilities } from "../src/kernel/tracker.js";
@@ -587,6 +588,48 @@ describe.skipIf(process.platform !== "linux")(
       expect(await result).toBeInstanceOf(Error);
       expect(s.commands().some((x) => x[0] === "update")).toBe(false);
     });
+    it.each(["inspection", "claim", "reconciliation"] as const)(
+      "retains an unknown namespace stop during %s without a second graph read or a fabricated I/O receipt",
+      async (stage) => {
+        const s = fixture();
+        let pendingId: string | undefined;
+        if (stage === "reconciliation") {
+          vi.spyOn(s.journal.tracker, "finish").mockImplementationOnce(() => {
+            throw new Error("Lost outcome persistence");
+          });
+          expect((await s.dispatch(claim())).status).toBe("indeterminate");
+          const previous = s.journal.tracker.pending(s.run.runId)!;
+          expect(previous.ioStopped).toBe(true);
+          pendingId = previous.trackerOperationId;
+        }
+        const graph = vi.spyOn(s.transport, "graph");
+        if (stage === "claim")
+          vi.spyOn(s.transport, "claim").mockRejectedValueOnce(
+            new NamespaceStopUnprovenError("Unknown fixture monitor stop"),
+          );
+        else
+          graph.mockRejectedValueOnce(
+            new NamespaceStopUnprovenError("Unknown fixture monitor stop"),
+          );
+        const result = await s.dispatch(
+          stage === "reconciliation"
+            ? { kind: "reconcile_tracker_operation", trackerOperationId: pendingId! }
+            : stage === "claim"
+              ? claim()
+              : { kind: "refresh_tracker" },
+        );
+        expect(result.status).toBe("indeterminate");
+        expect(graph).toHaveBeenCalledOnce();
+        const pending = s.journal.tracker.pending(s.run.runId)!;
+        expect(pending).toMatchObject({ ioStopped: false, outcome: null });
+        s.newLease();
+        s.reopen();
+        expect(s.journal.tracker.pending(s.run.runId)?.ioStopped).toBe(false);
+        await expect(s.adapter.reconcile(s.authority, pending.trackerOperationId)).rejects.toThrow(
+          "Independently prove",
+        );
+      },
+    );
     it("rejects malformed, cyclic, and internally inconsistent graph evidence", async () => {
       const s = fixture();
       s.mode("invalid");

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
 import { open, readFile, writeFile, type FileHandle } from "node:fs/promises";
 import { constants } from "node:fs";
 import { createServer } from "node:net";
@@ -76,45 +76,31 @@ async function main() {
     abort.signal.throwIfAborted();
     await prepareCodexAccessToken(launch, abort.signal);
     abort.signal.throwIfAborted();
-    const child = spawn(command.command, command.args, {
+    const namespace = startNamespaceProcess(command.command, command.args, {
       cwd: command.cwd,
       env: command.env,
       stdio: "inherit",
     });
-    let exited = false;
-    let force: NodeJS.Timeout | undefined;
-    const stopChild = () => {
-      if (exited) return;
-      child.kill("SIGTERM");
-      force = setTimeout(() => {
-        if (!exited) child.kill("SIGKILL");
-      }, 500);
-    };
+    const { child } = namespace;
+    const stopChild = namespace.interrupt;
     abort.signal.addEventListener("abort", stopChild, { once: true });
     if (abort.signal.aborted) stopChild();
-    let error: Error | undefined;
     child.once("spawn", () => {
       launched = true;
       if (!abort.signal.aborted) state = "running";
     });
-    child.once("error", (failure) => {
-      error = failure;
-    });
-    child.once("exit", () => {
-      exited = true;
-    });
     const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolve) => child.once("close", (code, signal) => resolve({ code, signal })),
     );
-    if (force) clearTimeout(force);
     abort.signal.removeEventListener("abort", stopChild);
+    const error = namespace.failure();
     if (error) throw error;
     await terminal({ kind: "stopped", ...result, interrupted: abort.signal.aborted });
     process.exitCode = abort.signal.aborted ? 130 : (result.code ?? 1);
   } catch (error) {
     // A failed terminal-file sync is uncertainty, not permission to replace an
     // already-written receipt with a second, different outcome.
-    if (!terminalAttempted)
+    if (!terminalAttempted && !(error instanceof NamespaceStopUnprovenError))
       await terminal({
         kind: launched ? "stopped" : "not_started",
         code: null,

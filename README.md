@@ -4,11 +4,11 @@ Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra 
 
 This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Use a fresh state path. Unsupported existing data is left intact.
 
-The CLI and controlled runtimes are wired, but complete epic delivery is not yet ready. Final epic review/closure, fixture reset/cleanup and scoped validation access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
+The CLI and controlled runtimes are wired, but complete epic delivery is not yet ready. Final epic review/closure, host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
 ## Requirements
 
-- Linux x64, Node.js 22.12+, Git, and working Bubblewrap/user namespaces.
+- Linux x64, Node.js 22.12+, Git, Bubblewrap, util-linux `unshare`, and working unprivileged user/PID/mount namespaces.
 - Codex authentication and access to exactly `gpt-6-astra`. There is no coordinator model fallback.
 - `br` (Beads) and a repository with a local `.beads/beads.db`.
 - A repository-declared `.epicd/policy.json`.
@@ -28,6 +28,8 @@ node dist/cli.js doctor --repo /path/to/repository --runtime sdk
 `doctor` checks executable/endpoint availability without starting a model turn. It does not certify authentication, model access, confinement, or successful delivery.
 
 SDK mode uses the SDK-pinned native Codex binary through the supervised SDK transport. Herdr mode launches a real native Codex TUI in run-owned, unfocused tabs; it does not wrap SDK workers in decorative panes. The selected runtime, executable paths, private storage roots, and Herdr endpoint are persisted at creation. Resume does not silently switch runtimes.
+
+Confined validation, Codex, Beads and fixture commands use an independent PID-namespace lifetime supervisor outside Bubblewrap's command mounts. Cancellation remains effective during sandbox startup. A killed supervisor is an unknown stop, not permission to release a workspace, accept tracker completion or attest fixture-client termination. There is no unconfined fallback when this boundary cannot start.
 
 ## Declare policy
 
@@ -54,7 +56,7 @@ The JSON declaration uses schema version 1. Include the checks that actually est
 }
 ```
 
-Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Fixture declarations do not themselves grant host-service authority. Explicit grants, catalog inspection and absent-database creation are implemented; reset, cleanup and scoped fixture access for repository tests are not yet implemented.
+Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Host fixture declarations do not themselves grant service authority. Explicit grants, catalog inspection and absent-database creation are implemented; host-fixture reset, cleanup and restricted shared-service access are not. Separately declared check-scoped PostgreSQL services can now supply an isolated database for validation.
 
 Policy is frozen when a run is created. Editing the repository file does not change an existing run's permissions or required checks.
 
@@ -135,6 +137,35 @@ Before mutation, SQLite records the generation, planned database OID, operation 
 
 `reconcile_fixture_creation` inspects a recorded creation without repeating SQL mutations. It requires an inspection grant after dispatch. An unmarked, changed or possibly still-running creation remains uncertain and is preserved. A replaced socket cannot prove that the old backend stopped. Only a never-dispatched intent, or confirmed backend stop followed by an absent resource, permits a new creation generation. Reset/cleanup remain unavailable, and successful creation does not make the fixture accessible to repository validation.
 
+## Check-scoped PostgreSQL validation
+
+When a check needs a fresh database rather than a shared host fixture, add a separate `validationServices` declaration to policy:
+
+```json
+{
+  "validationServices": [
+    {
+      "id": "e2e-postgres",
+      "provider": "postgresql",
+      "lifetime": "check",
+      "binDirectory": "/usr/lib/postgresql/18/bin",
+      "database": "browser_test",
+      "role": "fixture_owner",
+      "port": 55432,
+      "connectionVariable": "DATABASE_URL"
+    }
+  ]
+}
+```
+
+Reference `"e2e-postgres"` in the required check's `environmentBindings` array. The orchestrator still chooses when to call `run_validation`; the kernel initializes the declared service before executing that check's unchanged command/arguments. Setup stays inside the validation profile already authorized for the run. It does not consume or expand a host-fixture grant, install PostgreSQL, or connect to a host database. Service IDs cannot alias host fixture bindings.
+
+Each invocation creates a fresh private PostgreSQL cluster and database, exposes its URL only inside that check, and discards its data when the sandbox stops. TCP uses the sandbox's private loopback interface; no host socket, host account file or credential is mounted. Even PostgreSQL-superuser operations remain inside the same filesystem/process/network confinement. The existing `CREATEDB` host role is never passed through `SET ROLE` as a substitute for isolation; [PostgreSQL permits resetting that role](https://www.postgresql.org/docs/current/sql-set-role.html).
+
+SQLite records the instance ID, definition digest and native executable fingerprints before launch. Binding and its audit write commit together. Setup failure cannot start the check; a changed runtime cannot supply passing environment evidence. Replaying the same action returns its stored result, while a new invocation gets a new instance. There is no database state shared between checks, and no automatic substitution for a declared host fixture. Use a deliberately matching check/plan; application dependencies and browser binaries still need to exist in the validation environment.
+
+The live contract currently uses PostgreSQL 18. Native `initdb`, `pg_ctl`, `postgres` and `psql` must reside in the declared canonical `/usr` directory. The validation user must be non-root. These services are visible in `status --json` and in the orchestrator's frozen policy context.
+
 ## Safety and recovery
 
 The model chooses the next useful capability. The kernel validates control versions, leases, policy, workspace ownership, and evidence before executing it.
@@ -177,7 +208,7 @@ Normal integration tests use owned temporary repositories and scripted provider 
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 
 ```bash
-EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin npm test -- test/fixture-postgresql.integration.test.ts test/fixture-creation-postgresql.integration.test.ts
+EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin npm test -- test/fixture-postgresql.integration.test.ts test/fixture-creation-postgresql.integration.test.ts test/validation-services.integration.test.ts test/delivery.integration.test.ts
 ```
 
 The original dispatcher and its dedicated tests have been removed. Their history remains in Git; old state, user repositories, and user-owned Herdr resources are not deleted by this hard cut.

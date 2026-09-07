@@ -7,8 +7,11 @@ const NodeIdentity = z.strictObject({
   device: z.string().regex(/^\d+$/),
   inode: z.string().regex(/^\d+$/),
 });
+export const FixtureExecutableSchema = NodeIdentity.extend({
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
+});
 export const FixtureProviderBindingSchema = z.strictObject({
-  executable: NodeIdentity.extend({ digest: z.string().regex(/^[a-f0-9]{64}$/) }),
+  executable: FixtureExecutableSchema,
   directory: NodeIdentity,
   socket: NodeIdentity.extend({ changeTimeNs: z.string().regex(/^\d+$/) }).nullable(),
 });

@@ -2,6 +2,23 @@ import { z } from "zod";
 import { WorkspaceIdentitySchema } from "./agents.js";
 import { WorkspaceSnapshotSchema } from "./workspaces.js";
 import { RequiredCheckSchema } from "./repository-policy.js";
+import { FixtureExecutableSchema } from "./fixtures.js";
+
+export const ValidationServiceRuntimeSchema = z.strictObject({
+  initdb: FixtureExecutableSchema,
+  pg_ctl: FixtureExecutableSchema,
+  postgres: FixtureExecutableSchema,
+  psql: FixtureExecutableSchema,
+});
+export type ValidationServiceRuntime = z.infer<typeof ValidationServiceRuntimeSchema>;
+export const ValidationEnvironmentSchema = z.strictObject({
+  bindingId: z.string().min(1).max(256),
+  instanceId: z.uuid(),
+  generation: z.literal(1), // A fresh check-scoped instance is never reset or reused.
+  definitionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  runtime: ValidationServiceRuntimeSchema.nullable(),
+});
+export type ValidationEnvironment = z.infer<typeof ValidationEnvironmentSchema>;
 
 const Id = z.string().min(1).max(256);
 const At = z.iso.datetime();
@@ -86,8 +103,8 @@ export const ValidationEvidenceSchema = WorkspaceIdentitySchema.extend({
   revision: Id,
   fingerprint: Id,
   confinementProfile: z.literal("bwrap-read-only-source-v1"),
-  // Fixture-backed evidence is not admitted until the fixture bridge supplies generation proofs.
-  environmentGenerations: z.array(z.never()),
+  environmentGenerations: z.array(ValidationEnvironmentSchema).max(4),
+  environmentVerified: z.boolean(),
   status: z.enum(["running", "finished"]),
   outcome: ValidationOutcomeSchema.nullable(),
   sourceUnchanged: z.boolean(),

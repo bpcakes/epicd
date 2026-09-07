@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as sandbox from "../src/adapters/sandbox.js";
+import { NamespaceStopUnprovenError } from "../src/adapters/pid-namespace.js";
 import { StateStore } from "../src/adapters/store.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { ActionKernel } from "../src/kernel/actions.js";
@@ -14,6 +16,7 @@ import {
   RepositoryPolicySchema,
   RequiredCheckSchema,
   type RepositoryPolicy,
+  ValidationServiceSchema,
 } from "../src/domain/repository-policy.js";
 import { SdkAgentSessionContractSchema } from "../src/domain/types.js";
 import type {
@@ -22,6 +25,7 @@ import type {
   KernelAction,
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import type { ValidationEvidence } from "../src/domain/delivery.js";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
@@ -121,12 +125,15 @@ async function fixture(policyInput: Partial<RepositoryPolicy> = {}) {
     const pending = kernel.operation(result.operationId);
     return pending ? await pending : journal.action(state.runId, result.actionId)!.result!;
   }
-  async function define(checks = [actionCheck(check)]) {
+  async function define(
+    checks = [actionCheck(check)],
+    acceptanceCriteria = ["The application must report green"],
+  ) {
     const result = success(
       await dispatch({
         kind: "define_validation_plan",
         taskId: "demo.1",
-        acceptanceCriteria: ["The application must report green"],
+        acceptanceCriteria,
         checks,
       }),
     );
@@ -190,6 +197,277 @@ function validation(result: ActionResult) {
 
 // Linux is the admitted confinement platform; a missing/broken sandbox fails these tests there.
 describe.skipIf(process.platform !== "linux")("candidate and validation capabilities", () => {
+  it("keeps validation and workspace exclusion indeterminate when its monitor cannot prove stop", async () => {
+    const setup = await fixture();
+    const planId = await setup.define(),
+      candidate = await setup.capture(planId),
+      copy = await setup.review(candidate);
+    // This injects only the transport's unknown-stop outcome; the action, evidence,
+    // snapshot admission and SQLite exclusion are real. No fake command success.
+    const launch = vi.spyOn(sandbox, "startConfinedCommand").mockImplementationOnce(async () => ({
+      result: Promise.reject(new NamespaceStopUnprovenError("Fixture monitor was killed")),
+      interrupt() {},
+    }));
+    try {
+      const result = await setup.dispatch({
+        kind: "run_validation",
+        ...candidate,
+        ...target(copy),
+        validationPlanId: planId,
+        checkId: check.id,
+      });
+      expect(result.status).toBe("indeterminate");
+      expect(launch).toHaveBeenCalledOnce();
+      const db = new Database(setup.path, { readonly: true });
+      try {
+        const rows = db
+          .prepare("SELECT record_json FROM validation_evidence WHERE run_id = ?")
+          .all(setup.authority.runId) as { record_json: string }[];
+        expect(rows).toHaveLength(1);
+        const evidence = JSON.parse(rows[0]!.record_json);
+        expect(evidence).toMatchObject({
+          status: "running",
+          outcome: null,
+          environmentVerified: false,
+        });
+        expect(
+          setup.journal.delivery.satisfiesCheck(setup.authority.runId, evidence.evidenceId),
+        ).toBe(false);
+        expect(
+          setup.journal.agents.activeWorkspaceOperation(setup.authority.runId, copy),
+        ).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      launch.mockRestore();
+    }
+  });
+  it("binds service runtime metadata once, rolls back failed audit writes, and never treats a lost pre-launch result as a pass", async () => {
+    const service = ValidationServiceSchema.parse({
+      id: "browser",
+      provider: "postgresql",
+      lifetime: "check",
+      binDirectory: "/usr/lib/postgresql/18/bin",
+      database: "browser_test",
+      role: "fixture_owner",
+      port: 55432,
+      connectionVariable: "DATABASE_URL",
+    });
+    const dependent = { ...check, environmentBindings: [service.id] };
+    const setup = await fixture({ requiredChecks: [dependent], validationServices: [service] });
+    const planId = await setup.define([actionCheck(dependent)]),
+      candidate = await setup.capture(planId),
+      copy = await setup.review(candidate);
+    let announce!: (value: ValidationEvidence) => void, release!: () => void;
+    const ready = new Promise<ValidationEvidence>((resolve) => {
+      announce = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const kernel = new ActionKernel(setup.journal);
+    kernel.registerExternal("run_validation", async ({ authority, record }) => {
+      announce(setup.journal.delivery.beginValidation(authority, record.actionId));
+      await gate;
+      throw new Error("Lost acknowledgement before any provider launch");
+    });
+    const pending = await kernel.execute(
+      setup.decision({
+        kind: "run_validation",
+        ...candidate,
+        ...target(copy),
+        validationPlanId: planId,
+        checkId: dependent.id,
+      }),
+      setup.authority,
+    );
+    if (pending.status !== "running") throw new Error("Expected held validation intent");
+    const result = kernel.operation(pending.operationId)!;
+    const db = new Database(setup.path);
+    try {
+      const evidence = await ready;
+      // Synthetic executable metadata is journal-only input; no provider is invoked in this test.
+      const binary = (name: string) => ({
+        path: `${service.binDirectory}/${name}`,
+        device: "1",
+        inode: "1",
+        digest: "a".repeat(64),
+      });
+      const runtime = {
+        initdb: binary("initdb"),
+        pg_ctl: binary("pg_ctl"),
+        postgres: binary("postgres"),
+        psql: binary("psql"),
+      };
+      const before = setup.journal.latestObservationCursor(setup.authority.runId);
+      db.exec(
+        "CREATE TRIGGER fail_service_binding BEFORE INSERT ON observations WHEN json_extract(NEW.observation_json, '$.kind') = 'validation.services_bound' BEGIN SELECT RAISE(ABORT, 'audit failure'); END",
+      );
+      expect(() =>
+        setup.journal.delivery.bindValidationServices(setup.authority, evidence.evidenceId, [
+          runtime,
+        ]),
+      ).toThrow("audit failure");
+      expect(setup.journal.delivery.evidence(setup.authority.runId, evidence.evidenceId)).toEqual(
+        evidence,
+      );
+      expect(setup.journal.latestObservationCursor(setup.authority.runId)).toBe(before);
+      db.exec("DROP TRIGGER fail_service_binding");
+      const bound = setup.journal.delivery.bindValidationServices(
+        setup.authority,
+        evidence.evidenceId,
+        [runtime],
+      );
+      expect(bound.environmentGenerations[0]?.runtime).toEqual(runtime);
+      expect(() =>
+        setup.journal.delivery.bindValidationServices(setup.authority, evidence.evidenceId, [
+          runtime,
+        ]),
+      ).toThrow("one-use");
+      expect(
+        setup.journal.delivery.satisfiesCheck(setup.authority.runId, evidence.evidenceId),
+      ).toBe(false);
+      release();
+      expect((await result).status).toBe("indeterminate");
+      const reopened = new StateStore(setup.path);
+      try {
+        expect(
+          reopened.orchestration.delivery.evidence(setup.authority.runId, evidence.evidenceId),
+        ).toEqual(bound);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      release();
+      await result;
+      db.close();
+    }
+  });
+  it.runIf(Boolean(process.env.EPICD_TEST_PG_BINDIR))(
+    "executes a declared check-scoped database through the real action/evidence path and never replays its instance",
+    async () => {
+      const bin = process.env.EPICD_TEST_PG_BINDIR!;
+      const service = ValidationServiceSchema.parse({
+        id: "browser",
+        provider: "postgresql",
+        lifetime: "check",
+        binDirectory: bin,
+        database: "browser_test",
+        role: "fixture_owner",
+        port: 55432,
+        connectionVariable: "DATABASE_URL",
+      });
+      const sql = RequiredCheckSchema.parse({
+        ...check,
+        id: "sql",
+        environmentBindings: [service.id],
+        timeoutMs: 15_000,
+        args: [
+          "-c",
+          `exec ${bin}/psql -X -w -qAt -v ON_ERROR_STOP=1 "$DATABASE_URL" -c 'CREATE TABLE proof(value integer); INSERT INTO proof VALUES (42); SELECT value FROM proof;'`,
+        ],
+      });
+      const setup = await fixture({ requiredChecks: [sql], validationServices: [service] });
+      const planId = await setup.define(
+        [actionCheck(sql)],
+        ["The declared fresh database must execute the required SQL"],
+      );
+      const candidate = await setup.capture(planId),
+        copy = await setup.review(candidate);
+      const action: KernelAction = {
+        kind: "run_validation",
+        ...candidate,
+        ...target(copy),
+        validationPlanId: planId,
+        checkId: sql.id,
+      };
+      const request = setup.decision(action);
+      const pending = await setup.kernel.execute(request, setup.authority);
+      if (pending.status !== "running") throw new Error("Expected asynchronous validation");
+      const first = validation(await setup.kernel.operation(pending.operationId)!);
+      expect(first).toMatchObject({ outcome: "succeeded", satisfiesCheck: true });
+      const evidence = setup.journal.delivery.evidence(setup.authority.runId, first.evidenceId);
+      expect(evidence).toMatchObject({
+        environmentVerified: true,
+        sourceUnchanged: true,
+        outcome: { stdout: "42\n", processTreeStopped: true },
+        environmentGenerations: [
+          {
+            bindingId: service.id,
+            generation: 1,
+            runtime: { postgres: { path: `${bin}/postgres`, digest: expect.any(String) } },
+          },
+        ],
+      });
+      expect(validation(await setup.kernel.execute(request, setup.authority))).toEqual(first);
+      const reopened = new StateStore(setup.path);
+      try {
+        expect(
+          reopened.orchestration.delivery.evidence(setup.authority.runId, first.evidenceId),
+        ).toEqual(evidence);
+      } finally {
+        reopened.close();
+      }
+      const next = validation(await setup.dispatch(action));
+      expect(next.satisfiesCheck).toBe(true);
+      const latest = setup.journal.delivery.evidence(setup.authority.runId, next.evidenceId);
+      expect(latest.environmentGenerations[0]?.instanceId).not.toBe(
+        evidence.environmentGenerations[0]?.instanceId,
+      );
+      expect(setup.journal.delivery.satisfiesCheck(setup.authority.runId, first.evidenceId)).toBe(
+        false,
+      );
+      expect(readFileSync(join(setup.source, "app.txt"), "utf8")).toBe("red\n");
+    },
+    40_000,
+  );
+
+  it("records failed service setup without starting the check or accepting empty environment evidence", async () => {
+    const service = ValidationServiceSchema.parse({
+      id: "browser",
+      provider: "postgresql",
+      lifetime: "check",
+      binDirectory: "/usr/epicd-missing-postgresql-binaries",
+      database: "browser_test",
+      role: "fixture_owner",
+      port: 55432,
+      connectionVariable: "DATABASE_URL",
+    });
+    const dependent = {
+      ...check,
+      environmentBindings: [service.id],
+      args: ["-c", "touch scratch/check-started"],
+    };
+    const setup = await fixture({
+      requiredChecks: [dependent],
+      validationServices: [service],
+      writableScratch: ["scratch"],
+    });
+    const planId = await setup.define([actionCheck(dependent)]),
+      candidate = await setup.capture(planId),
+      copy = await setup.review(candidate);
+    const result = validation(
+      await setup.dispatch({
+        kind: "run_validation",
+        ...candidate,
+        ...target(copy),
+        validationPlanId: planId,
+        checkId: dependent.id,
+      }),
+    );
+    expect(result).toMatchObject({ outcome: "not_started", satisfiesCheck: false });
+    const evidence = setup.journal.delivery.evidence(setup.authority.runId, result.evidenceId);
+    expect(evidence).toMatchObject({
+      environmentVerified: false,
+      environmentGenerations: [{ bindingId: service.id, runtime: null }],
+    });
+    expect(existsSync(join(copy.path, "scratch/check-started"))).toBe(false);
+    expect(setup.journal.agents.activeWorkspaceOperation(setup.authority.runId, copy)).toBeNull();
+    expect(() =>
+      setup.journal.delivery.bindValidationServices(setup.authority, evidence.evidenceId, []),
+    ).toThrow("one-use");
+  });
   it("retains truncated output without accepting it as a pass or overflowing inspection", async () => {
     const noisy = {
       ...check,
