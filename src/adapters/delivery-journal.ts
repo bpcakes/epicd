@@ -38,7 +38,7 @@ export const DELIVERY_TABLES = [
   "candidate_workspaces",
   "validation_evidence",
 ] as const;
-export function migrateDelivery(db: Database.Database): void {
+export function createDeliverySchema(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS validation_plans (
       plan_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,

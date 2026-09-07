@@ -15,7 +15,7 @@ import { redactSensitiveText } from "../util/redact.js";
 import { RunStateSchema } from "../domain/types.js";
 
 export const COMMIT_TABLES = ["delivery_commits"] as const;
-export function migrateCommits(db: Database.Database) {
+export function createCommitsSchema(db: Database.Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS delivery_commits (
     commit_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
     operation_id TEXT NOT NULL UNIQUE REFERENCES actions(operation_id),

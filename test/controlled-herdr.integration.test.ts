@@ -306,6 +306,26 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === 
         },
       });
       await setup.terminalStopped(first.launch!.native!);
+      const observations = setup.store.orchestration.observations(setup.authority.runId);
+      const terminal = observations.find((row) => row.kind === "runtime.native_terminal");
+      expect(terminal?.artifactIds).toHaveLength(1);
+      const diagnostic = setup.store.orchestration.diagnostics.read(
+        setup.authority.runId,
+        terminal!.artifactIds[0]!,
+        0,
+        65536,
+      );
+      expect(diagnostic).toMatchObject({
+        identity: first.identity,
+        sourceTruncated: true,
+        source: "controlled-herdr",
+      });
+      expect(diagnostic.text.length).toBeGreaterThan(0);
+      expect(
+        observations.some(
+          (row) => row.kind === "runtime.agent_message" && row.artifactIds.length === 1,
+        ),
+      ).toBe(true);
       const sessionId = setup.store.orchestration.agents.instance(
         setup.authority.runId,
         setup.agent,

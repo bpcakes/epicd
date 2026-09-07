@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { ControllerAuthority, KernelAction } from "../domain/orchestration.js";
 import type { WorkspaceManager } from "./workspaces.js";
 import { InspectionError, InspectionFiles, inspectionPath } from "./inspection-files.js";
-import { redactSensitiveText } from "../util/redact.js";
+import { redactDiagnosticText } from "../util/redact.js";
 
 type Request = Extract<KernelAction, { kind: "inspect_repo" }>;
 type Row = Record<string, unknown>;
@@ -25,15 +25,7 @@ const secretFile = (path: string) =>
       ),
     );
 // Redact whole contents before selecting a page, so a page boundary cannot expose a split assignment.
-function diagnostic(value: string): string {
-  return redactSensitiveText(
-    value.replace(
-      /("(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|password|client[_-]?secret|secret)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
-      '$1"[REDACTED]"',
-    ),
-    value.length + 1,
-  );
-}
+const diagnostic = redactDiagnosticText;
 
 /** Bounded source observations. Never creates a candidate, validation, or approval record. */
 export async function inspectRepository(

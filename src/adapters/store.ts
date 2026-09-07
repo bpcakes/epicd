@@ -21,7 +21,7 @@ import {
 import { redactSensitiveText } from "../util/redact.js";
 import {
   OrchestrationJournal,
-  migrateOrchestration,
+  createOrchestrationSchema,
   ORCHESTRATION_SCHEMA_VERSION,
 } from "./orchestration-journal.js";
 import { RepositoryPolicySchema, type RepositoryPolicy } from "../domain/repository-policy.js";
@@ -232,10 +232,10 @@ export class StateStore {
     this.db = new Database(path, { timeout: 5_000 });
     this.orchestration = new OrchestrationJournal(this.db);
     try {
+      this.initialize();
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
       this.db.pragma("foreign_keys = ON");
-      this.migrate();
     } catch (error) {
       this.db.close();
       throw error;
@@ -245,34 +245,26 @@ export class StateStore {
     }
   }
 
-  private migrate(): void {
-    const existingSchema = this.db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_schema'")
-      .get();
-    let requiresSnapshot = !existingSchema;
-    if (existingSchema) {
-      const version = this.db
-        .prepare("SELECT MAX(version) AS version FROM orchestration_schema")
-        .get() as { version: number | null };
-      if (
-        version.version === null ||
-        version.version < 1 ||
-        version.version > ORCHESTRATION_SCHEMA_VERSION
-      )
-        throw new Error("Orchestration database requires a different Epicd schema version");
-      requiresSnapshot = version.version < ORCHESTRATION_SCHEMA_VERSION;
-    }
-    if (
-      requiresSnapshot &&
-      this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").get()
-    ) {
-      // SQLite's snapshot facility includes committed WAL pages; copying the main file does not.
-      const backupPath = `${this.path}.before-orchestration-${randomUUID()}.sqlite3`;
-      this.db.prepare("VACUUM main INTO ?").run(backupPath);
-      chmodSync(backupPath, 0o600);
-    }
+  /** Hard cut: initialize empty storage or reopen this exact format. Never migrate existing data. */
+  private initialize(): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const tables = this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .all() as { name: string }[];
+      if (tables.length) {
+        const versions = tables.some((table) => table.name === "orchestration_schema")
+          ? (this.db.prepare("SELECT version FROM orchestration_schema").all() as {
+              version: number;
+            }[])
+          : [];
+        if (versions.length !== 1 || versions[0]?.version !== ORCHESTRATION_SCHEMA_VERSION)
+          throw new Error(
+            "This Epicd state format is unsupported. Use a fresh state path; existing data was not migrated or deleted.",
+          );
+        this.db.exec("COMMIT");
+        return;
+      }
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
@@ -323,71 +315,14 @@ export class StateStore {
         PRIMARY KEY (run_id, event_id)
       ) STRICT;
       `);
-      let leaseColumns = this.db.pragma("table_info(run_leases)") as Array<{
-        name: string;
-        notnull: 0 | 1;
-      }>;
-      if (!leaseColumns.some((column) => column.name === "process_marker")) {
-        this.db.exec("ALTER TABLE run_leases ADD COLUMN process_marker TEXT");
-      }
-      if (!leaseColumns.some((column) => column.name === "lease_id")) {
-        this.db.exec("ALTER TABLE run_leases ADD COLUMN lease_id TEXT");
-      }
-      const leasesWithoutIdentity = this.db
-        .prepare("SELECT run_id FROM run_leases WHERE lease_id IS NULL OR lease_id = ''")
-        .all() as Array<{ run_id: string }>;
-      const setLeaseIdentity = this.db.prepare(
-        "UPDATE run_leases SET lease_id = ? WHERE run_id = ?",
-      );
-      for (const lease of leasesWithoutIdentity) {
-        setLeaseIdentity.run(randomUUID(), lease.run_id);
-      }
-      leaseColumns = this.db.pragma("table_info(run_leases)") as Array<{
-        name: string;
-        notnull: 0 | 1;
-      }>;
-      if (leaseColumns.find((column) => column.name === "lease_id")?.notnull !== 1) {
-        this.db.exec(`
-          DROP TABLE IF EXISTS run_leases_epicd_migration;
-          CREATE TABLE run_leases_epicd_migration (
-            run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
-            owner_token TEXT NOT NULL,
-            lease_id TEXT NOT NULL,
-            pid INTEGER NOT NULL,
-            acquired_at TEXT NOT NULL,
-            process_marker TEXT
-          ) STRICT;
-          INSERT INTO run_leases_epicd_migration(
-            run_id, owner_token, lease_id, pid, acquired_at, process_marker
-          )
-          SELECT run_id, owner_token, lease_id, pid, acquired_at, process_marker
-          FROM run_leases;
-          DROP TABLE run_leases;
-          ALTER TABLE run_leases_epicd_migration RENAME TO run_leases;
-        `);
-      }
-      const conflict = this.db
-        .prepare(
-          `SELECT repo_path, GROUP_CONCAT(epic_id) AS epic_ids
-           FROM runs WHERE phase != 'complete'
-           GROUP BY repo_path HAVING COUNT(*) > 1
-           LIMIT 1`,
-        )
-        .get() as { repo_path: string; epic_ids: string } | undefined;
-      if (conflict) {
-        throw new Error(
-          `Cannot migrate epicd state: repository ${conflict.repo_path} has multiple active epics (${conflict.epic_ids})`,
-        );
-      }
       this.db.exec(`
-        DROP INDEX IF EXISTS runs_active_epic;
         CREATE UNIQUE INDEX IF NOT EXISTS runs_active_repo
           ON runs(repo_path)
           WHERE phase != 'complete';
         CREATE INDEX IF NOT EXISTS runs_by_repo_epic_order
           ON runs(repo_path, epic_id, updated_at DESC, created_at DESC, run_id DESC);
       `);
-      migrateOrchestration(this.db);
+      createOrchestrationSchema(this.db);
       this.db.exec("COMMIT");
     } catch (error) {
       if (this.db.inTransaction) this.db.exec("ROLLBACK");

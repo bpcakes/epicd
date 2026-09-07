@@ -1,13 +1,5 @@
 import { execFileSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -340,53 +332,6 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
     expect(setup.journal.delivery.satisfiesCheck(setup.authority.runId, result.evidenceId)).toBe(
       false,
     );
-  });
-
-  it("snapshots schema-three workspace state before adding candidate and evidence tables", async () => {
-    const setup = await fixture();
-    const db = new Database(setup.path);
-    try {
-      db.exec(
-        "DROP TABLE tracker_snapshots; DROP TABLE tracker_operations; DROP TABLE tracker_roots; DROP TABLE publications; DROP TABLE delivery_repositories; DROP TABLE delivery_commits; DROP TABLE review_findings; DROP TABLE review_evidence; DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP INDEX workspace_creation_operation; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema VALUES (3)",
-      );
-      db.exec(
-        "UPDATE workspaces SET record_json = json_remove(record_json, '$.creationOperationId')",
-      );
-      const original = db
-        .prepare("SELECT record_json FROM workspaces WHERE workspace_id = ?")
-        .get(setup.workspace.workspaceId);
-      const upgraded = new StateStore(setup.path);
-      stores.push(upgraded);
-      expect(
-        upgraded.orchestration.agents.workspace(setup.authority.runId, setup.workspace),
-      ).toMatchObject({ status: "ready", creationOperationId: null });
-      const backupPath = join(
-        setup.root,
-        readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!,
-      );
-      const backup = new Database(backupPath, { readonly: true });
-      try {
-        expect(
-          backup.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-        ).toEqual({ version: 3 });
-        expect(
-          backup
-            .prepare("SELECT record_json FROM workspaces WHERE workspace_id = ?")
-            .get(setup.workspace.workspaceId),
-        ).toEqual(original);
-        expect(
-          backup.prepare("SELECT name FROM sqlite_master WHERE name = 'candidates'").get(),
-        ).toBeUndefined();
-      } finally {
-        backup.close();
-      }
-      expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 12,
-      });
-      expect(db.pragma("foreign_key_check")).toEqual([]);
-    } finally {
-      db.close();
-    }
   });
 
   it("tracks replacement writers for the task, not only the original source agent", async () => {

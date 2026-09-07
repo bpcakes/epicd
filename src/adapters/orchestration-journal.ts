@@ -26,30 +26,35 @@ import {
   type RepositoryPolicy,
 } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
-import { AgentJournal, AGENT_TABLES, migrateAgents } from "./agent-journal.js";
+import { AgentJournal, AGENT_TABLES, createAgentsSchema } from "./agent-journal.js";
 import {
   DecisionJournal,
   DECISION_SOURCE_TABLES,
-  migrateDecisionSource,
+  createDecisionSourceSchema,
 } from "./decision-journal.js";
 import {
   DeliveryJournal,
   DeliveryError,
   DELIVERY_TABLES,
-  migrateDelivery,
+  createDeliverySchema,
 } from "./delivery-journal.js";
-import { ReviewJournal, REVIEW_TABLES, migrateReviews } from "./review-journal.js";
-import { CommitJournal, COMMIT_TABLES, migrateCommits } from "./commit-journal.js";
+import { ReviewJournal, REVIEW_TABLES, createReviewsSchema } from "./review-journal.js";
+import { CommitJournal, COMMIT_TABLES, createCommitsSchema } from "./commit-journal.js";
 import {
   PublicationJournal,
   PUBLICATION_TABLES,
-  migratePublication,
+  createPublicationSchema,
 } from "./publication-journal.js";
 import { concurrentWithPublication } from "../domain/publication.js";
-import { TrackerJournal, TRACKER_TABLES, migrateTracker } from "./tracker-journal.js";
+import { TrackerJournal, TRACKER_TABLES, createTrackerSchema } from "./tracker-journal.js";
 import { concurrentWithTracker } from "../domain/tracker.js";
+import {
+  DiagnosticJournal,
+  DIAGNOSTIC_TABLES,
+  createDiagnosticsSchema,
+} from "./diagnostic-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 12;
+export const ORCHESTRATION_SCHEMA_VERSION = 13;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -65,10 +70,11 @@ export const ORCHESTRATION_TABLES = [
   ...COMMIT_TABLES,
   ...PUBLICATION_TABLES,
   ...TRACKER_TABLES,
+  ...DIAGNOSTIC_TABLES,
 ] as const;
 
-/** Called inside StateStore's single forward-migration transaction. */
-export function migrateOrchestration(db: Database.Database): void {
+/** Called only while initializing an empty StateStore. There is no migration path. */
+export function createOrchestrationSchema(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS orchestration_schema (version INTEGER PRIMARY KEY CHECK(version > 0)) STRICT;
     INSERT OR IGNORE INTO orchestration_schema(version) VALUES (${ORCHESTRATION_SCHEMA_VERSION});
@@ -123,13 +129,14 @@ export function migrateOrchestration(db: Database.Database): void {
       source_table TEXT NOT NULL, row_json TEXT NOT NULL
     ) STRICT;
   `);
-  migrateAgents(db);
-  migrateDelivery(db);
-  migrateReviews(db);
-  migrateCommits(db);
-  migratePublication(db);
-  migrateTracker(db);
-  migrateDecisionSource(db);
+  createAgentsSchema(db);
+  createDeliverySchema(db);
+  createReviewsSchema(db);
+  createCommitsSchema(db);
+  createPublicationSchema(db);
+  createTrackerSchema(db);
+  createDecisionSourceSchema(db);
+  createDiagnosticsSchema(db);
 }
 
 type ControlRow = {
@@ -189,8 +196,24 @@ export class OrchestrationJournal {
   readonly publications: PublicationJournal;
   readonly tracker: TrackerJournal;
   readonly decisionSource: DecisionJournal;
+  readonly diagnostics: DiagnosticJournal;
 
   constructor(private readonly db: Database.Database) {
+    this.diagnostics = new DiagnosticJournal(db, {
+      transaction: (authority, body) => this.transaction(authority, body),
+      budget: (runId) => this.policy(runId).budgets.artifactBytes,
+      turn: (runId, identity) => this.agents.turn(runId, identity),
+      observe: (authority, input) => this.appendObservation(authority, input),
+      exhaust: (authority) => {
+        if (this.control(authority.runId).status === "active")
+          this.setEscalation(
+            authority,
+            "The run's retained diagnostic budget is exhausted. Preserve existing evidence; authorize a budget increase or end the run before further evidence-producing work.",
+            "diagnostic_budget_exhausted",
+            [],
+          );
+      },
+    });
     this.decisionSource = new DecisionJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
       control: (runId) => this.control(runId),

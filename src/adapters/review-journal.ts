@@ -23,7 +23,7 @@ import { DeliveryError, type DeliveryJournal } from "./delivery-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
 
 export const REVIEW_TABLES = ["review_evidence", "review_findings"] as const;
-export function migrateReviews(db: Database.Database) {
+export function createReviewsSchema(db: Database.Database) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS review_evidence (
       evidence_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,

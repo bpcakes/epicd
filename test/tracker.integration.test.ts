@@ -10,7 +10,6 @@ import {
   rmSync,
   symlinkSync,
   writeFileSync,
-  readdirSync,
 } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -652,28 +651,10 @@ describe.skipIf(process.platform !== "linux")(
       ).toBe("rejected");
       expect(s.commands()).toEqual([]);
     });
-    it("preserves schema-ten snapshots and raw tracker records during quarantine", async () => {
+    it("preserves raw current tracker records during quarantine", async () => {
       const s = fixture();
       const db = new Database(join(s.root, "state.db"));
       try {
-        db.exec(
-          "DROP TABLE tracker_snapshots; DROP TABLE tracker_operations; DROP TABLE tracker_roots; UPDATE orchestration_schema SET version = 10",
-        );
-        s.reopen();
-        expect(
-          db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-        ).toEqual({
-          version: 12,
-        });
-        const file = readdirSync(s.root).find((name) => name.includes("before-orchestration"))!;
-        const backup = new Database(join(s.root, file), { readonly: true });
-        try {
-          expect(backup.prepare("SELECT version FROM orchestration_schema").get()).toEqual({
-            version: 10,
-          });
-        } finally {
-          backup.close();
-        }
         success(await s.dispatch(claim()));
         const rows = db.prepare("SELECT * FROM tracker_operations").all();
         db.prepare("UPDATE runs SET state_json = 'invalid' WHERE run_id = ?").run(s.run.runId);

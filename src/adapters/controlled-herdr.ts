@@ -106,16 +106,25 @@ export class ControlledHerdrRuntime {
     let dispatched = false;
     let successfulExit = false;
     let sequence = 0;
-    const observe = (kind: string, summary: string) =>
-      this.journal.appendObservation(authority, {
-        source: "controlled-herdr",
-        sourceEventId: `${identity.turnId}:${++sequence}`,
-        kind,
-        summary: redactSensitiveText(summary, 7999),
-        artifactIds: [],
-        identity,
-        wakesOrchestrator: true,
-      });
+    const observe = (kind: string, summary: string, sourceTruncated = false) => {
+      const retained = this.journal.diagnostics.append(
+        authority,
+        {
+          source: "controlled-herdr",
+          sourceEventId: `${identity.turnId}:${++sequence}`,
+          kind,
+          summary: redactSensitiveText(summary, 7999),
+          identity,
+          wakesOrchestrator: true,
+        },
+        summary,
+        sourceTruncated,
+      );
+      if (retained.artifact.omission === "budget_exhausted")
+        throw new Error(
+          "Retained diagnostic budget exhausted; stop this turn without accepting its result",
+        );
+    };
     try {
       const launcher = await this.launches.materialize(manifest);
       check();
@@ -259,15 +268,27 @@ export class ControlledHerdrRuntime {
       });
       await sendHerdrPrompt(native, prompt, request.signal);
       let lastObservation = "";
+      let lastDiagnostic = "";
+      let nextDiagnosticAt = 0;
       for (;;) {
         check();
         await this.assertServer(native);
         const current = await observer.observe(native.name, expected, request.signal);
         check();
         const observed = JSON.stringify(current);
-        if (observed !== lastObservation) {
+        const changed = observed !== lastObservation;
+        if (changed) {
           observe("runtime.agent.lifecycle", observed);
           lastObservation = observed;
+        }
+        if (changed || Date.now() >= nextDiagnosticAt) {
+          const diagnostic = await observer.readDiagnostic(current.identity, request.signal);
+          check();
+          if (diagnostic.text !== lastDiagnostic) {
+            observe("runtime.native_terminal", diagnostic.text, diagnostic.truncated);
+            lastDiagnostic = diagnostic.text;
+          }
+          nextDiagnosticAt = Date.now() + 5000;
         }
         if (current.state === "blocked")
           throw new Error("Native agent requires approval or user input");
@@ -311,6 +332,7 @@ export class ControlledHerdrRuntime {
             continue;
           }
           check();
+          observe("runtime.agent_message", JSON.stringify(result));
           // Native readiness gates the exit key, not delivery evidence. Only the
           // outer supervisor's subsequent clean stop can make this result eligible.
           await this.cli(native, ["agent", "send-keys", native.name, "ctrl+d"], request.signal);

@@ -53,7 +53,7 @@ export const AGENT_TABLES = [
   "agent_messages",
 ] as const;
 
-export function migrateAgents(db: Database.Database): void {
+export function createAgentsSchema(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS workspaces (
       workspace_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,

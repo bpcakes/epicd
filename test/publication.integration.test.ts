@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, renameSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { fixture, check, git, resource, success, target, waitFor } from "./fixtures/review.js";
@@ -568,40 +568,11 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     );
   }, 25000);
 
-  it("snapshots schema nine before adding publication and quarantines all publication ownership records", async () => {
+  it("quarantines all current publication ownership records", async () => {
     const s = await fixture();
     const { candidate, commit } = await verified(s);
     const db = new Database(s.path);
     try {
-      db.exec(
-        "DROP TABLE tracker_snapshots; DROP TABLE tracker_operations; DROP TABLE tracker_roots; DROP TABLE publications; DROP TABLE delivery_repositories; UPDATE orchestration_schema SET version = 9",
-      );
-      const raw = db
-        .prepare("SELECT record_json FROM delivery_commits WHERE commit_id = ?")
-        .get(commit.commitId);
-      const { StateStore } = await import("../src/adapters/store.js");
-      const upgraded = new StateStore(s.path);
-      upgraded.close();
-      expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 12,
-      });
-      expect(
-        db
-          .prepare("SELECT record_json FROM delivery_commits WHERE commit_id = ?")
-          .get(commit.commitId),
-      ).toEqual(raw);
-      const backup = readdirSync(s.root).find((name) => name.includes("before-orchestration"))!;
-      const snapshot = new Database(join(s.root, backup), { readonly: true });
-      try {
-        expect(snapshot.prepare("SELECT version FROM orchestration_schema").get()).toEqual({
-          version: 9,
-        });
-        expect(
-          snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'publications'").get(),
-        ).toBeUndefined();
-      } finally {
-        snapshot.close();
-      }
       const id = resource(
         await s.dispatch(request(candidate, commit.revision!, s.head)),
       ).resourceId;

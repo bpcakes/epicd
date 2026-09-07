@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { runCommand, runJson } from "../util/command.js";
-import { redactSensitiveText } from "../util/redact.js";
+import { redactDiagnosticText } from "../util/redact.js";
 
 export const NativeHerdrIdentitySchema = z.object({
   name: z.string().min(1),
@@ -104,8 +104,9 @@ export class HerdrObserver {
 
   async readDiagnostic(
     identity: NativeHerdrIdentity,
+    signal?: AbortSignal,
   ): Promise<{ text: string; truncated: boolean }> {
-    await this.observe(identity.name, identity);
+    await this.observe(identity.name, identity, signal);
     const result = await runCommand(
       this.options.herdrPath,
       this.args(["agent", "read", identity.name, "--source", "recent-unwrapped", "--lines", "120"]),
@@ -113,13 +114,14 @@ export class HerdrObserver {
         cwd: this.options.cwd,
         timeoutMs: 10_000,
         ...(this.options.env ? { env: this.options.env } : {}),
+        ...(signal ? { signal } : {}),
       },
     );
     // Installed Herdr returns plain text, not a JSON read envelope. Check the
     // exact occupant before and after; text cannot attest to its own provenance.
-    await this.observe(identity.name, identity);
+    await this.observe(identity.name, identity, signal);
     return {
-      text: redactSensitiveText(result.stdout, 16 * 1024),
+      text: redactDiagnosticText(result.stdout).slice(0, 16 * 1024),
       // This is at most 120 screen/scrollback lines. The text CLI cannot prove
       // that earlier output was retained, even when no local clipping occurred.
       truncated: true,

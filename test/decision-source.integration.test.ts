@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -466,26 +466,10 @@ describe("durable coordinator transport attempts", () => {
     });
   });
 
-  it("migrates version 4 with a snapshot and includes source records in raw quarantine", () => {
+  it("includes current decision-source records in raw quarantine", () => {
     const setup = fixture();
     const db = new Database(setup.path);
     databases.push(db);
-    db.exec(
-      "DROP TABLE decision_source_attempts; DROP TABLE decision_executions; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema VALUES(4)",
-    );
-    const migrated = new StateStore(setup.path);
-    stores.push(migrated);
-    const backupName = readdirSync(setup.root).find((name) =>
-      name.includes(".before-orchestration-"),
-    )!;
-    const backup = new Database(join(setup.root, backupName), { readonly: true });
-    databases.push(backup);
-    expect(
-      backup.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 4 });
-    expect(
-      backup.prepare("SELECT 1 FROM sqlite_master WHERE name = 'decision_executions'").get(),
-    ).toBeUndefined();
     const input = request(setup);
     setup.journal.decisionSource.start(setup.authority, input.ticket.decisionId);
     // Use the real quarantine path through corrupted persisted state, preserving raw attempt/input rows.

@@ -20,6 +20,7 @@ import { assertCurrentDispatch, CapabilityRejected, OperationFailed } from "./gu
 import { actionContextRecord } from "./action-context.js";
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import { DeliveryError } from "../adapters/delivery-journal.js";
+import { DiagnosticRequestError } from "../adapters/diagnostic-journal.js";
 
 type ActionKind = KernelAction["kind"];
 export type ActionContext = {
@@ -43,6 +44,21 @@ export class ActionKernel {
   private integrityError: Error | null = null;
 
   constructor(readonly journal: OrchestrationJournal) {
+    this.registerLocal("inspect_artifact", ({ authority }, action) => {
+      try {
+        const page = journal.diagnostics.read(
+          authority.runId,
+          action.artifactId,
+          action.offset,
+          action.limit,
+        );
+        return { kind: "inspection", text: JSON.stringify(page), artifactIds: [page.artifactId] };
+      } catch (error) {
+        if (error instanceof DiagnosticRequestError)
+          throw new CapabilityRejected("invalid_artifact_reference", error.message);
+        throw error;
+      }
+    });
     this.registerLocal("inspect_agent", ({ authority }, action) => {
       const agent = journal.agents.instance(authority.runId, action);
       const turns = journal.agents
@@ -120,6 +136,7 @@ export class ActionKernel {
         commits: journal.commits.summaries(authority.runId),
         publications: journal.publications.summaries(authority.runId),
         tracker: journal.tracker.summary(authority.runId),
+        diagnostics: journal.diagnostics.summary(authority.runId),
         memory: journal
           .memory(authority.runId)
           .slice(-20)

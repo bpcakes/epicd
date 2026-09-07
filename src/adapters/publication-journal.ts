@@ -30,7 +30,7 @@ import { redactSensitiveText } from "../util/redact.js";
 import { WorkspaceOperationSchema } from "../domain/workspaces.js";
 
 export const PUBLICATION_TABLES = ["delivery_repositories", "publications"] as const;
-export function migratePublication(db: Database.Database) {
+export function createPublicationSchema(db: Database.Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS delivery_repositories (
     run_id TEXT PRIMARY KEY REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
     record_json TEXT NOT NULL CHECK(json_valid(record_json)),

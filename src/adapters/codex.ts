@@ -11,7 +11,7 @@ import type {
   TurnExecution,
   TurnUsage,
 } from "./runtime.js";
-import { redactSensitiveText } from "../util/redact.js";
+import { redactSensitiveText, redactDiagnosticText } from "../util/redact.js";
 import { runtimeCapabilities } from "./runtime-capabilities.js";
 import {
   AgentRoleSettingsSchema,
@@ -232,27 +232,27 @@ export function normalizeCodexEvent(event: ThreadEvent): RuntimeEvent | null {
     };
   }
   if (event.type === "turn.failed") {
-    return { type: "turn.failed", message: redactSensitiveText(event.error.message) };
+    return { type: "turn.failed", message: redactDiagnosticText(event.error.message) };
   }
   if (event.type === "error") {
-    return { type: "error", message: redactSensitiveText(event.message) };
+    return { type: "error", message: redactDiagnosticText(event.message) };
   }
   if (event.type === "item.started" && event.item.type === "command_execution") {
     return {
       type: "command.started",
       sourceItemId: event.item.id,
-      command: redactSensitiveText(event.item.command),
+      command: redactDiagnosticText(event.item.command),
     };
   }
   if (event.type !== "item.completed") return null;
   const item = event.item;
   if (item.type === "command_execution") {
-    const output = Buffer.from(redactSensitiveText(item.aggregated_output, Infinity), "utf8");
+    const output = Buffer.from(redactDiagnosticText(item.aggregated_output), "utf8");
     const outputLimit = 64 * 1024;
     const outputTruncated = output.length > outputLimit;
     return {
       type: "command.completed",
-      command: redactSensitiveText(item.command),
+      command: redactDiagnosticText(item.command),
       status: item.status === "failed" ? "failed" : "completed",
       sourceItemId: item.id,
       output: outputTruncated
@@ -270,7 +270,7 @@ export function normalizeCodexEvent(event: ThreadEvent): RuntimeEvent | null {
     };
   }
   if (item.type === "error") {
-    return { type: "error", message: redactSensitiveText(item.message), sourceItemId: item.id };
+    return { type: "error", message: redactDiagnosticText(item.message), sourceItemId: item.id };
   }
   return null;
 }

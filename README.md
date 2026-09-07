@@ -1,5 +1,7 @@
 # epicd
 
+This feature branch is a hard-cut rewrite into a persistent, GPT-6 Astra-led engineering orchestrator with native Herdr and SDK runtimes. It is not yet ready for real epic delivery: the new bootstrap and end-to-end acceptance are still being completed. The command reference below is being replaced, not maintained as a compatibility promise. Existing state formats are unsupported; select a fresh state path. Epicd does not migrate or automatically delete old run data.
+
 `epicd` runs a Beads epic one dependency-safe task at a time. It claims a task and hands it to a Codex implementation agent. A second session reviews the diff. If review passes, epicd commits the work and gives the exact commit SHA to a fresh verifier. The task closes after verification.
 
 Review findings return to the original implementation session, and the same reviewer checks the repairs. SQLite records the current phase, task, findings, session IDs, repair budget, and Git revisions, so a run can resume after epicd, its terminal, or an agent process stops. If Beads contains dependency-safe `in_progress` work with no owner, epicd can adopt it atomically; assigned work remains with its owner.
@@ -215,7 +217,7 @@ When `XDG_STATE_HOME` is unset, the path is `~/.local/state/epicd/epicd.sqlite3`
 
 The state database must be local to one OS instance and PID namespace. Epicd uses SQLite WAL and process identities for coordination; network filesystems, cross-host sharing, and sharing one database across containers or PID namespaces are unsupported.
 
-The state directory is owner-only, and epicd forces SQLite files to mode `0600`. It does not persist command output. Activity events retain redacted command lines, removing common credential assignments and bearer values.
+The state directory is owner-only, and epicd forces SQLite files to mode `0600`. The new controlled runtimes retain diagnostic command output, reported agent messages and native terminal excerpts in SQLite. Each artifact keeps at most 64 KiB of redacted head/tail text, within the frozen per-run budget (100 MiB by default, counting retained UTF-8 content separately from metadata). Redaction is best effort, not a guarantee that every secret is recognized. Native excerpts are always partial; clipping and omissions are explicit. `inspect_artifact` pages the immutable redacted view. Diagnostics and content hashes are not validation or approval evidence. Exhausting retention pauses new evidence-producing work and preserves existing artifacts; nothing is silently evicted.
 
 Herdr agents exchange structured results through an atomic file under `$XDG_STATE_HOME/epicd/herdr/<run-id>`. Epicd deletes each result after reading it instead of parsing terminal screen text as an API.
 

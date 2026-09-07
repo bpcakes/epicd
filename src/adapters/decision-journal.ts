@@ -23,7 +23,7 @@ import { redactSensitiveText } from "../util/redact.js";
 
 export const DECISION_SOURCE_TABLES = ["decision_executions", "decision_source_attempts"] as const;
 
-export function migrateDecisionSource(db: Database.Database): void {
+export function createDecisionSourceSchema(db: Database.Database): void {
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS decisions_run_identity ON decisions(run_id, decision_id);
     CREATE TABLE IF NOT EXISTS decision_executions (

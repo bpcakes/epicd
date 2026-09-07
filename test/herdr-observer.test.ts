@@ -119,6 +119,20 @@ describe("Herdr native observations", () => {
     ]);
   });
 
+  it("redacts structured credential values before clipping and forwards cancellation to every read", async () => {
+    const controller = new AbortController();
+    commands.runJson.mockResolvedValue(agent());
+    commands.runCommand.mockResolvedValue({
+      stdout: '{"password":"' + "hidden".repeat(4000) + '"}\nvisible failure',
+    });
+    expect(await observer.readDiagnostic(identity, controller.signal)).toEqual({
+      text: '{"password":"[REDACTED]"}\nvisible failure',
+      truncated: true,
+    });
+    for (const call of [...commands.runJson.mock.calls, ...commands.runCommand.mock.calls])
+      expect(call[2].signal).toBe(controller.signal);
+  });
+
   it("rechecks identity before requesting interruption and does not claim stop", async () => {
     commands.runJson.mockResolvedValueOnce(agent({ agent_status: "working" }));
     commands.runCommand.mockResolvedValueOnce({});

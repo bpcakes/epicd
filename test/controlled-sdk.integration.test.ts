@@ -1,13 +1,4 @@
-import {
-  copyFile,
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  realpath,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -53,15 +44,22 @@ const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const emit = (value: unknown) => `printf '%s\\n' ${quote(JSON.stringify(value))}`;
 
 async function fixture(
-  mode: "complete" | "hang" | "provider_error" | "missing_terminal" | "live" = "complete",
+  mode:
+    | "complete"
+    | "hang"
+    | "provider_error"
+    | "missing_terminal"
+    | "diagnostic"
+    | "live" = "complete",
   coordinator = false,
+  artifactBytes = 100 * 1024 * 1024,
 ) {
   const root = await mkdtemp("/var/tmp/epicd-controlled-sdk-");
   const databasePath = join(root, "state.sqlite3");
   let store = new StateStore(databasePath);
   const state = store.createAdaptive(
     initialRun(),
-    RepositoryPolicySchema.parse({ schemaVersion: 1 }),
+    RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { artifactBytes } }),
   );
   const lease = store.acquireLease(state.runId);
   let authority: ControllerAuthority = {
@@ -127,6 +125,23 @@ async function fixture(
           ? [emit({ type: "error", message: "Provider rejected the response schema" }), "sleep 30"]
           : []),
         ...(mode === "hang" ? ["sleep 30"] : []),
+        ...(mode === "diagnostic"
+          ? [
+              emit({
+                type: "item.completed",
+                item: {
+                  id: "browser-check",
+                  type: "command_execution",
+                  command: "npm run test:e2e",
+                  aggregated_output:
+                    "log ".repeat(3000) +
+                    '\n{"password":"do-not-retain"}\npeer authentication failed',
+                  exit_code: 1,
+                  status: "failed",
+                },
+              }),
+            ]
+          : []),
         emit({
           type: "item.completed",
           item: { id: "response", type: "agent_message", text: '{"status":"observed"}' },
@@ -270,6 +285,47 @@ async function until(predicate: () => boolean) {
 }
 
 describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch", () => {
+  it("retains a failed command beyond the preview even when the worker claims completion", async () => {
+    const setup = await fixture("diagnostic");
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({ status: "completed", resultEligible: true });
+    const journal = setup.store.orchestration;
+    const event = journal
+      .observations(setup.authority.runId)
+      .find((row) => row.kind === "runtime.command.completed")!;
+    expect(event.artifactIds).toHaveLength(1);
+    const artifactId = event.artifactIds[0]!;
+    const page = journal.diagnostics.read(setup.authority.runId, artifactId, 0, 65536);
+    expect(page.identity).toEqual(result.identity);
+    expect(page.text).toContain("peer authentication failed");
+    expect(page.text).not.toContain("do-not-retain");
+    expect(page.text).toContain('"exitCode":1');
+    expect(page).toMatchObject({ sourceTruncated: false, locallyTruncated: false });
+    expect(journal.delivery.summaries(setup.authority.runId)).toMatchObject({
+      candidates: [],
+      validation: [],
+    });
+    setup.reopen();
+    expect(
+      setup.store.orchestration.diagnostics.read(setup.authority.runId, artifactId, 0, 65536),
+    ).toEqual(page);
+  });
+
+  it("stops an actual supervised SDK turn after diagnostic-budget exhaustion without accepting completion", async () => {
+    const setup = await fixture("complete", false, 1);
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({
+      status: "cancelled",
+      resultEligible: false,
+      result: null,
+      launch: { stop: { processTreeStopped: true } },
+    });
+    expect(setup.store.orchestration.control(setup.authority.runId).status).toBe("awaiting_user");
+    expect(
+      setup.store.orchestration.diagnostics.summary(setup.authority.runId).latest,
+    ).toContainEqual(expect.objectContaining({ omission: "budget_exhausted", retainedBytes: 0 }));
+  });
+
   it("binds a real supervised invocation, acknowledges its exact prompt, and resumes via a fresh launch", async () => {
     const setup = await fixture();
     const journal = setup.store.orchestration;
@@ -415,28 +471,10 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     expect(await readCodexLaunchStop(manifest)).toEqual(recovered.launch!.stop);
   });
 
-  it("validates launch contracts and digests, and snapshots schema five before adding generation exclusions", async () => {
+  it("validates current launch contracts and digests", async () => {
     const setup = await fixture();
     const db = new Database(setup.databasePath);
     try {
-      db.exec(
-        "UPDATE orchestration_schema SET version = 5; DROP INDEX one_turn_launch_generation; DROP INDEX one_turn_launch_directory",
-      );
-      setup.reopen();
-      expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 12,
-      });
-      const backup = (await readdir(setup.root)).find((name) =>
-        name.includes("before-orchestration"),
-      )!;
-      const snapshot = new Database(join(setup.root, backup), { readonly: true });
-      try {
-        expect(
-          snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-        ).toEqual({ version: 5 });
-      } finally {
-        snapshot.close();
-      }
       const result = await setup.driver().run(setup.authority, setup.prepare().identity);
       expect(() =>
         setup.store.orchestration.agents.recordLaunchStop(setup.authority, result.identity, {

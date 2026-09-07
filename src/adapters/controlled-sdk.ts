@@ -123,20 +123,46 @@ export class ControlledSdkRuntime {
               );
             }
             const normalized = normalizeCodexEvent(event);
-            if (normalized)
-              this.journal.appendObservation(authority, {
-                source: "controlled-sdk",
-                sourceEventId: `${identity.turnId}:${++sequence}`,
-                kind: `runtime.${normalized.type}`,
-                summary: redactSensitiveText(JSON.stringify(normalized), 7999),
-                artifactIds: [],
-                identity,
-                wakesOrchestrator: true,
-              });
+            if (normalized) {
+              const retained = this.journal.diagnostics.append(
+                authority,
+                {
+                  source: "controlled-sdk",
+                  sourceEventId: `${identity.turnId}:${++sequence}`,
+                  kind: `runtime.${normalized.type}`,
+                  summary: redactSensitiveText(JSON.stringify(normalized), 7999),
+                  identity,
+                  wakesOrchestrator: true,
+                },
+                JSON.stringify(normalized),
+                normalized.type === "command.completed" && normalized.outputTruncated,
+              );
+              if (retained.artifact.omission === "budget_exhausted")
+                throw new Error(
+                  "Retained diagnostic budget exhausted; stop this turn without accepting its result",
+                );
+            }
             if (event.type === "turn.completed") completed = true;
             if (event.type === "item.completed" && event.item.type === "agent_message") {
               if (Buffer.byteLength(event.item.text) > 1024 * 1024)
                 throw new Error("Agent result exceeds one MiB");
+              const retained = this.journal.diagnostics.append(
+                authority,
+                {
+                  source: "controlled-sdk",
+                  sourceEventId: `${identity.turnId}:${++sequence}`,
+                  kind: "runtime.agent_message",
+                  summary:
+                    "Agent-reported message; inspect its retained diagnostic, not approval evidence",
+                  identity,
+                  wakesOrchestrator: true,
+                },
+                event.item.text,
+              );
+              if (retained.artifact.omission === "budget_exhausted")
+                throw new Error(
+                  "Retained diagnostic budget exhausted; stop this turn without accepting its result",
+                );
               response = event.item.text;
             }
             if (event.type === "error" || event.type === "turn.failed")

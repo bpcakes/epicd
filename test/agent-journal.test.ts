@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -309,51 +309,6 @@ describe("durable agent coordination", () => {
       setup.agents.bindNativeLaunch(authority, second.identity, nativeEndpoint(setup.root)),
     ).toThrow("current controlled Herdr launch");
     expect(setup.agents.turn(authority.runId, second.identity).launch?.native).toBeNull();
-  });
-
-  it("snapshots schema-six launch records before adding native terminal ownership", () => {
-    const setup = fixture();
-    const turn = setup.launches.reserve(
-      setup.journal,
-      setup.authority,
-      setup.prepare(setup.reserve()).identity,
-    ).turn;
-    setup.db.exec(
-      "DROP INDEX one_turn_native_terminal; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (6)",
-    );
-    setup.db
-      .prepare(
-        "UPDATE agent_turns SET record_json = json_remove(record_json, '$.launch.native') WHERE turn_id = ?",
-      )
-      .run(turn.identity.turnId);
-    const original = setup.db
-      .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
-      .get(turn.identity.turnId);
-    const upgraded = new StateStore(setup.path);
-    stores.push(upgraded);
-    expect(
-      upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity).launch?.native,
-    ).toBeNull();
-    expect(
-      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 12 });
-    expect(
-      setup.db
-        .prepare("SELECT name FROM sqlite_master WHERE name = 'one_turn_native_terminal'")
-        .get(),
-    ).toEqual({ name: "one_turn_native_terminal" });
-    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
-    expect(backup).toBeDefined();
-    const snapshot = new Database(join(setup.root, backup!), { readonly: true });
-    databases.push(snapshot);
-    expect(
-      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 6 });
-    expect(
-      snapshot
-        .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
-        .get(turn.identity.turnId),
-    ).toEqual(original);
   });
 
   it("requires a materialized directory before a workspace can be marked ready", () => {
@@ -932,116 +887,5 @@ describe("durable agent coordination", () => {
     ).toEqual(originalWorkspaceOperation);
     expect(setup.db.pragma("foreign_key_check")).toEqual([]);
     expect(setup.agents.instances(setup.authority.runId)).toEqual([]);
-  });
-
-  it("snapshots schema seven before adding reviews and preserves legacy prompt hashes", () => {
-    const setup = fixture();
-    const turn = setup.submit(setup.ready());
-    expect(turn.prompt).not.toHaveProperty("reviewContext");
-    setup.db.exec(
-      "DROP TABLE tracker_snapshots; DROP TABLE tracker_operations; DROP TABLE tracker_roots; DROP TABLE publications; DROP TABLE delivery_repositories; DROP TABLE delivery_commits; DROP TABLE review_findings; DROP TABLE review_evidence; UPDATE orchestration_schema SET version = 7",
-    );
-    const original = setup.db
-      .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
-      .get(turn.identity.turnId);
-    const upgraded = new StateStore(setup.path);
-    stores.push(upgraded);
-    expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
-    expect(
-      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 12 });
-    expect(
-      setup.db
-        .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
-        .get(turn.identity.turnId),
-    ).toEqual(original);
-    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
-    const snapshot = new Database(join(setup.root, backup), { readonly: true });
-    databases.push(snapshot);
-    expect(
-      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 7 });
-    expect(
-      snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'review_evidence'").get(),
-    ).toBeUndefined();
-    expect(setup.db.pragma("foreign_key_check")).toEqual([]);
-  });
-
-  it("snapshots schema-one databases before adding the durable agent tables", () => {
-    const setup = fixture();
-    for (const table of [
-      "publications",
-      "delivery_repositories",
-      "delivery_commits",
-      "review_findings",
-      "review_evidence",
-      "validation_evidence",
-      "candidate_workspaces",
-      "candidates",
-      "validation_plans",
-      "workspace_operations",
-      "agent_messages",
-      "agent_turns",
-      "agent_instances",
-      "agent_assignments",
-      "workspaces",
-    ])
-      setup.db.exec(`DROP TABLE ${table}`);
-    setup.db.exec(
-      "DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (1)",
-    );
-    const upgraded = new StateStore(setup.path);
-    stores.push(upgraded);
-    expect(
-      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 12 });
-    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
-    expect(backup).toBeDefined();
-    const snapshot = new Database(join(setup.root, backup!), { readonly: true });
-    databases.push(snapshot);
-    expect(
-      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 1 });
-    expect(snapshot.prepare("SELECT run_id FROM orchestration_runs").get()).toEqual({
-      run_id: setup.authority.runId,
-    });
-    expect(
-      snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'agent_turns'").get(),
-    ).toBeUndefined();
-    expect(
-      setup.db.prepare("SELECT name FROM sqlite_master WHERE name = 'agent_turns'").get(),
-    ).toEqual({ name: "agent_turns" });
-  });
-
-  it("snapshots schema-two agent records before adding workspace I/O exclusions", () => {
-    const setup = fixture();
-    const agent = setup.ready();
-    const turn = setup.submit(agent);
-    const original = setup.agents.instance(setup.authority.runId, agent);
-    setup.db.exec(
-      "DROP TABLE tracker_snapshots; DROP TABLE tracker_operations; DROP TABLE tracker_roots; DROP TABLE publications; DROP TABLE delivery_repositories; DROP TABLE delivery_commits; DROP TABLE review_findings; DROP TABLE review_evidence; DROP TABLE validation_evidence; DROP TABLE candidate_workspaces; DROP TABLE candidates; DROP TABLE validation_plans; DROP TABLE workspace_operations; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (2)",
-    );
-    const upgraded = new StateStore(setup.path);
-    stores.push(upgraded);
-    expect(upgraded.orchestration.agents.instance(setup.authority.runId, agent)).toEqual(original);
-    expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
-    expect(
-      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 12 });
-    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
-    const snapshot = new Database(join(setup.root, backup), { readonly: true });
-    databases.push(snapshot);
-    expect(
-      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 2 });
-    expect(
-      snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'workspace_operations'").get(),
-    ).toBeUndefined();
-    expect(
-      snapshot
-        .prepare("SELECT record_json FROM agent_instances WHERE agent_id = ?")
-        .get(agent.agentId),
-    ).toEqual({ record_json: JSON.stringify(original) });
-    expect(setup.db.pragma("foreign_key_check")).toEqual([]);
   });
 });

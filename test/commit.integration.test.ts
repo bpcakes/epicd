@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
@@ -351,45 +351,6 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
         .get(run) as { row_json: string };
       expect(JSON.parse(row.row_json)).toEqual(raw);
       expect(db.pragma("foreign_key_check")).toEqual([]);
-    } finally {
-      db.close();
-    }
-  });
-
-  it("snapshots schema eight before adding commits and retains prior review evidence", async () => {
-    const s = await fixture();
-    const { review } = await approved(s);
-    const run = s.authority.runId;
-    const db = new Database(s.path);
-    try {
-      const original = db.prepare("SELECT record_json FROM review_evidence").get();
-      db.exec(
-        "DROP TABLE tracker_snapshots; DROP TABLE tracker_operations; DROP TABLE tracker_roots; DROP TABLE publications; DROP TABLE delivery_repositories; DROP TABLE delivery_commits; UPDATE orchestration_schema SET version = 8",
-      );
-      const upgraded = new StateStore(s.path);
-      try {
-        expect(upgraded.orchestration.reviews.evidence(run, review.evidence.evidenceId)).toEqual(
-          review.evidence,
-        );
-      } finally {
-        upgraded.close();
-      }
-      expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 12,
-      });
-      const file = readdirSync(s.root).find((name) => name.includes("before-orchestration"))!;
-      const snapshot = new Database(join(s.root, file), { readonly: true });
-      try {
-        expect(
-          snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-        ).toEqual({ version: 8 });
-        expect(snapshot.prepare("SELECT record_json FROM review_evidence").get()).toEqual(original);
-        expect(
-          snapshot.prepare("SELECT name FROM sqlite_master WHERE name = 'delivery_commits'").get(),
-        ).toBeUndefined();
-      } finally {
-        snapshot.close();
-      }
     } finally {
       db.close();
     }

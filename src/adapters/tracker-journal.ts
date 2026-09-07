@@ -25,7 +25,7 @@ import { redactSensitiveText } from "../util/redact.js";
 import { DeliveryError } from "./delivery-journal.js";
 
 export const TRACKER_TABLES = ["tracker_roots", "tracker_operations", "tracker_snapshots"] as const;
-export function migrateTracker(db: Database.Database) {
+export function createTrackerSchema(db: Database.Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS tracker_roots (
     run_id TEXT PRIMARY KEY REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
     binding_json TEXT CHECK(binding_json IS NULL OR json_valid(binding_json))
