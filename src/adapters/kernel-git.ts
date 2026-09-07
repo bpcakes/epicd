@@ -15,6 +15,8 @@ const CONFIG = [
   "maintenance.auto=false",
   "commit.gpgSign=false",
   "tag.gpgSign=false",
+  "user.name=Epicd",
+  "user.email=epicd@epicd.local",
   "protocol.allow=never",
   "protocol.file.allow=always",
 ];
@@ -23,6 +25,8 @@ export type KernelGitOptions = {
   indexPath?: string;
   signal?: AbortSignal;
   allowedExitCodes?: readonly number[];
+  // Trusted update-ref transaction only: inspect while refs are prepared/locked.
+  beforeRefCommit?: (signal: AbortSignal) => Promise<void>;
 };
 export class KernelGitError extends Error {
   constructor(
@@ -38,8 +42,13 @@ export class KernelGitError extends Error {
 
 /** Trusted plumbing only. Never expose this raw command surface to a model. */
 export class KernelGit {
-  constructor(readonly path: string) {
+  constructor(
+    readonly path: string,
+    private readonly gitDirectory?: string,
+  ) {
     if (!isAbsolute(path)) throw new Error("Kernel Git requires an absolute repository path");
+    if (gitDirectory && !isAbsolute(gitDirectory))
+      throw new Error("Git metadata path must be absolute");
   }
 
   async text(args: readonly string[], options: KernelGitOptions = {}): Promise<string> {
@@ -49,6 +58,22 @@ export class KernelGit {
   /** No shell, inherited Git environment, user/system config, filters, or optional lock writes. */
   async bytes(args: readonly string[], options: KernelGitOptions = {}): Promise<Buffer> {
     options.signal?.throwIfAborted();
+    if (
+      options.beforeRefCommit &&
+      (args[0] !== "update-ref" ||
+        !args.includes("--stdin") ||
+        typeof options.input !== "string" ||
+        !options.input.startsWith("start\n") ||
+        !options.input.endsWith("prepare\n") ||
+        options.input.includes("\0") ||
+        options.input
+          .split("\n")
+          .slice(1, -2)
+          .some((line) => !/^(?:option no-deref|(?:create|update|verify) [^\r\n]+)$/.test(line)))
+    )
+      throw new Error(
+        "Prepared transaction guard requires a single explicit update-ref transaction",
+      );
     const env = {
       PATH: "/usr/bin:/bin",
       LANG: "C.UTF-8",
@@ -71,6 +96,7 @@ export class KernelGit {
           ...CONFIG.flatMap((value) => ["-c", value]),
           "-C",
           this.path,
+          ...(this.gitDirectory ? [`--git-dir=${this.gitDirectory}`] : []),
           ...args,
         ],
         { env, stdio: ["pipe", "pipe", "pipe"], shell: false },
@@ -82,9 +108,13 @@ export class KernelGit {
       let failure: Error | null = null;
       let killTimer: NodeJS.Timeout | undefined;
       let exited = false;
+      const guardController = new AbortController();
+      let guard: Promise<void> | null = null;
+      let commitRequested = false;
       const stop = (error: Error) => {
         if (failure) return;
         failure = error;
+        guardController.abort(error);
         if (!exited) {
           child.kill("SIGTERM");
           killTimer = setTimeout(() => {
@@ -103,6 +133,28 @@ export class KernelGit {
         size += data.length;
         if (size > 64 * 1024 * 1024) stop(new Error("Kernel Git output exceeds 64 MiB"));
         else output.push(data);
+        if (
+          options.beforeRefCommit &&
+          !guard &&
+          !failure &&
+          !exited &&
+          Buffer.concat(output).toString("utf8") === "start: ok\nprepare: ok\n"
+        ) {
+          guard = Promise.resolve()
+            .then(() => {
+              guardController.signal.throwIfAborted();
+              return options.beforeRefCommit!(guardController.signal);
+            })
+            .then(() => {
+              if (!failure && !exited) {
+                commitRequested = true;
+                child.stdin.end("commit\n");
+              }
+            })
+            .catch((error: unknown) =>
+              stop(error instanceof Error ? error : new Error("Ref transaction guard failed")),
+            );
+        }
       });
       child.stderr.on("data", (data: Buffer) => {
         errorSize += data.length;
@@ -118,16 +170,31 @@ export class KernelGit {
       child.once("exit", () => {
         exited = true;
       });
-      child.once("close", (code) => {
+      child.once("close", async (code) => {
+        guardController.abort(new Error("Git process stopped"));
+        await guard;
         clearTimeout(timer);
         if (killTimer) clearTimeout(killTimer);
         options.signal?.removeEventListener("abort", abort);
         if (failure) reject(failure);
+        else if (
+          options.beforeRefCommit &&
+          (code !== 0 ||
+            !commitRequested ||
+            Buffer.concat(output).toString("utf8") !== "start: ok\nprepare: ok\ncommit: ok\n")
+        )
+          reject(
+            new KernelGitError(
+              code,
+              `Prepared ref transaction was not acknowledged: ${Buffer.concat(errors).toString("utf8")}`,
+            ),
+          );
         else if (code !== null && (options.allowedExitCodes ?? [0]).includes(code))
           resolve(Buffer.concat(output));
         else reject(new KernelGitError(code, Buffer.concat(errors).toString("utf8")));
       });
-      child.stdin.end(options.input);
+      if (options.beforeRefCommit) child.stdin.write(options.input);
+      else child.stdin.end(options.input);
     });
   }
 }
