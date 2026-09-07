@@ -375,7 +375,7 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
         upgraded.close();
       }
       expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 11,
+        version: 12,
       });
       const file = readdirSync(s.root).find((name) => name.includes("before-orchestration"))!;
       const snapshot = new Database(join(s.root, file), { readonly: true });

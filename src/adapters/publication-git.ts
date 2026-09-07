@@ -414,6 +414,40 @@ export class PublicationGit {
       conflict("Worktree topology changed while refs were committed; inspect the retained outcome");
   }
 
+  /** Hold exact published branch/receipt values while a trusted dependent effect executes. */
+  async withPublishedRefs(
+    input: PublicationRefIntent,
+    body: (signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const intent = PublicationRefIntentSchema.parse(input);
+    const refs = publicationRefs(intent);
+    await this.assertBinding(intent.repository, signal);
+    await this.refSafety(intent, signal);
+    if ((await this.observeRefs(intent, signal)).outcome !== "applied")
+      conflict("Dependent tracker operation requires both exact published refs");
+    const heads = await this.heads(intent.repository, refs.branch, signal);
+    const git = gitFor(intent.repository);
+    await assertCommit(git, intent.revision, signal);
+    await git.text(["update-ref", "--stdin"], {
+      signal,
+      input: `start\noption no-deref\nverify ${refs.branch} ${intent.revision}\noption no-deref\nverify ${refs.receipt} ${intent.revision}\nprepare\n`,
+      beforeRefCommit: async (lockedSignal) => {
+        await this.assertBinding(intent.repository, lockedSignal);
+        await this.refSafety(intent, lockedSignal);
+        await body(lockedSignal);
+        await this.assertBinding(intent.repository, lockedSignal);
+        if (
+          JSON.stringify(await this.heads(intent.repository, refs.branch, lockedSignal)) !==
+          JSON.stringify(heads)
+        )
+          conflict("Worktree topology changed during the dependent tracker operation");
+      },
+    });
+    if ((await this.observeRefs(intent, signal)).outcome !== "applied")
+      conflict("Published refs changed after the dependent tracker operation");
+  }
+
   /** Read-only observation. Unknown old I/O MUST remain excluded even for not_applied. */
   async observeRefs(
     input: PublicationRefIntent,

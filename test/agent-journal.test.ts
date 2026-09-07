@@ -336,7 +336,7 @@ describe("durable agent coordination", () => {
     ).toBeNull();
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 11 });
+    ).toEqual({ version: 12 });
     expect(
       setup.db
         .prepare("SELECT name FROM sqlite_master WHERE name = 'one_turn_native_terminal'")
@@ -949,7 +949,7 @@ describe("durable agent coordination", () => {
     expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 11 });
+    ).toEqual({ version: 12 });
     expect(
       setup.db
         .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
@@ -994,7 +994,7 @@ describe("durable agent coordination", () => {
     stores.push(upgraded);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 11 });
+    ).toEqual({ version: 12 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
     expect(backup).toBeDefined();
     const snapshot = new Database(join(setup.root, backup!), { readonly: true });
@@ -1027,7 +1027,7 @@ describe("durable agent coordination", () => {
     expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 11 });
+    ).toEqual({ version: 12 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
     const snapshot = new Database(join(setup.root, backup), { readonly: true });
     databases.push(snapshot);

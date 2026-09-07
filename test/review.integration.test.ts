@@ -72,50 +72,58 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     expect(s.journal.reviews.approval(run, candidate)).toBeNull();
   });
 
-  it("preserves findings across replacement, requires explicit resolution and disallows choosing an older approval", async () => {
-    const s = await fixture();
-    const run = s.authority.runId;
-    const candidate = await s.capture(await s.define());
-    await s.validate(candidate, await s.copy(candidate));
-    const first = await s.review(candidate, { verdict: "changes_requested", findings: [finding] });
-    expect(first.result.status).toBe("succeeded");
-    const found = s.journal.reviews.openFindings(run, candidate);
-    expect(found).toHaveLength(1);
-    const replacement = await s.review(candidate);
-    expect(replacement.evidence.turnIdentity!.agentId).not.toBe(
-      first.evidence.turnIdentity!.agentId,
-    );
-    expect(
-      s.journal.agents.turn(run, replacement.evidence.turnIdentity!).prompt.reviewContext,
-    ).toMatchObject({ findings: [found[0]] });
-    expect(s.journal.reviews.approval(run, candidate)).toBeNull();
-    const resolved = await s.review(candidate, {
-      resolutions: [
-        {
-          findingId: found[0]!.findingId,
-          disposition: "dismissed",
-          rationale: "Inspected the cited branch; the check covers the expected condition.",
-        },
-      ],
-    });
-    expect(s.journal.reviews.approval(run, candidate)).toBe(resolved.evidence.evidenceId);
-    expect(s.journal.reviews.findings(run, "demo.1")).toEqual(found);
-    await s.review(candidate, { verdict: "blocked" });
-    expect(s.journal.reviews.approval(run, candidate)).toBeNull();
-    const page = success(
-      await s.dispatch({ kind: "inspect_findings", taskId: "demo.1", offset: 0, limit: 1 }),
-    );
-    expect(page.kind).toBe("inspection");
-    if (page.kind === "inspection")
-      expect(JSON.parse(page.text)).toMatchObject({
-        findings: [{ findingId: found[0]!.findingId, open: false }],
-        total: 1,
-        nextOffset: null,
+  // Four supervised reviewer processes and independent Git copies, not a latency check.
+  it(
+    "preserves findings across replacement, requires explicit resolution and disallows choosing an older approval",
+    { timeout: 30_000 },
+    async () => {
+      const s = await fixture();
+      const run = s.authority.runId;
+      const candidate = await s.capture(await s.define());
+      await s.validate(candidate, await s.copy(candidate));
+      const first = await s.review(candidate, {
+        verdict: "changes_requested",
+        findings: [finding],
       });
-    const next = await s.capture(await s.define());
-    expect(s.journal.reviews.openFindings(run, next)).toEqual(found);
-    expect(s.journal.reviews.approval(run, candidate)).toBeNull();
-  });
+      expect(first.result.status).toBe("succeeded");
+      const found = s.journal.reviews.openFindings(run, candidate);
+      expect(found).toHaveLength(1);
+      const replacement = await s.review(candidate);
+      expect(replacement.evidence.turnIdentity!.agentId).not.toBe(
+        first.evidence.turnIdentity!.agentId,
+      );
+      expect(
+        s.journal.agents.turn(run, replacement.evidence.turnIdentity!).prompt.reviewContext,
+      ).toMatchObject({ findings: [found[0]] });
+      expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+      const resolved = await s.review(candidate, {
+        resolutions: [
+          {
+            findingId: found[0]!.findingId,
+            disposition: "dismissed",
+            rationale: "Inspected the cited branch; the check covers the expected condition.",
+          },
+        ],
+      });
+      expect(s.journal.reviews.approval(run, candidate)).toBe(resolved.evidence.evidenceId);
+      expect(s.journal.reviews.findings(run, "demo.1")).toEqual(found);
+      await s.review(candidate, { verdict: "blocked" });
+      expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+      const page = success(
+        await s.dispatch({ kind: "inspect_findings", taskId: "demo.1", offset: 0, limit: 1 }),
+      );
+      expect(page.kind).toBe("inspection");
+      if (page.kind === "inspection")
+        expect(JSON.parse(page.text)).toMatchObject({
+          findings: [{ findingId: found[0]!.findingId, open: false }],
+          total: 1,
+          nextOffset: null,
+        });
+      const next = await s.capture(await s.define());
+      expect(s.journal.reviews.openFindings(run, next)).toEqual(found);
+      expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+    },
+  );
 
   it.each([
     "wrong_revision",

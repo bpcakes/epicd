@@ -663,7 +663,7 @@ describe.skipIf(process.platform !== "linux")(
         expect(
           db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
         ).toEqual({
-          version: 11,
+          version: 12,
         });
         const file = readdirSync(s.root).find((name) => name.includes("before-orchestration"))!;
         const backup = new Database(join(s.root, file), { readonly: true });

@@ -69,7 +69,20 @@ export function resource(result: ActionResult) {
 
 // Real private Git copies, SQLite ownership, supervisor and read-only process mounts.
 // Provider judgments are explicitly scripted; this suite does not certify model competence.
-export async function fixture(required = check, format: "sha1" | "sha256" = "sha1") {
+export type ReviewTrackerSetup = {
+  initialize(source: string): Promise<{ epicId: string; taskId: string }>;
+  claim(context: {
+    root: string;
+    source: string;
+    kernel: ActionKernel;
+    authority: ControllerAuthority;
+  }): Promise<void>;
+};
+export async function fixture(
+  required = check,
+  format: "sha1" | "sha256" = "sha1",
+  tracker?: ReviewTrackerSetup,
+) {
   const root = mkdtempSync("/var/tmp/epicd-review-");
   const source = join(root, "source");
   mkdirSync(source);
@@ -77,15 +90,20 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
   git(source, "config", "user.name", "Fixture");
   git(source, "config", "user.email", "fixture@example.test");
   writeFileSync(join(source, "app.txt"), "red\n");
-  mkdirSync(join(source, ".beads"));
-  writeFileSync(join(source, ".beads/issues.jsonl"), "tracker\n");
+  const trackedTask = tracker
+    ? await tracker.initialize(source)
+    : { epicId: "demo", taskId: "demo.1" };
+  if (!tracker) {
+    mkdirSync(join(source, ".beads"));
+    writeFileSync(join(source, ".beads/issues.jsonl"), "tracker\n");
+  }
   git(source, "add", "-A");
   git(source, "commit", "--quiet", "-m", "baseline");
   const head = git(source, "rev-parse", "HEAD");
   const path = join(root, "state.sqlite3");
   let store = new StateStore(path);
   const state = store.createAdaptive(
-    { ...initialRun(), repoPath: source, epicBaseRevision: head },
+    { ...initialRun(), repoPath: source, epicBaseRevision: head, epicId: trackedTask.epicId },
     RepositoryPolicySchema.parse({ schemaVersion: 1, requiredChecks: [required] }),
   );
   const lease = store.acquireLease(state.runId);
@@ -95,6 +113,8 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
     leaseId: lease.leaseId,
   };
   const journal = store.orchestration;
+  const kernel = new ActionKernel(journal);
+  if (tracker) await tracker.claim({ root, source, kernel, authority });
   const manager = new WorkspaceManager(journal, join(root, "managed"));
   const workspace = await manager.create(authority, source, head, "implementation");
   const settings = { model: "worker-model", reasoningEffort: "high" as const };
@@ -109,7 +129,7 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
       ...target(workspace),
       role: "implementation",
       purpose: "implementation",
-      taskId: "demo.1",
+      taskId: trackedTask.taskId,
       candidateId: null,
       instructions: "Implement green behavior",
       confinementProfile: "fixture-only",
@@ -129,7 +149,6 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
     turnTimeoutMs: 30_000,
   };
   const driver = new ControlledSdkRuntime(journal, options);
-  const kernel = new ActionKernel(journal);
   registerDeliveryCapabilities(kernel, manager);
   registerCommitCapabilities(kernel, manager);
   const publication = registerPublicationCapabilities(kernel, manager);
@@ -162,7 +181,7 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
     resource(
       await dispatch({
         kind: "define_validation_plan",
-        taskId: "demo.1",
+        taskId: trackedTask.taskId,
         acceptanceCriteria: ["The application reports green"],
         checks: [proposedCheck],
       }),
@@ -171,7 +190,7 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
     const result = resource(
       await dispatch({
         kind: "capture_candidate",
-        taskId: "demo.1",
+        taskId: trackedTask.taskId,
         ...target(workspace),
         validationPlanId: planId,
       }),
@@ -292,6 +311,7 @@ export async function fixture(required = check, format: "sha1" | "sha256" = "sha
   });
   return {
     root,
+    taskId: trackedTask.taskId,
     path,
     source,
     head,

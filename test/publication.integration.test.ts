@@ -583,7 +583,7 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
       const upgraded = new StateStore(s.path);
       upgraded.close();
       expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 11,
+        version: 12,
       });
       expect(
         db

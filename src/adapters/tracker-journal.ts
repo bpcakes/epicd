@@ -10,6 +10,8 @@ import {
   type TrackerOperation,
   type TrackerGraph,
   type TrackerSnapshot,
+  type TaskClaimBinding,
+  type TrackerClosure,
 } from "../domain/tracker.js";
 import type {
   ActionRecord,
@@ -51,6 +53,12 @@ type Access = {
   action(runId: string, actionId: string): ActionRecord | null;
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
   assertPublicationIdle(runId: string): void;
+  closurePublication(
+    runId: string,
+    taskId: string,
+    revision: string,
+    claim: TaskClaimBinding,
+  ): import("../domain/publication.js").PublicationRecord;
 };
 const fail = (message: string): never => {
   throw new DeliveryError("tracker_authority", message);
@@ -95,11 +103,41 @@ export class TrackerJournal {
         return fail("Not a tracker action");
       if (
         input.kind === "request_beads_transition" &&
-        (!(["claim", "adopt"] as string[]).includes(input.transition) || input.revision !== null)
+        (!(["claim", "adopt", "close_task"] as string[]).includes(input.transition) ||
+          (input.transition === "close_task" ? input.revision === null : input.revision !== null))
       )
         return fail(
-          "Only claim/adopt with no revision is implemented; closure requires independent delivery and graph proofs",
+          "Claim/adopt need no revision; task closure needs an exact verified publication. Container/epic closure requires its own completion proof",
         );
+      let closure: TrackerClosure | undefined;
+      if (input.kind === "request_beads_transition" && input.transition === "close_task") {
+        const claim = this.assertTaskOwned(authority.runId, input.taskId);
+        if (!claim)
+          return fail("Closure requires a recorded task claim, not unconfigured component state");
+        const publication = this.access.closurePublication(
+          authority.runId,
+          input.taskId,
+          input.revision!,
+          claim,
+        );
+        if (
+          this.operations(authority.runId).some(
+            (record) =>
+              record.outcome === "closed" &&
+              record.closure?.claim.trackerOperationId === claim.trackerOperationId,
+          )
+        )
+          return fail("This claim already has a closed operation; do not close it again");
+        closure = {
+          publicationId: publication.publicationId,
+          revision: publication.revision,
+          reviewEvidenceId: publication.reviewEvidenceId,
+          claim,
+          reason: `epicd run ${authority.runId}; operation ${action.operationId}; verified revision ${publication.revision}; publication ${publication.publicationId}`,
+          refsVerified: false,
+          intervention: false,
+        };
+      }
       this.db.prepare("INSERT OR IGNORE INTO tracker_roots VALUES (?, NULL)").run(authority.runId);
       const record = TrackerOperationSchema.parse({
         schemaVersion: 1,
@@ -111,6 +149,7 @@ export class TrackerJournal {
         ioLeaseId: authority.leaseId,
         policyDigest: control.policyDigest,
         kind: input.kind === "refresh_tracker" ? "refresh" : input.transition,
+        ...(closure ? { closure } : {}),
         taskId: input.kind === "refresh_tracker" ? null : input.taskId,
         dispatched: false,
         mutationDispatched: false,
@@ -158,6 +197,19 @@ export class TrackerJournal {
     )
       return fail("Tracker mutation authority changed");
     this.access.assertPublicationIdle(authority.runId);
+    if (record.closure) {
+      const publication = this.access.closurePublication(
+        record.runId,
+        record.taskId!,
+        record.closure.revision,
+        record.closure.claim,
+      );
+      if (
+        publication.publicationId !== record.closure.publicationId ||
+        publication.reviewEvidenceId !== record.closure.reviewEvidenceId
+      )
+        return fail("Closure's exact publication or review changed");
+    }
     return record;
   }
   bind(authority: ControllerAuthority, id: string, binding: TrackerBinding) {
@@ -191,8 +243,9 @@ export class TrackerJournal {
           "description",
           "acceptanceCriteria",
           "instructions",
+          "closeReason",
         ] as const) {
-          if (issue[field] !== null)
+          if (issue[field] !== null && issue[field] !== undefined)
             issue[field] = redactSensitiveText(issue[field]!, field === "title" ? 1023 : 32767);
         }
       const snapshot = TrackerSnapshotSchema.parse({
@@ -224,15 +277,25 @@ export class TrackerJournal {
         !record.beforeSnapshotId ||
         !record.taskId
       )
-        return fail("Claim needs an unused mutation gate and its exact precondition snapshot");
-      claimable(
-        this.snapshot(authority.runId, record.beforeSnapshotId).graph,
-        record.taskId,
-        record.kind,
-      );
+        return fail("Tracker mutation needs an unused gate and its exact precondition snapshot");
+      const graph = this.snapshot(authority.runId, record.beforeSnapshotId).graph;
+      if (record.kind === "close_task") {
+        const claim = this.claimBinding(authority.runId, record.taskId, graph);
+        if (digestJson(claim) !== digestJson(record.closure!.claim))
+          return fail("Closure task claim changed");
+        const task = graph.issues.find((issue) => issue.id === record.taskId)!;
+        if (
+          task.dependents.some((edge) => edge.type === "parent-child" && edge.status !== "closed")
+        )
+          return fail("Task closure cannot hide unfinished children");
+      } else claimable(graph, record.taskId, record.kind);
       record.mutationDispatched = true;
       this.save(record);
-      this.changed(authority, "tracker.claim_dispatched", id);
+      this.changed(
+        authority,
+        record.closure ? "tracker.close_dispatched" : "tracker.claim_dispatched",
+        id,
+      );
     });
   }
   stopIO(authority: ControllerAuthority, id: string, failure: string | null) {
@@ -258,6 +321,27 @@ export class TrackerJournal {
       return record;
     });
   }
+  closureReport(authority: ControllerAuthority, id: string, report: unknown) {
+    this.access.transaction(authority, () => {
+      const record = this.assertIOOwned(authority, id);
+      if (!record.closure) return fail("Not a closure operation");
+      record.closure.commandReport = redactSensitiveText(
+        JSON.stringify(report) ?? "No structured report",
+        3999,
+      );
+      this.save(record);
+      this.changed(authority, "tracker.close_reported", id);
+    });
+  }
+  closureRefs(authority: ControllerAuthority, id: string, verified: boolean, intervention = false) {
+    this.access.transaction(authority, () => {
+      const record = this.assertIOOwned(authority, id);
+      if (!record.closure) return fail("Not a closure operation");
+      record.closure.refsVerified = verified;
+      record.closure.intervention ||= intervention;
+      this.save(record);
+    });
+  }
   finish(authority: ControllerAuthority, id: string) {
     return this.access.transaction(authority, () => {
       const record = this.record(authority.runId, id);
@@ -267,27 +351,70 @@ export class TrackerJournal {
         ? this.snapshot(authority.runId, record.afterSnapshotId).graph
         : null;
       if (record.mutationDispatched && !after) return record; // External effect still needs inspection.
+      if (
+        record.mutationDispatched &&
+        record.closure &&
+        this.access.control(authority.runId).status !== "active"
+      )
+        return record; // Preserve the stopped effect until an active controller can inspect it.
+      if (
+        record.mutationDispatched &&
+        record.closure &&
+        !record.closure.refsVerified &&
+        !record.closure.intervention
+      )
+        return record; // A lost ref-inspection result needs reconciliation, not a second close.
       if (record.kind === "refresh") record.outcome = after ? "observed" : "failed";
-      else if (!record.mutationDispatched) record.outcome = "not_claimed";
+      else if (!record.mutationDispatched)
+        record.outcome = record.closure ? "not_closed" : "not_claimed";
       else {
         const task = after!.issues.find((issue) => issue.id === record.taskId);
         const before = this.snapshot(authority.runId, record.beforeSnapshotId!).graph.issues.find(
           (issue) => issue.id === record.taskId,
         )!;
         const root = after!.issues.find((issue) => issue.id === after!.epicId)!;
-        const unchangedWork =
-          task &&
-          digestJson({ ...task, status: before.status, assignee: before.assignee }) ===
-            digestJson(before);
-        record.outcome =
-          task?.status === "in_progress" &&
-          task.assignee?.trim() === trackerActor(record.runId) &&
-          unchangedWork &&
-          !["closed", "tombstone"].includes(root.status)
-            ? "claimed"
-            : task && digestJson(task) === digestJson(before)
-              ? "not_claimed"
-              : "conflict";
+        const unchangedWork = task?.workDigest === before.workDigest;
+        if (record.closure) {
+          let approved = false;
+          try {
+            const publication = this.access.closurePublication(
+              record.runId,
+              record.taskId!,
+              record.closure.revision,
+              record.closure.claim,
+            );
+            approved =
+              publication.publicationId === record.closure.publicationId &&
+              publication.reviewEvidenceId === record.closure.reviewEvidenceId &&
+              record.policyDigest === this.access.control(record.runId).policyDigest;
+          } catch (error) {
+            if (!(error instanceof DeliveryError)) throw error;
+          }
+          record.outcome =
+            task?.status === "closed" &&
+            task.closedAt &&
+            task.closedBySession === record.operationId &&
+            task.closeReason === record.closure.reason &&
+            task.assignee === before.assignee &&
+            unchangedWork &&
+            !["closed", "tombstone"].includes(root.status) &&
+            approved &&
+            record.closure.refsVerified &&
+            !record.closure.intervention
+              ? "closed"
+              : task && digestJson(task) === digestJson(before)
+                ? "not_closed"
+                : "conflict";
+        } else
+          record.outcome =
+            task?.status === "in_progress" &&
+            task.assignee?.trim() === trackerActor(record.runId) &&
+            unchangedWork &&
+            !["closed", "tombstone"].includes(root.status)
+              ? "claimed"
+              : task && digestJson(task) === digestJson(before)
+                ? "not_claimed"
+                : "conflict";
       }
       record.finishedAt = at();
       this.save(record);
@@ -364,13 +491,15 @@ export class TrackerJournal {
         "Graph is a captured observation, not an atomic permission grant; inspect details and refresh before choosing work",
     };
   }
-  assertTaskOwned(runId: string, taskId: string | null) {
+  assertTaskOwned(runId: string, taskId: string | null): TaskClaimBinding | undefined {
     // Unconfigured compositions are component-test/legacy scaffolding, never adaptive admission.
     if (!this.configured(runId) || taskId === null) return;
     this.assertIdle(runId);
-    const snapshot = this.snapshot(runId);
-    const task = snapshot.graph.issues.find((issue) => issue.id === taskId);
-    const epic = snapshot.graph.issues.find((issue) => issue.id === snapshot.graph.epicId)!;
+    return this.claimBinding(runId, taskId, this.snapshot(runId).graph);
+  }
+  private claimBinding(runId: string, taskId: string, graph: TrackerGraph): TaskClaimBinding {
+    const task = graph.issues.find((issue) => issue.id === taskId);
+    const epic = graph.issues.find((issue) => issue.id === graph.epicId)!;
     const claim = this.operations(runId).findLast(
       (record) => record.taskId === taskId && record.outcome === "claimed",
     );
@@ -387,6 +516,11 @@ export class TrackerJournal {
       task.workDigest !== claimedTask.workDigest
     )
       return fail("Task lacks this run's recorded claim in the latest observed epic graph");
+    return {
+      trackerOperationId: claim!.trackerOperationId,
+      snapshotId: claim!.afterSnapshotId!,
+      workDigest: claimedTask.workDigest,
+    };
   }
   private save(record: TrackerOperation) {
     this.db

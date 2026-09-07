@@ -2,6 +2,7 @@ import { z } from "zod";
 import { TurnIdentitySchema } from "./orchestration.js";
 import { AgentRoleSchema, AgentSessionContractSchema } from "./types.js";
 import { TurnLaunchSchema } from "./codex-launch.js";
+import { TaskClaimBindingSchema } from "./tracker.js";
 
 const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
 const Generation = z.number().int().positive();
@@ -54,6 +55,8 @@ export const AgentAssignmentSchema = z.strictObject({
   taskId: z.string().min(1).max(256).nullable(),
   candidateId: Id.nullable(),
   instructions: Text,
+  // Kernel-bound provenance; callers cannot add a claim to an older assignment.
+  trackerClaim: TaskClaimBindingSchema.optional(),
   createdAt: At,
 });
 export type AgentAssignment = z.infer<typeof AgentAssignmentSchema>;

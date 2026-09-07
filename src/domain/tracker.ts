@@ -17,6 +17,12 @@ export const TrackerBindingSchema = z.strictObject({
   configurationDigest: z.string().length(64),
 });
 export type TrackerBinding = z.infer<typeof TrackerBindingSchema>;
+export const TaskClaimBindingSchema = z.strictObject({
+  trackerOperationId: z.string().uuid(),
+  snapshotId: z.string().uuid(),
+  workDigest: z.string().regex(/^[0-9a-f]{64}$/),
+});
+export type TaskClaimBinding = z.infer<typeof TaskClaimBindingSchema>;
 export const TrackerRelationSchema = z.strictObject({
   id: TrackerIdSchema,
   type: z.string().min(1).max(64),
@@ -32,7 +38,12 @@ export const TrackerIssueSchema = z.strictObject({
   priority: z.number().int().min(0).max(4),
   assignee: z.string().max(1024).nullable(),
   instructions: z.string().max(32768).nullable(),
-  // Computed by the trusted transport before redaction; excludes only status and assignee.
+  // Optional keeps historical snapshot JSON and digests unchanged.
+  closedAt: z.iso.datetime().nullable().optional(),
+  closeReason: z.string().max(32768).nullable().optional(),
+  closedBySession: z.string().max(1024).nullable().optional(),
+  updatedAt: z.iso.datetime().nullable().optional(),
+  // Raw work before redaction, excluding task status, assignee and close/update metadata.
   workDigest: z.string().regex(/^[0-9a-f]{64}$/),
   dependencies: z.array(TrackerRelationSchema).max(1000),
   dependents: z.array(TrackerRelationSchema).max(1000),
@@ -101,6 +112,18 @@ export const TrackerSnapshotSchema = z.strictObject({
   graph: TrackerGraphSchema,
 });
 export type TrackerSnapshot = z.infer<typeof TrackerSnapshotSchema>;
+export const TrackerClosureSchema = z.strictObject({
+  publicationId: z.string().uuid(),
+  revision: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+  reviewEvidenceId: z.string().min(1).max(256),
+  claim: TaskClaimBindingSchema,
+  reason: z.string().min(1).max(1024),
+  commandReport: z.string().max(4000).optional(),
+  // Physical ref inspection is separate from current journal approval.
+  refsVerified: z.boolean(),
+  intervention: z.boolean(),
+});
+export type TrackerClosure = z.infer<typeof TrackerClosureSchema>;
 export const TrackerOperationSchema = z
   .strictObject({
     schemaVersion: z.literal(1),
@@ -111,20 +134,29 @@ export const TrackerOperationSchema = z
     controllerLeaseId: z.string(),
     ioLeaseId: z.string(),
     policyDigest: z.string(),
-    kind: z.enum(["refresh", "claim", "adopt"]),
+    kind: z.enum(["refresh", "claim", "adopt", "close_task"]),
+    closure: TrackerClosureSchema.optional(),
     taskId: TrackerIdSchema.nullable(),
     dispatched: z.boolean(),
     mutationDispatched: z.boolean(),
     ioStopped: z.boolean(),
     beforeSnapshotId: z.string().uuid().nullable(),
     afterSnapshotId: z.string().uuid().nullable(),
-    outcome: z.enum(["observed", "claimed", "not_claimed", "conflict", "failed"]).nullable(),
+    outcome: z
+      .enum(["observed", "claimed", "not_claimed", "closed", "not_closed", "conflict", "failed"])
+      .nullable(),
     failure: z.string().max(4000).nullable(),
     createdAt: z.iso.datetime(),
     finishedAt: z.iso.datetime().nullable(),
   })
   .refine((operation) => (operation.outcome !== null) === (operation.finishedAt !== null))
   .refine((operation) => operation.outcome === null || operation.ioStopped)
+  .refine((operation) => (operation.kind === "close_task") === (operation.closure !== undefined))
+  .refine(
+    (operation) =>
+      operation.outcome !== "closed" ||
+      (operation.closure?.refsVerified && !operation.closure.intervention),
+  )
   .refine(
     (operation) =>
       !operation.mutationDispatched ||

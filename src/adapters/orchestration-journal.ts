@@ -49,7 +49,7 @@ import { concurrentWithPublication } from "../domain/publication.js";
 import { TrackerJournal, TRACKER_TABLES, migrateTracker } from "./tracker-journal.js";
 import { concurrentWithTracker } from "../domain/tracker.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 11;
+export const ORCHESTRATION_SCHEMA_VERSION = 12;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -254,6 +254,37 @@ export class OrchestrationJournal {
       action: (runId, actionId) => this.action(runId, actionId),
       observe: (authority, input) => this.appendObservation(authority, input),
       assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
+      closurePublication: (runId, taskId, revision, claim) => {
+        const id = this.publications.repository(runId)?.lastPublishedId;
+        if (!id)
+          throw new DeliveryError(
+            "closure_not_published",
+            "Task closure needs a verified published revision",
+          );
+        const publication = this.publications.record(runId, id);
+        if (
+          publication.revision !== revision ||
+          this.publications.approval(runId, id) !== publication.reviewEvidenceId
+        )
+          throw new DeliveryError(
+            "closure_not_verified",
+            "Task closure needs current independent exact-SHA publication approval",
+          );
+        const commit = this.commits.exact(runId, publication, revision);
+        const candidate = this.delivery.candidate(runId, publication);
+        const assignment = this.agents.assignment(runId, candidate.sourceAssignmentId);
+        if (
+          commit.taskId !== taskId ||
+          candidate.taskId !== taskId ||
+          !assignment.trackerClaim ||
+          digestJson(assignment.trackerClaim) !== digestJson(claim)
+        )
+          throw new DeliveryError(
+            "closure_claim_mismatch",
+            "Verified implementation did not originate under this exact task claim",
+          );
+        return publication;
+      },
     });
   }
 

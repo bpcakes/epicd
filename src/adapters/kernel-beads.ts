@@ -109,7 +109,14 @@ export class KernelBeads {
           dependents: relations(input.dependents),
         };
         const { status: _status, assignee: _assignee, ...work } = content;
-        const issue = TrackerIssueSchema.parse({ ...content, workDigest: digestJson(work) });
+        const issue = TrackerIssueSchema.parse({
+          ...content,
+          workDigest: digestJson(work),
+          closedAt: input.closed_at ?? null,
+          closeReason: input.close_reason ?? null,
+          closedBySession: input.closed_by_session ?? null,
+          updatedAt: input.updated_at ?? null,
+        });
         issues.set(issue.id, issue);
         for (const edge of issue.dependents)
           if (edge.type === "parent-child" && !issues.has(edge.id)) queue.push(edge.id);
@@ -154,6 +161,43 @@ export class KernelBeads {
         "update",
         taskId,
         "--claim",
+        "--actor",
+        trackerActor(runId),
+        "--agent-name",
+        "epicd",
+        "--harness",
+        "epicd",
+      ],
+      guard,
+      signal,
+    );
+  }
+  /** Exact journal-generated close metadata; never force, bypass policy, or close a batch. */
+  async close(
+    binding: TrackerBinding,
+    taskId: string,
+    runId: string,
+    operationId: string,
+    reason: string,
+    guard: Guard,
+    signal: AbortSignal,
+  ) {
+    TrackerIdSchema.parse(taskId);
+    z.string().uuid().parse(operationId);
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(runId))
+      throw new Error("Invalid tracker run identity");
+    z.string().min(1).max(1024).parse(reason);
+    return this.command(
+      binding,
+      [
+        "close",
+        taskId,
+        "--reason",
+        reason,
+        "--transition-comment",
+        reason,
+        "--session",
+        operationId,
         "--actor",
         trackerActor(runId),
         "--agent-name",

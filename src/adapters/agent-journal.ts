@@ -134,7 +134,10 @@ type Access = {
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
   publicationPending(runId: string): import("../domain/publication.js").PublicationRecord | null;
   deliveryRepository(runId: string): import("../domain/publication.js").DeliveryRepository | null;
-  assertTaskOwned(runId: string, taskId: string | null): void;
+  assertTaskOwned(
+    runId: string,
+    taskId: string | null,
+  ): import("../domain/tracker.js").TaskClaimBinding | undefined;
 };
 export class AgentCoordinationError extends Error {
   constructor(
@@ -511,7 +514,7 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       const control = this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, input);
-      this.access.assertTaskOwned(authority.runId, input.taskId);
+      const trackerClaim = this.access.assertTaskOwned(authority.runId, input.taskId);
       if (workspace.purpose === "delivery")
         throw new AgentCoordinationError(
           "kernel_workspace",
@@ -574,6 +577,7 @@ export class AgentJournal {
         taskId: input.taskId,
         candidateId: input.candidateId,
         instructions: safeText(input.instructions),
+        ...(trackerClaim ? { trackerClaim } : {}),
         createdAt: at,
       });
       const agent = AgentInstanceSchema.parse({

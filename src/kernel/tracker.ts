@@ -95,7 +95,11 @@ export function registerTrackerCapabilities(kernel: ActionKernel, transport: Ker
       const intent = journal.tracker.reserve(authority, record.actionId);
       const result = await adapter.execute(authority, intent.trackerOperationId, signal);
       if (!result.outcome) throw new Error("Tracker effect requires explicit reconciliation");
-      if (result.outcome !== "observed" && result.outcome !== "claimed")
+      if (
+        result.outcome !== "observed" &&
+        result.outcome !== "claimed" &&
+        result.outcome !== "closed"
+      )
         throw new OperationFailed(
           `Tracker ${result.trackerOperationId}: ${result.failure ?? result.outcome}`,
         );
@@ -109,6 +113,7 @@ export function registerTrackerCapabilities(kernel: ActionKernel, transport: Ker
       action.trackerOperationId,
       signal,
     );
+    if (!record.outcome) throw new Error("Tracker reconciliation still awaits current authority");
     return resource(record);
   });
   return adapter;
@@ -121,6 +126,9 @@ export async function reconcileTracker(
   signal?: AbortSignal,
 ) {
   const record = await adapter.reconcile(authority, id, signal);
+  // Read-only bootstrap inspection can run while paused. A stopped physical
+  // effect with no admissible outcome must not terminally fail its parent.
+  if (!record.outcome) return record;
   const action = kernel.journal.action(authority.runId, record.actionId);
   if (
     action &&
@@ -128,7 +136,7 @@ export async function reconcileTracker(
     !kernel.operation(action.operationId)
   ) {
     if (
-      ["observed", "claimed"].includes(record.outcome ?? "") &&
+      ["observed", "claimed", "closed"].includes(record.outcome ?? "") &&
       action.policyDigest === kernel.journal.control(authority.runId).policyDigest
     )
       kernel.journal.settleAction(authority, action.actionId, action.status, {
