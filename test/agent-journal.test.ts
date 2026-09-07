@@ -20,6 +20,10 @@ import type {
   OrchestratorDecision,
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import {
+  coordinatorConversationPressure,
+  COORDINATOR_CONVERSATION_LIMITS,
+} from "../src/orchestrator/conversation.js";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
@@ -174,6 +178,138 @@ function decision(setup: ReturnType<typeof fixture>, action: KernelAction): Orch
     },
   };
 }
+
+describe("coordinator conversation accounting", () => {
+  it.each(["sdk", "herdr"] as const)(
+    "bounds %s history without relying on usage or agent prose",
+    (runtime) => {
+      const f = fixture(),
+        agent = f.reserve("specialist", undefined, runtime);
+      const turn = f.prepare(agent);
+      const turns = Array.from({ length: COORDINATOR_CONVERSATION_LIMITS.turns - 1 }, () =>
+        structuredClone(turn),
+      );
+      const before = coordinatorConversationPressure(agent, turns);
+      expect(before.reasons).toEqual([]);
+      expect(before.usageTurns).toBe(0);
+      turns.push(turn);
+      expect(coordinatorConversationPressure(agent, turns).reasons).toEqual(["turn_limit"]);
+      expect(
+        coordinatorConversationPressure(agent, [{ ...turn, result: { inputTokens: 999999999 } }])
+          .reportedInputTokens,
+      ).toBe(0);
+      expect(coordinatorConversationPressure({ ...agent, agentGeneration: 2 }, turns).turns).toBe(
+        0,
+      );
+      expect(coordinatorConversationPressure({ ...agent, runId: "foreign" }, turns).turns).toBe(0);
+    },
+  );
+  it("uses byte and usage boundaries independently, without summing repeated cached input", () => {
+    const f = fixture(),
+      agent = f.reserve("specialist"),
+      turn = f.prepare(agent);
+    const base = coordinatorConversationPressure(agent, [turn]).retainedBytes;
+    const padded = structuredClone(turn);
+    padded.prompt.instructions += "x".repeat(
+      COORDINATOR_CONVERSATION_LIMITS.retainedBytes - base - 1,
+    );
+    expect(coordinatorConversationPressure(agent, [padded]).reasons).toEqual([]);
+    padded.prompt.instructions += "x";
+    expect(coordinatorConversationPressure(agent, [padded]).reasons).toEqual(["byte_limit"]);
+    turn.sdkUsage = {
+      inputTokens: COORDINATOR_CONVERSATION_LIMITS.reportedInputTokens - 1,
+      cachedInputTokens: 0,
+      outputTokens: 1,
+    };
+    expect(coordinatorConversationPressure(agent, [turn, turn]).reasons).toEqual([]);
+    turn.sdkUsage.inputTokens++;
+    expect(coordinatorConversationPressure(agent, [turn]).reasons).toEqual(["usage_pressure"]);
+  });
+  it("persists exact-launch SDK usage once, survives reopen, and rejects late or conflicting reports", () => {
+    const f = fixture(),
+      agent = f.reserve("specialist"),
+      prepared = f.prepare(agent);
+    const { turn, manifest } = f.launches.reserve(f.journal, f.authority, prepared.identity);
+    const usage = { inputTokens: 50000, cachedInputTokens: 40000, outputTokens: 800 };
+    const report = (generation = manifest.generation, input = usage) =>
+      f.agents.recordSdkUsage(f.authority, turn.identity, generation, input);
+    expect(report).toThrow("acknowledged");
+    f.agents.acknowledgePrompt(
+      f.authority,
+      turn.identity,
+      turn.promptDigest,
+      "Fixture acknowledgement",
+    );
+    expect(() => report(randomUUID())).toThrow("acknowledged");
+    expect(() => report(manifest.generation, { ...usage, inputTokens: -1 })).toThrow();
+    expect(report().sdkUsage).toEqual(usage);
+    expect(report().sdkUsage).toEqual(usage);
+    expect(() => report(manifest.generation, { ...usage, outputTokens: 801 })).toThrow("immutable");
+    const reopened = new StateStore(f.path);
+    stores.push(reopened);
+    expect(reopened.orchestration.agents.turn(f.authority.runId, turn.identity).sdkUsage).toEqual(
+      usage,
+    );
+    expect(
+      f.journal.observations(f.authority.runId).filter((event) => event.kind === "agent.sdk_usage"),
+    ).toHaveLength(1);
+    f.agents.recordLaunchStop(f.authority, turn.identity, {
+      generation: manifest.generation,
+      stoppedAt: new Date().toISOString(),
+      kind: "stopped",
+      code: 0,
+      signal: null,
+      interrupted: false,
+      processTreeStopped: true,
+    });
+    expect(report).toThrow("unstopped");
+  });
+  it("rolls back accounting if its audit cannot be recorded", () => {
+    const f = fixture(),
+      agent = f.reserve("specialist"),
+      prepared = f.prepare(agent);
+    const { turn, manifest } = f.launches.reserve(f.journal, f.authority, prepared.identity);
+    f.agents.acknowledgePrompt(
+      f.authority,
+      turn.identity,
+      turn.promptDigest,
+      "Fixture acknowledgement",
+    );
+    f.db.exec(`CREATE TRIGGER fail_usage BEFORE INSERT ON observations
+      WHEN json_extract(NEW.observation_json, '$.kind') = 'agent.sdk_usage'
+      BEGIN SELECT RAISE(ABORT, 'usage audit unavailable'); END`);
+    expect(() =>
+      f.agents.recordSdkUsage(f.authority, turn.identity, manifest.generation, {
+        inputTokens: 500,
+        cachedInputTokens: 0,
+        outputTokens: 10,
+      }),
+    ).toThrow("usage audit unavailable");
+    expect(f.agents.turn(f.authority.runId, turn.identity).sdkUsage).toBeNull();
+  });
+  it("retirement cannot erase pending messages or treat an unconfirmed launch as stopped", () => {
+    const f = fixture(),
+      agent = f.reserve("specialist"),
+      prepared = f.prepare(agent);
+    f.launches.reserve(f.journal, f.authority, prepared.identity);
+    expect(() =>
+      f.agents.retireStoppedAgent(f.authority, agent, "Bounded context rollover"),
+    ).toThrow("every exact turn");
+    expect(f.agents.instance(f.authority.runId, agent).status).toBe("busy");
+    const idle = f.reserve("specialist");
+    const message = f.agents.enqueueAgentMessage(
+      f.authority,
+      idle,
+      randomUUID(),
+      "Keep this instruction",
+    );
+    expect(() =>
+      f.agents.retireStoppedAgent(f.authority, idle, "Bounded context rollover"),
+    ).toThrow("pending instructions");
+    expect(f.agents.messages(f.authority.runId, idle)).toEqual([message]);
+    expect(f.agents.instance(f.authority.runId, idle).status).toBe("reserved");
+  });
+});
 
 describe("durable agent coordination", () => {
   it("binds a native terminal once before accepting provider identity and never reuses it for a later turn", () => {

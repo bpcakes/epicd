@@ -995,6 +995,7 @@ export class AgentJournal {
         prompt,
         promptDigest: digestJson(prompt),
         outputSchema,
+        sdkUsage: null,
         policyDigest: control.policyDigest,
         controlVersion: control.controlVersion,
         submissionAcknowledgement: null,
@@ -1197,6 +1198,40 @@ export class AgentJournal {
         turn.launch.stop = stop;
         this.saveTurn(turn);
         this.event(authority, "agent.launch_stopped", identity.turnId, identity);
+      }
+      return turn;
+    });
+  }
+
+  /** Only the SDK adapter may report this; accounting grants no result or stop authority. */
+  recordSdkUsage(
+    authority: ControllerAuthority,
+    identity: TurnIdentity,
+    launchGeneration: string,
+    input: NonNullable<TurnRecord["sdkUsage"]>,
+  ): TurnRecord {
+    return this.access.transaction(authority, () => {
+      const turn = this.turn(authority.runId, identity);
+      const usage = TurnRecordSchema.shape.sdkUsage.unwrap().parse(input);
+      if (
+        this.instance(authority.runId, identity).contract.runtime !== "sdk" ||
+        !turn.launch ||
+        turn.launch.manifest.generation !== launchGeneration ||
+        turn.launch.stop ||
+        turn.stopEvidence ||
+        !turn.submissionAcknowledgement
+      )
+        throw new AgentCoordinationError(
+          "usage_not_current",
+          "Usage needs the acknowledged, unstopped SDK launch",
+        );
+      this.requireCurrent(turn);
+      if (turn.sdkUsage && digestJson(turn.sdkUsage) !== digestJson(usage))
+        throw new AgentCoordinationError("usage_conflict", "Completed-turn usage is immutable");
+      if (!turn.sdkUsage) {
+        turn.sdkUsage = usage;
+        this.saveTurn(turn);
+        this.event(authority, "agent.sdk_usage", JSON.stringify(usage), identity);
       }
       return turn;
     });
@@ -1447,7 +1482,11 @@ export class AgentJournal {
   }
 
   /** End future conversation authority without revoking historical evidence or deleting resources. */
-  retireStoppedAgent(authority: ControllerAuthority, identity: AgentIdentity): AgentInstance {
+  retireStoppedAgent(
+    authority: ControllerAuthority,
+    identity: AgentIdentity,
+    reason?: string,
+  ): AgentInstance {
     return this.access.transaction(authority, () => {
       const agent = this.instance(authority.runId, identity);
       if (
@@ -1478,7 +1517,7 @@ export class AgentJournal {
       this.changed(
         authority,
         "agent.retired",
-        `${agent.agentId}/${agent.agentGeneration}: conversation retired; evidence and resources retained`,
+        `${agent.agentId}/${agent.agentGeneration}: conversation retired; evidence and resources retained${reason ? `; ${safeText(reason, 4000)}` : ""}`,
       );
       return agent;
     });

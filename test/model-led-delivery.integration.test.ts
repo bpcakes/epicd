@@ -160,6 +160,18 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
               .filter((agent) => agent.role === "orchestrator")
               .every((agent) => agent.contract.effective.model === "gpt-6-astra"),
           ).toBe(true);
+          const coordinators = journal.agents
+            .instances(run.runId)
+            .filter((agent) => agent.role === "orchestrator");
+          expect(coordinators.length).toBeGreaterThan(1);
+          expect(
+            coordinators
+              .slice(0, -1)
+              .every((agent) => agent.status === "released" && agent.revokedReason === null),
+          ).toBe(true);
+          expect(new Set(coordinators.map((agent) => agent.provider?.sessionId)).size).toBe(
+            coordinators.length,
+          );
           expect(journal.publications.repository(run.runId)?.publishedRevision).toBe(revision);
         } finally {
           clearTimeout(timeout);

@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 27. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 28. Use a fresh state path; unsupported existing data is left intact.
 
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
@@ -150,6 +150,14 @@ During a run, the orchestrator can invoke `change_agent_settings` within frozen 
 
 `create_diagnostic_workspace` gives specialists a writable private copy for experiments. With `candidate` and `revision` both null it copies the frozen epic baseline, even while implementation is active. A candidate identity selects its captured snapshot; an explicit revision must also identify that candidate's kernel-recorded exact commit. Candidate copying requires its source workspace to be stopped. The orchestrator then chooses `start_specialist`, follow-up, inspection or replacement through the selected SDK/native Herdr driver. Diagnostic edits and reports cannot satisfy delivery validation or independent review. Restart can recover a lost creation acknowledgement only from an intact recorded copy with confirmed I/O stop; it never recreates an uncertain copy or discards its delta.
 
+## Bounded coordinator conversations
+
+The run outlives any one Astra conversation. Between decisions, the controller retires a confirmed-stopped coordinator when its recorded history reaches 12 turns, 512 KiB of serialized prompts/schemas/results, or 196,608 reported SDK input tokens. These are conservative rollover thresholds, not exact context occupancy or monetary limits. SDK usage is retained against the exact acknowledged launch; native Herdr uses the same byte/turn guards without inventing token counts from terminal text.
+
+Rollover starts a fresh `gpt-6-astra` conversation in the selected runtime with unchanged settings and current journal context. Memory, assignments, evidence, findings, policy and consumed budgets remain intact. Pending instructions and unknown stop states prevent retirement; a frozen decision is reconciled before its conversation can be retired. Old workspaces and provider records are retained, not deleted or copied into the new conversation. Unexpected runtime failures still require diagnosis; this does not introduce a generic retry or model fallback.
+
+Codex exposes [automatic compaction settings](https://learn.chatgpt.com/docs/config-file/config-reference), but this safeguard does not depend on compaction succeeding or assume that the [Astra API context window](https://developers.openai.com/api/docs/models/gpt-6-astra) is the installed Codex runtime's effective limit.
+
 ## Explicit runtime handoff
 
 `resume` always uses the recorded runtime. To switch deliberately, pause the run and wait for its controller to detach, then inspect status again for the current control version:
@@ -267,7 +275,7 @@ The unscripted SDK delivery acceptance uses the existing Codex authentication ca
 EPICD_LIVE_DELIVERY=1 npm test -- test/model-led-delivery.integration.test.ts
 ```
 
-It allows up to 20 minutes of actual Astra work and always retains its printed private `/var/tmp/epicd-live-delivery-*` directory for diagnosis. It does not use the project's tracker or modify the user's checkout. This is an unfinished release check: the current recorded run creates and independently verifies a local commit, publishes it and closes the real task and epic, but exhausts coordinator context before final tracker publication and run completion. Bounded context rollover is still required. Native Herdr delivery acceptance remains separate.
+It allows up to 20 minutes of actual Astra work and always retains its printed private `/var/tmp/epicd-live-delivery-*` directory for diagnosis. It does not use the project's tracker or modify the user's checkout. The 2026-09-08 run passed complete SDK delivery, including nine context rollovers, three independent reviews, task/epic closure, final tracker publication, repository ownership release and preservation of the original checkout/index. This is one bounded acceptance case, not full release certification. Native Herdr whole-epic delivery and the receipt/browser recovery scenarios remain separate open checks.
 
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 

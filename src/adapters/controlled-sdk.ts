@@ -142,7 +142,15 @@ export class ControlledSdkRuntime {
                   "Retained diagnostic budget exhausted; stop this turn without accepting its result",
                 );
             }
-            if (event.type === "turn.completed") completed = true;
+            if (event.type === "turn.completed") {
+              if (event.usage)
+                this.journal.agents.recordSdkUsage(authority, identity, manifest.generation, {
+                  inputTokens: event.usage.input_tokens,
+                  cachedInputTokens: event.usage.cached_input_tokens,
+                  outputTokens: event.usage.output_tokens,
+                });
+              completed = true;
+            }
             if (event.type === "item.completed" && event.item.type === "agent_message") {
               if (Buffer.byteLength(event.item.text) > 1024 * 1024)
                 throw new Error("Agent result exceeds one MiB");

@@ -16,6 +16,8 @@ import { StateStore } from "../dist/adapters/store.js";
 import { ControlledSdkRuntime } from "../dist/adapters/controlled-sdk.js";
 import { OrchestratorController, controlledDriver } from "../dist/controller.js";
 import { ActionKernel } from "../dist/kernel/actions.js";
+import { buildOrchestratorContext } from "../dist/orchestrator/context.js";
+import { ControlledDecisionSource } from "../dist/orchestrator/sdk-source.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import type {
   ControllerAuthority,
@@ -82,7 +84,7 @@ function fixture() {
     ticket: Record<string, unknown>;
     context: { objective: unknown; capabilities: { kind: string; available: boolean }[] };
   }[] = [];
-  function driverFactory(actions: KernelAction[], hang = false) {
+  function driverFactory(actions: KernelAction[], hang = false, inputTokens = 10) {
     return (selectedStore: StateStore) => {
       const journal = selectedStore.orchestration;
       const driver = controlledDriver(selectedStore, state);
@@ -122,7 +124,7 @@ function fixture() {
               }),
               emit({
                 type: "turn.completed",
-                usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5 },
+                usage: { input_tokens: inputTokens, cached_input_tokens: 0, output_tokens: 5 },
               }),
               "",
             ].join("\n"),
@@ -454,6 +456,130 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     expect(journal.memory(f.state.runId)[0]?.content).toContain("preserve the user's checkout");
     expect(JSON.stringify(f.observed.at(-1))).toContain("preserve the user's checkout");
     expect(f.git("status", "--porcelain")).toBe("");
+  });
+  it("rolls over from durable usage after reopening without revoking evidence or refilling budgets", async () => {
+    const f = fixture(),
+      run = f.state.runId;
+    await new OrchestratorController(f.store, run, {
+      driver: f.driverFactory(
+        [
+          {
+            kind: "record_memory",
+            entry: {
+              kind: "strategy",
+              content: "Retain the validation hypothesis across context rollover",
+              scope: "run",
+              taskId: null,
+              confidence: "hypothesis",
+              observationIds: [],
+              evidenceIds: [],
+              revision: null,
+              environmentGeneration: null,
+              supersedes: null,
+            },
+          },
+          question,
+        ],
+        false,
+        192 * 1024,
+      ),
+    }).run();
+    const oldTurns = f.store.orchestration.agents.turns(run);
+    expect(oldTurns).toHaveLength(2);
+    expect(
+      oldTurns.every((turn) => turn.resultEligible && turn.sdkUsage?.inputTokens === 192 * 1024),
+    ).toBe(true);
+    const reopened = new StateStore(f.path);
+    cleanup.push(() => reopened.close());
+    const journal = reopened.orchestration;
+    const before = journal.control(run);
+    journal.operatorControl(run, before.controlVersion, {
+      kind: "respond",
+      escalationId: journal.pendingEscalation(run)!.escalationId,
+      message: "Continue the bounded inspection",
+    });
+    await new OrchestratorController(reopened, run, {
+      driver: f.driverFactory([{ kind: "inspect_run" }, question]),
+    }).run();
+    const agents = journal.agents.instances(run);
+    expect(agents).toHaveLength(3);
+    expect(
+      agents
+        .slice(0, 2)
+        .every((agent) => agent.status === "released" && agent.revokedReason === null),
+    ).toBe(true);
+    expect(new Set(agents.map((agent) => agent.workspaceId)).size).toBe(3);
+    expect(new Set(agents.map((agent) => agent.provider?.sessionId)).size).toBe(3);
+    expect(
+      agents.every(
+        (agent) =>
+          agent.contract.runtime === "sdk" &&
+          agent.contract.effective.model === "gpt-6-astra" &&
+          agent.contract.effective.reasoningEffort === "high",
+      ),
+    ).toBe(true);
+    expect(journal.agents.turns(run).slice(0, 2)).toEqual(oldTurns);
+    expect(journal.control(run)).toMatchObject({
+      decisionsUsed: before.decisionsUsed + 2,
+      maxDecisions: before.maxDecisions,
+    });
+    expect(JSON.stringify(f.observed.at(-1))).toContain(
+      "Retain the validation hypothesis across context rollover",
+    );
+    const retirements = journal
+      .observations(run, 0, 1000)
+      .filter((event) => event.kind === "agent.retired");
+    expect(retirements).toHaveLength(2);
+    expect(retirements.every((event) => event.summary.includes("usage_pressure"))).toBe(true);
+    expect(f.git("status", "--porcelain")).toBe("");
+  });
+  it("reconciles a stopped coordinator result before rollover instead of invalidating its frozen ticket", async () => {
+    const f = fixture(),
+      run = f.state.runId;
+    await new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run();
+    const journal = f.store.orchestration;
+    journal.operatorControl(run, journal.control(run).controlVersion, {
+      kind: "respond",
+      escalationId: journal.pendingEscalation(run)!.escalationId,
+      message: "Perform a bounded inspection",
+    });
+    const lease = f.store.acquireLease(run),
+      authority = { runId: run, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
+    const previous = journal.agents.instances(run)[0]!;
+    const context = buildOrchestratorContext(new ActionKernel(journal), run);
+    const ticket = journal.beginDecision(
+      authority,
+      context.observationCursor,
+      context.control.controlVersion,
+    );
+    journal.decisionSource.prepare(authority, ticket, JSON.stringify(context));
+    const attempt = journal.decisionSource.start(authority, ticket.decisionId);
+    const source = new ControlledDecisionSource(
+      journal,
+      authority,
+      previous,
+      f.driverFactory([{ kind: "inspect_run" }], false, 192 * 1024)(f.store),
+    );
+    await source.decide({ ticket, context, attemptId: attempt.attemptId });
+    // Simulated lost transport acknowledgement, not lost process-stop proof.
+    expect(journal.decisionSource.unsettled(run)?.attemptId).toBe(attempt.attemptId);
+    const used = journal.control(run).decisionsUsed;
+    f.store.releaseLease(run, authority.ownerToken);
+    const reopened = new StateStore(f.path);
+    cleanup.push(() => reopened.close());
+    await new OrchestratorController(reopened, run, { driver: f.driverFactory([question]) }).run();
+    const resumed = reopened.orchestration;
+    expect(
+      resumed.actions(run).filter((action) => action.request.decisionId === ticket.decisionId),
+    ).toEqual([expect.objectContaining({ status: "succeeded" })]);
+    expect(resumed.decisionSource.execution(run, ticket.decisionId)?.attempts).toHaveLength(1);
+    expect(resumed.decisionSource.unsettled(run)).toBeNull();
+    expect(resumed.agents.instances(run)).toHaveLength(2);
+    expect(resumed.agents.instance(run, previous)).toMatchObject({
+      status: "released",
+      revokedReason: null,
+    });
+    expect(resumed.control(run).decisionsUsed).toBe(used + 1);
   });
   it("rejects a competing controller before creating a coordinator or invoking a runtime", async () => {
     const f = fixture();

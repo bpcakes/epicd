@@ -40,6 +40,7 @@ import {
 } from "./kernel/delivery-recovery.js";
 import { ControlledDecisionSource } from "./orchestrator/sdk-source.js";
 import { OrchestratorLoop } from "./orchestrator/loop.js";
+import { coordinatorConversationPressure } from "./orchestrator/conversation.js";
 import { runStatusView } from "./status.js";
 import { redactSensitiveText } from "./util/redact.js";
 import { RepositoryAdmission } from "./kernel/repository-admission.js";
@@ -439,9 +440,26 @@ export class OrchestratorController {
     const existing = live[0];
     if (existing) {
       if (existing.activeTurnId) throw new Error("The previous coordinator has no confirmed stop");
-      if (digestJson(existing.contract) === digestJson(contract)) return existing;
-      journal.agents.revokeAgent(authority, existing, "Future-thread coordinator settings changed");
-      journal.agents.releaseAgent(authority, existing);
+      // Startup may precede replay of a stopped turn's recorded result or a
+      // transport retry. Do not invalidate its frozen ticket by retiring here.
+      const pending = journal.pendingDecision(this.runId);
+      const control = journal.control(this.runId);
+      if (
+        journal.decisionSource.unsettled(this.runId) ||
+        (pending &&
+          pending.expectedControlVersion === control.controlVersion &&
+          pending.policyDigest === control.policyDigest &&
+          journal.decisionSource.execution(this.runId, pending.decisionId))
+      )
+        return existing;
+      const pressure = coordinatorConversationPressure(existing, journal.agents.turns(this.runId));
+      const settingsChanged = digestJson(existing.contract) !== digestJson(contract);
+      if (!settingsChanged && pressure.reasons.length === 0) return existing;
+      journal.agents.retireStoppedAgent(
+        authority,
+        existing,
+        `${settingsChanged ? "Future-thread settings changed" : "Bounded context rollover"}; ${JSON.stringify(pressure)}`,
+      );
     }
     const operation = `coordinator-${digestJson([this.runId, prior.length, contract]).slice(0, 40)}`;
     let workspace = journal.agents.workspaceForOperation(this.runId, operation);

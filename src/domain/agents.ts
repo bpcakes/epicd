@@ -140,6 +140,15 @@ export const TurnRecordSchema = z.strictObject({
   prompt: TurnPromptSchema,
   promptDigest: z.string().length(64),
   outputSchema: z.json(),
+  // Transport accounting, never parsed from agent prose or a terminal excerpt.
+  // Native Herdr currently has no complete per-turn usage surface.
+  sdkUsage: z
+    .strictObject({
+      inputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      cachedInputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      outputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    })
+    .nullable(),
   policyDigest: z.string().length(64),
   controlVersion: z.number().int().nonnegative(),
   submissionAcknowledgement: z.string().min(1).max(4000).nullable(),
