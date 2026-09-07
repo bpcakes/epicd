@@ -4,7 +4,7 @@ Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra 
 
 This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Use a fresh state path. Unsupported existing data is left intact.
 
-The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, guarded container/root closure and atomic run completion are implemented. Epic-scoped repair, guarded tracker export/commit handling, host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
+The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure and atomic run completion are implemented. Guarded tracker export/commit handling, host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
 ## Requirements
 
@@ -32,6 +32,8 @@ SDK mode uses the SDK-pinned native Codex binary through the supervised SDK tran
 Confined validation, Codex, Beads and fixture commands use an independent PID-namespace lifetime supervisor outside Bubblewrap's command mounts. Cancellation remains effective during sandbox startup. A killed supervisor is an unknown stop, not permission to release a workspace, accept tracker completion or attest fixture-client termination. There is no unconfined fallback when this boundary cannot start.
 
 Whole-epic verification has its own published-revision target. `prepare_epic_delivery` binds the latest publication, observed tracker scope and closed-task provenance to an epic-root validation plan. It retains required checks from delivered tasks and demands fresh results at the final SHA. `run_review` then starts an independent `final_review` conversation in an isolated verification copy, covering all descendant requirements and the diff from the run baseline. Findings survive replacement targets. This evidence does not itself close the tracker root or complete the run. Oversized complete review context is rejected, never silently shortened into approval.
+
+After a final finding, the orchestrator can request `start_agent` with purpose `epic_repair`, the root task ID and latest captured root candidate, using a fresh implementation workspace at the latest private commit. The kernel binds the assignment to the open root and proven closed descendants, and supplies retained requirements, findings and checks to either runtime. No task is reopened and no root claim is fabricated. Repair commits use the normal independent pre-commit and exact-revision review gates. Every further repair extends the private tip; publication must be followed by a new whole-epic target and approval before root closure. Policy/reviewer requirements and committed repair checks remain binding even before publication; uncommitted draft checks stay editable.
 
 ## Declare policy
 

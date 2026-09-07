@@ -115,6 +115,13 @@ export const TrackerSnapshotSchema = z.strictObject({
   graph: TrackerGraphSchema,
 });
 export type TrackerSnapshot = z.infer<typeof TrackerSnapshotSchema>;
+export const EpicRepairBindingSchema = z.strictObject({
+  scopeDigest: z.string().length(64),
+  epicBaselineRevision: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+  baseCommitId: z.uuid(),
+  baseRevision: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+});
+export type EpicRepairBinding = z.infer<typeof EpicRepairBindingSchema>;
 const ScopeClosureProof = z.strictObject({
   scopeDigest: z.string().length(64),
   closureOperationIds: z.array(z.uuid()).max(1000),

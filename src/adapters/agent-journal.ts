@@ -134,6 +134,21 @@ type Access = {
     runId: string,
     taskId: string | null,
   ): import("../domain/tracker.js").TaskClaimBinding | undefined;
+  bindEpicRepair(
+    runId: string,
+    taskId: string | null,
+    candidateId: string | null,
+    workspace: WorkspaceIdentity,
+  ): import("../domain/tracker.js").EpicRepairBinding;
+  assertEpicRepair(
+    runId: string,
+    taskId: string | null,
+    binding: import("../domain/tracker.js").EpicRepairBinding,
+    workspace: WorkspaceIdentity,
+    requireLatestBase: boolean,
+  ): void;
+  epicReviewTarget(runId: string, taskId: string | null, candidateId: string | null): boolean;
+  epicRepairContext(runId: string): unknown;
 };
 export class AgentCoordinationError extends Error {
   constructor(
@@ -512,8 +527,15 @@ export class AgentJournal {
       const workspace = this.workspace(authority.runId, input);
       // Final review is admitted by the evidence-bound review capability after task closure.
       // Its epic root is not an implementation task and must not acquire a fabricated claim.
+      const epicRepair =
+        input.purpose === "epic_repair"
+          ? this.access.bindEpicRepair(authority.runId, input.taskId, input.candidateId, workspace)
+          : undefined;
+      const epicReview =
+        ["review", "verification", "final_review"].includes(input.purpose) &&
+        this.access.epicReviewTarget(authority.runId, input.taskId, input.candidateId);
       const trackerClaim =
-        input.purpose === "final_review"
+        epicRepair || epicReview
           ? undefined
           : this.access.assertTaskOwned(authority.runId, input.taskId);
       if (workspace.purpose === "delivery")
@@ -579,6 +601,7 @@ export class AgentJournal {
         candidateId: input.candidateId,
         instructions: safeText(input.instructions),
         ...(trackerClaim ? { trackerClaim } : {}),
+        ...(epicRepair ? { epicRepair } : {}),
         createdAt: at,
       });
       const agent = AgentInstanceSchema.parse({
@@ -846,7 +869,18 @@ export class AgentJournal {
       const agent = this.instance(authority.runId, identity);
       const workspace = this.workspace(authority.runId, agent);
       const assignment = this.assignment(authority.runId, agent.assignmentId);
-      if (assignment.purpose !== "final_review")
+      if (assignment.epicRepair)
+        this.access.assertEpicRepair(
+          authority.runId,
+          assignment.taskId,
+          assignment.epicRepair,
+          workspace,
+          true,
+        );
+      else if (!(
+        ["review", "verification", "final_review"].includes(assignment.purpose) &&
+        this.access.epicReviewTarget(authority.runId, assignment.taskId, assignment.candidateId)
+      ))
         this.access.assertTaskOwned(authority.runId, assignment.taskId);
       if (
         this.access.publicationPending(authority.runId) &&
@@ -926,6 +960,9 @@ export class AgentJournal {
         ...(reviewContext === undefined
           ? {}
           : { reviewContext: JsonValueSchema.parse(reviewContext) }),
+        ...(assignment.epicRepair
+          ? { repairContext: JsonValueSchema.parse(this.access.epicRepairContext(authority.runId)) }
+          : {}),
       };
       if (
         Buffer.byteLength(JSON.stringify(prompt)) > (agent.role === "orchestrator" ? 131072 : 65536)
@@ -982,6 +1019,14 @@ export class AgentJournal {
       const turn = this.turn(authority.runId, identity);
       this.active(authority, turn.controlVersion);
       this.requireCurrent(turn);
+      if (turn.prompt.assignment.epicRepair)
+        this.access.assertEpicRepair(
+          authority.runId,
+          turn.prompt.assignment.taskId,
+          turn.prompt.assignment.epicRepair,
+          turn.identity,
+          true,
+        );
       if (turn.launch && turn.launch.controllerLeaseId !== authority.leaseId)
         throw new AgentCoordinationError(
           "stale_launch",

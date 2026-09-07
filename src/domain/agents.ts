@@ -2,7 +2,7 @@ import { z } from "zod";
 import { TurnIdentitySchema } from "./orchestration.js";
 import { AgentRoleSchema, AgentSessionContractSchema } from "./types.js";
 import { TurnLaunchSchema } from "./codex-launch.js";
-import { TaskClaimBindingSchema } from "./tracker.js";
+import { TaskClaimBindingSchema, EpicRepairBindingSchema } from "./tracker.js";
 
 const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
 const Generation = z.number().int().positive();
@@ -39,26 +39,32 @@ export const WorkspaceRecordSchema = WorkspaceIdentitySchema.extend({
 });
 export type WorkspaceRecord = z.infer<typeof WorkspaceRecordSchema>;
 
-export const AgentAssignmentSchema = z.strictObject({
-  assignmentId: Id,
-  runId: Id,
-  ...AgentIdentitySchema.shape,
-  purpose: z.enum([
-    "coordination",
-    "implementation",
-    "review",
-    "verification",
-    "final_review",
-    "epic_repair",
-    "specialist",
-  ]),
-  taskId: z.string().min(1).max(256).nullable(),
-  candidateId: Id.nullable(),
-  instructions: Text,
-  // Kernel-bound provenance; callers cannot add a claim to an older assignment.
-  trackerClaim: TaskClaimBindingSchema.optional(),
-  createdAt: At,
-});
+export const AgentAssignmentSchema = z
+  .strictObject({
+    assignmentId: Id,
+    runId: Id,
+    ...AgentIdentitySchema.shape,
+    purpose: z.enum([
+      "coordination",
+      "implementation",
+      "review",
+      "verification",
+      "final_review",
+      "epic_repair",
+      "specialist",
+    ]),
+    taskId: z.string().min(1).max(256).nullable(),
+    candidateId: Id.nullable(),
+    instructions: Text,
+    // Kernel-bound provenance; callers cannot add a claim to an older assignment.
+    trackerClaim: TaskClaimBindingSchema.optional(),
+    epicRepair: EpicRepairBindingSchema.optional(),
+    createdAt: At,
+  })
+  .refine(
+    (assignment) =>
+      (assignment.purpose === "epic_repair") === (assignment.epicRepair !== undefined),
+  );
 export type AgentAssignment = z.infer<typeof AgentAssignmentSchema>;
 
 export const ProviderIdentitySchema = z.discriminatedUnion("runtime", [
@@ -116,6 +122,7 @@ export const TurnPromptSchema = z.strictObject({
   // Kernel-supplied review facts, covered by the complete prompt digest. Optional
   // preserves hashes of historical prompts rather than inserting a new default.
   reviewContext: z.json().optional(),
+  repairContext: z.json().optional(),
 });
 export const TurnRecordSchema = z.strictObject({
   identity: TurnIdentitySchema,

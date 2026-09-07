@@ -52,7 +52,7 @@ export type EpicDeliveryTarget = {
   binding: EpicDeliveryBinding;
   snapshot: WorkspaceSnapshot;
   checks: RequiredCheck[];
-  context: ReturnType<typeof epicContext>;
+  context: ReturnType<typeof epicRequirements>["context"];
 };
 
 function epicContext(
@@ -101,37 +101,35 @@ function epicContext(
   };
 }
 
-/** Derive a read-only target from kernel custody and tracker provenance, never model claims. */
-export function observeEpicDelivery(
+/** Requirements stay available while an epic repair has unpublished private commits. */
+export function epicRequirements(
   journal: OrchestrationJournal,
   runId: string,
   activeTrackerOperationId?: string,
-): EpicDeliveryTarget {
+) {
   journal.publications.assertIdle(runId);
   const scope = journal.tracker.closedEpicScope(runId, activeTrackerOperationId);
-  const repository = journal.publications.repository(runId);
-  if (!repository?.lastPublishedId || !repository.workspace || !repository.canonicalRepository)
-    throw new DeliveryError(
-      "epic_not_published",
-      "Epic review requires a published delivery revision in kernel custody",
-    );
-  const publication = journal.publications.record(runId, repository.lastPublishedId);
-  if (
-    publication.outcome !== "published" ||
-    !publication.ioStopped ||
-    repository.publishedRevision !== publication.revision ||
-    repository.privateRevision !== publication.revision ||
-    journal.commits.latestCreated(runId)?.revision !== publication.revision ||
-    journal.commits
-      .records(runId)
-      .some((commit) => ["preparing", "writing"].includes(commit.status))
-  )
-    throw new DeliveryError(
-      "epic_publication_unsettled",
-      "Settle and publish the complete private commit chain before final review",
-    );
-  const snapshot = journal.delivery.snapshotAtRevision(runId, publication, publication.revision);
-  const context = epicContext(journal, runId, scope);
+  const repairs = journal.commits
+    .records(runId)
+    .filter(
+      (commit) => commit.status === "created" && commit.taskId === scope.snapshot.graph.epicId,
+    )
+    .map((commit) => {
+      const plan = journal.delivery.plan(runId, commit.validationPlanId);
+      return {
+        commitId: commit.commitId,
+        revision: commit.revision!,
+        validationPlanId: plan.planId,
+        acceptanceCriteria: plan.acceptanceCriteria,
+        checks: plan.checks,
+      };
+    });
+  const context = {
+    ...epicContext(journal, runId, scope),
+    repairs,
+    baselineRevision: journal.runObjective(runId).baselineRevision,
+    trackerScopeDigest: scope.digest,
+  };
   const descendants = [...scope.snapshot.graph.issues]
     .filter((issue) => issue.id !== scope.snapshot.graph.epicId)
     .sort((a, b) => a.id.localeCompare(b.id));
@@ -153,6 +151,7 @@ export function observeEpicDelivery(
     ],
     [
       ...context.closedTasks,
+      ...repairs.map((repair) => ({ taskId: scope.snapshot.graph.epicId, checks: repair.checks })),
       ...descendants.map((issue) => ({
         taskId: issue.id,
         checks: journal.reviews.requiredChecks(runId, issue.id),
@@ -161,6 +160,49 @@ export function observeEpicDelivery(
   );
   const checks = collected.checks;
   context.checkBindings = collected.bindings;
+  return { scope, checks, context };
+}
+
+/** Derive a new final target from immutable published custody, not current source-assignment eligibility. */
+export function observeEpicDelivery(
+  journal: OrchestrationJournal,
+  runId: string,
+  activeTrackerOperationId?: string,
+): EpicDeliveryTarget {
+  const { scope, checks, context } = epicRequirements(journal, runId, activeTrackerOperationId);
+  const repository = journal.publications.repository(runId);
+  if (!repository?.lastPublishedId || !repository.workspace || !repository.canonicalRepository)
+    throw new DeliveryError(
+      "epic_not_published",
+      "Epic review requires a published delivery revision in kernel custody",
+    );
+  const publication = journal.publications.record(runId, repository.lastPublishedId);
+  const commit = journal.commits.record(runId, publication.commitId);
+  const captured = journal.delivery.candidate(runId, publication).snapshot;
+  if (
+    publication.outcome !== "published" ||
+    !publication.ioStopped ||
+    publication.policyDigest !== journal.control(runId).policyDigest ||
+    commit.policyDigest !== publication.policyDigest ||
+    repository.publishedRevision !== publication.revision ||
+    repository.privateRevision !== publication.revision ||
+    journal.commits.latestCreated(runId)?.commitId !== commit.commitId ||
+    commit.status !== "created" ||
+    !commit.sourceIntact ||
+    commit.revision !== publication.revision ||
+    commit.candidateId !== publication.candidateId ||
+    commit.candidateGeneration !== publication.candidateGeneration ||
+    !captured ||
+    captured.fullTree !== commit.fullTree ||
+    captured.fingerprint !== commit.fingerprint ||
+    captured.parentRevision !== commit.parentRevision ||
+    journal.commits.records(runId).some((entry) => ["preparing", "writing"].includes(entry.status))
+  )
+    throw new DeliveryError(
+      "epic_publication_unsettled",
+      "Settle and publish the complete private commit chain before final review",
+    );
+  const snapshot = { ...captured, snapshotRevision: publication.revision };
   return {
     taskId: scope.snapshot.graph.epicId,
     epicOpen:

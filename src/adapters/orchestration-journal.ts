@@ -56,10 +56,11 @@ import {
 } from "./diagnostic-journal.js";
 
 import { FixtureJournal, FIXTURE_TABLES, createFixturesSchema } from "./fixture-journal.js";
-import { observeEpicDelivery } from "./epic-delivery.js";
+import { observeEpicDelivery, epicRequirements } from "./epic-delivery.js";
 import { scopeClosure } from "./scope-closure.js";
+import { bindEpicRepair, assertEpicRepair } from "./epic-repair.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 21;
+export const ORCHESTRATION_SCHEMA_VERSION = 22;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -271,6 +272,37 @@ export class OrchestrationJournal {
       publicationPending: (runId) => this.publications.pending(runId),
       deliveryRepository: (runId) => this.publications.repository(runId),
       assertTaskOwned: (runId, taskId) => this.tracker.assertTaskOwned(runId, taskId),
+      bindEpicRepair: (runId, taskId, candidateId, workspace) =>
+        bindEpicRepair(this, runId, taskId, candidateId, workspace),
+      assertEpicRepair: (runId, taskId, binding, workspace, requireLatestBase) =>
+        assertEpicRepair(this, runId, taskId, binding, workspace, requireLatestBase),
+      epicReviewTarget: (runId, taskId, candidateId) => {
+        if (taskId !== this.runObjective(runId).epicId) return false;
+        const candidate = this.delivery.latestCandidate(runId, taskId);
+        if (
+          !candidate ||
+          candidate.candidateId !== candidateId ||
+          !this.delivery.candidateCurrent(runId, candidate)
+        )
+          throw new DeliveryError(
+            "epic_review_target",
+            "Epic review requires its current evidence-bound candidate",
+          );
+        return true;
+      },
+      epicRepairContext: (runId) => {
+        const { context, checks } = epicRequirements(this, runId);
+        const candidate = this.delivery.latestCandidate(runId, this.runObjective(runId).epicId)!;
+        const findings = this.reviews.openFindings(runId, candidate);
+        return {
+          ...context,
+          checks,
+          findings: findings.slice(0, 100),
+          omittedFindings: Math.max(0, findings.length - 100),
+          warning:
+            "Repair only this epic in the assigned private workspace. Existing findings and checks remain binding. Implementation output cannot approve delivery; independent review and fresh whole-epic exact-revision verification are required.",
+        };
+      },
     });
     this.delivery = new DeliveryJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -283,6 +315,9 @@ export class OrchestrationJournal {
       exactCommit: (runId, candidate, revision) => this.commits.exact(runId, candidate, revision),
       assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
       epicTarget: (runId, operationId) => observeEpicDelivery(this, runId, operationId),
+      epicRequirements: (runId) => epicRequirements(this, runId),
+      assertEpicRepair: (runId, taskId, binding, workspace) =>
+        assertEpicRepair(this, runId, taskId, binding, workspace, false),
       epicId: (runId) => this.runObjective(runId).epicId,
     });
     this.reviews = new ReviewJournal(db, {

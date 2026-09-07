@@ -248,13 +248,10 @@ export class ReviewJournal {
       );
       review.validationEvidenceIds = validation.evidence.map((entry) => entry.evidenceId);
       const findings = this.openFindings(authority.runId, review);
-      const candidate = this.access.delivery.candidate(authority.runId, review);
-      const epic = candidate.source.kind === "published_epic" ? candidate.source : null;
+      const epicContext = this.access.delivery.epicReviewContext(authority.runId, review);
       const context = {
-        scope: epic ? "epic" : "task",
-        comparisonBaseRevision: epic?.baselineRevision ?? review.parentRevision,
-        epicScopeDigest: epic?.scopeDigest ?? null,
-        epic: this.access.delivery.epicReviewContext(authority.runId, review),
+        ...this.contextScope(review),
+        epic: epicContext,
         phase: review.phase,
         revisionWarning:
           review.phase === "pre_commit"
@@ -627,8 +624,7 @@ export class ReviewJournal {
     const agent = this.access.agents.instance(review.runId, review.turnIdentity);
     const launch = turn.launch;
     const context = turn.prompt.reviewContext;
-    const candidate = this.access.delivery.candidate(review.runId, review);
-    const epic = candidate.source.kind === "published_epic" ? candidate.source : null;
+    const scope = this.contextScope(review);
     const boundContext =
       context &&
       typeof context === "object" &&
@@ -640,9 +636,9 @@ export class ReviewJournal {
       context.parentRevision === review.parentRevision &&
       context.fullTree === review.fullTree &&
       context.phase === review.phase &&
-      context.scope === (epic ? "epic" : "task") &&
-      context.comparisonBaseRevision === (epic?.baselineRevision ?? review.parentRevision) &&
-      context.epicScopeDigest === (epic?.scopeDigest ?? null);
+      context.scope === scope.scope &&
+      context.comparisonBaseRevision === scope.comparisonBaseRevision &&
+      context.epicScopeDigest === scope.epicScopeDigest;
     return (
       turn.resultEligible &&
       turn.status === "completed" &&
@@ -706,6 +702,23 @@ export class ReviewJournal {
         "Reviewer conversation cannot be reused from implementation or another candidate",
       );
     return agent;
+  }
+  private contextScope(review: ReviewEvidence) {
+    const candidate = this.access.delivery.candidate(review.runId, review);
+    const source = candidate.source;
+    const repair =
+      source.kind === "implementation"
+        ? this.access.agents.assignment(review.runId, source.assignmentId).epicRepair
+        : null;
+    return {
+      scope: source.kind === "published_epic" ? "epic" : repair ? "epic_repair" : "task",
+      comparisonBaseRevision:
+        source.kind === "published_epic"
+          ? source.baselineRevision
+          : (repair?.epicBaselineRevision ?? review.parentRevision),
+      epicScopeDigest:
+        source.kind === "published_epic" ? source.scopeDigest : (repair?.scopeDigest ?? null),
+    };
   }
   private reviewPurpose(
     runId: string,

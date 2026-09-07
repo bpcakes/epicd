@@ -105,6 +105,13 @@ type Access = {
   exactCommit(runId: string, candidate: CandidateIdentity, revision: string): CommitRecord;
   assertPublicationIdle(runId: string): void;
   epicTarget(runId: string, activeTrackerOperationId?: string): EpicDeliveryTarget;
+  epicRequirements(runId: string): ReturnType<typeof import("./epic-delivery.js").epicRequirements>;
+  assertEpicRepair(
+    runId: string,
+    taskId: string | null,
+    binding: import("../domain/tracker.js").EpicRepairBinding,
+    workspace: import("../domain/agents.js").WorkspaceIdentity,
+  ): void;
   epicId(runId: string): string;
 };
 export class DeliveryError extends Error {
@@ -143,7 +150,7 @@ export class DeliveryJournal {
       const requirements = new Map<string, z.infer<typeof RequiredCheckSchema>>();
       const epic =
         action.taskId === this.access.epicId(authority.runId)
-          ? this.access.epicTarget(authority.runId)
+          ? this.access.epicRequirements(authority.runId)
           : null;
       for (const required of [
         ...policy.requiredChecks,
@@ -269,6 +276,18 @@ export class DeliveryJournal {
           "Candidate has no current implementation assignment",
         );
       const assignment = this.access.agents.assignment(authority.runId, agent.assignmentId);
+      if (action.taskId === this.access.epicId(authority.runId) && !assignment.epicRepair)
+        throw new DeliveryError(
+          "epic_repair_required",
+          "Root implementation needs a kernel-bound epic repair assignment",
+        );
+      if (assignment.epicRepair)
+        this.access.assertEpicRepair(
+          authority.runId,
+          action.taskId,
+          assignment.epicRepair,
+          workspace,
+        );
       if (
         assignment.taskId !== action.taskId ||
         !["implementation", "epic_repair"].includes(assignment.purpose)
@@ -416,8 +435,8 @@ export class DeliveryJournal {
 
   epicReviewContext(runId: string, identity: CandidateIdentity) {
     const candidate = this.candidate(runId, identity);
-    return candidate.source.kind === "published_epic"
-      ? this.access.epicTarget(runId).context
+    return candidate.taskId === this.access.epicId(runId)
+      ? this.access.epicRequirements(runId).context
       : null;
   }
 
@@ -858,6 +877,18 @@ export class DeliveryJournal {
     const agent = this.access.agents
       .instances(runId)
       .find((item) => item.assignmentId === source.assignmentId);
+    if (agent) {
+      const assignment = this.access.agents.assignment(runId, agent.assignmentId);
+      if (candidate.taskId === this.access.epicId(runId) && !assignment.epicRepair) return false;
+      if (assignment.epicRepair) {
+        try {
+          this.access.assertEpicRepair(runId, candidate.taskId, assignment.epicRepair, candidate);
+        } catch (error) {
+          if (error instanceof DeliveryError) return false;
+          throw error;
+        }
+      }
+    }
     const writers = this.taskWriters(runId, candidate.taskId);
     return (
       candidate.status === "captured" &&

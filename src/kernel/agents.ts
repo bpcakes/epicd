@@ -85,7 +85,10 @@ export function registerAgentCapabilities(
         role: old.role,
         purpose: assignment.purpose,
         taskId: assignment.taskId,
-        candidateId: assignment.candidateId,
+        candidateId: assignment.epicRepair
+          ? (kernel.journal.delivery.latestCandidate(authority.runId, assignment.taskId!)
+              ?.candidateId ?? null)
+          : assignment.candidateId,
         workspaceId: action.workspaceId,
         workspaceGeneration: action.workspaceGeneration,
         instructions: action.instructions,
@@ -107,7 +110,7 @@ export function registerAgentCapabilities(
     if (["review", "verification", "final_review"].includes(assignment.purpose))
       throw new CapabilityRejected(
         "review_capability_required",
-        "Use run_review for candidate-bound independent review or exact-SHA verification; final epic review is not wired yet",
+        "Use run_review for candidate-bound independent review or exact-SHA verification, including whole-epic review",
       );
     if (instance.role === "orchestrator")
       throw new CapabilityRejected(
