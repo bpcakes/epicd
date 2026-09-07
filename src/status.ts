@@ -25,6 +25,10 @@ export function runStatusView(store: StateStore, runId: string) {
     publications: journal.publications.summaries(runId),
     tracker: journal.tracker.summary(runId),
     diagnostics: journal.diagnostics.summary(runId),
+    fixtures: {
+      declarations: journal.policy(runId).fixtures,
+      authority: journal.fixtures.summary(runId),
+    },
     events: store.events(runId, 20),
   };
 }

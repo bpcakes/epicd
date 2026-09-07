@@ -5,6 +5,8 @@ import { Command, Option } from "commander";
 import { render } from "ink";
 import { StateStore, defaultStatePath } from "./adapters/store.js";
 import { createRun } from "./bootstrap.js";
+import { bindFixtureProvider } from "./adapters/fixtures.js";
+import { FixtureOperationSchema } from "./domain/fixtures.js";
 import { OrchestratorController } from "./controller.js";
 import {
   AgentRoleSchema,
@@ -87,6 +89,67 @@ export function createProgram() {
     .name("epicd")
     .description("Persistent Astra engineering lead under a Git and Beads safety kernel")
     .version("0.1.0");
+  stateOption(
+    program
+      .command("grant-fixture <run-id> <fixture-id>")
+      .description(
+        "Explicitly grant bounded fixture operations; no resource is created or adopted",
+      ),
+  )
+    .requiredOption("--control-version <number>", "version observed in status", versionNumber)
+    .requiredOption(
+      "--operations <list>",
+      "comma-separated inspect,create,reset,cleanup; provisioning is not implemented yet",
+    )
+    .requiredOption("--expires-at <ISO-time>", "expiry within the next 24 hours")
+    .requiredOption(
+      "--psql-path <path>",
+      "canonical native PostgreSQL psql ELF executable, not pg_wrapper",
+    )
+    .action(
+      async (
+        runId: string,
+        fixtureId: string,
+        options: BaseOptions & {
+          controlVersion: number;
+          operations: string;
+          expiresAt: string;
+          psqlPath: string;
+        },
+      ) =>
+        withStore(options, async (store) => {
+          const journal = store.orchestration;
+          const operations = options.operations
+            .split(",")
+            .map((value) => FixtureOperationSchema.parse(value.trim()));
+          const definition = journal.fixtures.definition(runId, fixtureId);
+          const binding = await bindFixtureProvider(definition, resolve(options.psqlPath));
+          const grant = journal.fixtures.grant(runId, options.controlVersion, {
+            fixtureId,
+            binding,
+            operations,
+            expiresAt: options.expiresAt,
+          });
+          process.stdout.write(
+            `Grant ${grant.grantId} recorded for ${fixtureId}, expiring ${grant.expiresAt}. No database mutation or test-service access occurred.\n`,
+          );
+        }),
+    );
+  stateOption(
+    program
+      .command("revoke-fixture-grant <run-id> <grant-id>")
+      .description("Revoke exact fixture authority without deleting any resource"),
+  )
+    .requiredOption("--control-version <number>", "version observed in status", versionNumber)
+    .action(
+      async (runId: string, grantId: string, options: BaseOptions & { controlVersion: number }) =>
+        withStore(options, (store) => {
+          store.orchestration.fixtures.revoke(runId, options.controlVersion, grantId);
+          process.stdout.write(
+            "Fixture grant revoked. No resource was removed; a stop request is not proof that in-flight I/O stopped.\n",
+          );
+        }),
+    );
   runtimeOption(
     stateOption(
       program

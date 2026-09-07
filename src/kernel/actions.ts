@@ -138,6 +138,7 @@ export class ActionKernel {
         publications: journal.publications.summaries(authority.runId),
         tracker: journal.tracker.summary(authority.runId),
         diagnostics: journal.diagnostics.summary(authority.runId),
+        fixtures: journal.fixtures.summary(authority.runId),
         memory: journal
           .memory(authority.runId)
           .slice(-20)

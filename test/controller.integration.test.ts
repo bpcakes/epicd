@@ -154,6 +154,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     for (const kind of [
       "start_agent",
       "create_diagnostic_workspace",
+      "inspect_fixture",
       "run_validation",
       "run_review",
       "request_commit",

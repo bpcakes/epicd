@@ -54,7 +54,7 @@ The JSON declaration uses schema version 1. Include the checks that actually est
 }
 ```
 
-Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Fixture declarations do not grant provisioning authority, and the provisioning capability is not implemented yet.
+Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Fixture declarations do not themselves grant host-service authority. Explicit fixture grants and catalog inspection are implemented; provisioning and scoped fixture access for repository tests are not yet implemented.
 
 Policy is frozen when a run is created. Editing the repository file does not change an existing run's permissions or required checks.
 
@@ -110,6 +110,25 @@ During a run, the orchestrator can invoke `change_agent_settings` within frozen 
 
 `create_diagnostic_workspace` gives specialists a writable private copy for experiments. With `candidate` and `revision` both null it copies the frozen epic baseline, even while implementation is active. A candidate identity selects its captured snapshot; an explicit revision must also identify that candidate's kernel-recorded exact commit. Candidate copying requires its source workspace to be stopped. The orchestrator then chooses `start_specialist`, follow-up, inspection or replacement through the selected SDK/native Herdr driver. Diagnostic edits and reports cannot satisfy delivery validation or independent review. Restart can recover a lost creation acknowledgement only from an intact recorded copy with confirmed I/O stop; it never recreates an uncertain copy or discards its delta.
 
+## Fixture authority and inspection
+
+Review the frozen fixture declarations in `status RUN_ID --json` before granting access. A declaration identifies its canonical local PostgreSQL socket directory, port, existing role, exact database and expected owner. Grant only the operations you intend, with an ISO-8601 UTC expiry in the next 24 hours:
+
+```bash
+node dist/cli.js grant-fixture RUN_ID FIXTURE_ID --state STATE_PATH \
+  --control-version VERSION --operations inspect \
+  --expires-at EXPIRY_ISO8601 --psql-path /absolute/path/to/native/psql
+
+node dist/cli.js revoke-fixture-grant RUN_ID GRANT_ID --state STATE_PATH \
+  --control-version VERSION
+```
+
+Use the canonical native `psql` executable, not a shell wrapper such as `pg_wrapper`. The grant pins the run, policy, declaration, executable contents and filesystem/socket identities. A changed socket or provider requires a new grant. Replacing a grant revokes the old identity but preserves its history; revocation never deletes a database. Grant changes do not answer pending escalations or resume paused runs. Ordinary `respond` messages cannot issue grants.
+
+The orchestrator chooses when to invoke `inspect_fixture`. Its fixed read-only catalog query connects to the declared local server's `postgres` maintenance database using the declared role; startup files, inherited PostgreSQL environment and password files are not loaded. Only the trusted inspection process receives the exact socket, inside a separate PID/network sandbox. [The `psql` options reference](https://www.postgresql.org/docs/current/app-psql.html) documents the startup-file and error-stop controls used here.
+
+Inspection distinguishes a missing socket, an absent database, a present database and a failed query. Matching database ownership does not establish epicd ownership. Successful local authentication is not reported as proof of peer authentication, and neither observation grants service access to repository commands. `create`, `reset` and `cleanup` can be explicitly authorized within the declaration, but their capabilities remain unavailable until durable provisioning, ownership and cleanup are implemented.
+
 ## Safety and recovery
 
 The model chooses the next useful capability. The kernel validates control versions, leases, policy, workspace ownership, and evidence before executing it.
@@ -148,6 +167,12 @@ npm run format:check
 Build before testing: supervised-process and CLI tests exercise the compiled entrypoints. Do not rebuild or edit source while those tests are running.
 
 Normal integration tests use owned temporary repositories and scripted provider results. They exercise real journaling, Git operations, confinement, and process stop; they do not prove model judgment. Authenticated model/native checks are opt-in and recorded separately. See the implementation plan for remaining acceptance scenarios and their live-test commands.
+
+The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
+
+```bash
+EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin npm test -- test/fixture-postgresql.integration.test.ts
+```
 
 The original dispatcher and its dedicated tests have been removed. Their history remains in Git; old state, user repositories, and user-owned Herdr resources are not deleted by this hard cut.
 

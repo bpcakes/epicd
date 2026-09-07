@@ -25,6 +25,8 @@ import { registerCommitCapabilities } from "./kernel/commits.js";
 import { registerPublicationCapabilities } from "./kernel/publication.js";
 import { registerTrackerCapabilities } from "./kernel/tracker.js";
 import { registerSettingsCapabilities } from "./kernel/settings.js";
+import { registerFixtureCapabilities } from "./kernel/fixtures.js";
+import { PostgreSqlFixtureInspector } from "./adapters/fixtures.js";
 import {
   registerDiagnosticWorkspaceCapabilities,
   reconcileDiagnosticWorkspace,
@@ -119,6 +121,7 @@ export class OrchestratorController {
       registerPublicationCapabilities(kernel, workspaces);
       registerTrackerCapabilities(kernel, new KernelBeads(config.trackerExecutable));
       registerSettingsCapabilities(kernel, this.store);
+      registerFixtureCapabilities(kernel, new PostgreSqlFixtureInspector());
       registerDiagnosticWorkspaceCapabilities(kernel, workspaces, state.repoPath);
 
       // A replaced controller lease is never evidence that its external work stopped.
@@ -139,6 +142,12 @@ export class OrchestratorController {
         }
       }
       await reconcileActions(journal, authority, async (action) => {
+        if (action.request.action.kind === "inspect_fixture")
+          return {
+            status: "failed",
+            detail:
+              "Interrupted catalog-only inspection has no retained result. Choose a new observation if useful; no fixture mutation was performed or replayed.",
+          };
         if (action.request.action.kind === "create_diagnostic_workspace")
           return reconcileDiagnosticWorkspace(journal, workspaces, authority!, action, signal);
         if (action.request.action.kind === "inspect_repo")

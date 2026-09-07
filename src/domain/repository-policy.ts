@@ -29,6 +29,34 @@ export const RequiredCheckSchema = z.strictObject({
   stage: z.enum(["pre_commit", "exact_revision", "both"]).default("both"),
 });
 
+const PgName = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => !value.includes("\0") && Buffer.byteLength(value) <= 63,
+    "PostgreSQL names must contain 1–63 UTF-8 bytes without NUL",
+  );
+export const FixtureDefinitionSchema = z.strictObject({
+  id: z.string().min(1).max(256),
+  provider: z.literal("postgresql"),
+  socketDirectory: z
+    .string()
+    .startsWith("/")
+    .max(4096)
+    .refine(
+      (value) => !value.includes("\0") && value !== "/",
+      "Expected a local socket directory, not the filesystem root",
+    ),
+  port: z.number().int().min(1).max(65535),
+  role: PgName,
+  database: PgName,
+  expectedOwner: PgName,
+  operations: z.array(z.enum(["create", "reset", "cleanup"])).min(1),
+  environmentBinding: z.string().min(1).max(256),
+  cleanup: z.enum(["retain", "on_completion"]),
+});
+export type FixtureDefinition = z.infer<typeof FixtureDefinitionSchema>;
+
 export const RepositoryPolicySchema = z
   .strictObject({
     schemaVersion: z.literal(1),
@@ -60,23 +88,7 @@ export const RepositoryPolicySchema = z
       .array(RelativePath.refine((value) => value !== ".", "Scratch cannot be the repository root"))
       .max(100)
       .default([]),
-    fixtures: z
-      .array(
-        z.strictObject({
-          id: z.string().min(1).max(256),
-          provider: z.literal("postgresql"),
-          socketDirectory: z.string().startsWith("/").max(4096),
-          port: z.number().int().min(1).max(65535),
-          role: z.string().min(1).max(63),
-          database: z.string().min(1).max(63),
-          expectedOwner: z.string().min(1).max(63),
-          operations: z.array(z.enum(["create", "reset", "cleanup"])).min(1),
-          environmentBinding: z.string().min(1).max(256),
-          cleanup: z.enum(["retain", "on_completion"]),
-        }),
-      )
-      .max(100)
-      .default([]),
+    fixtures: z.array(FixtureDefinitionSchema).max(100).default([]),
     budgets: z
       .strictObject({
         maxWorkers: z.number().int().min(1).max(4).default(4),

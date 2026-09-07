@@ -55,7 +55,9 @@ import {
   createDiagnosticsSchema,
 } from "./diagnostic-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 16;
+import { FixtureJournal, FIXTURE_TABLES, createFixturesSchema } from "./fixture-journal.js";
+
+export const ORCHESTRATION_SCHEMA_VERSION = 17;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -72,6 +74,7 @@ export const ORCHESTRATION_TABLES = [
   ...PUBLICATION_TABLES,
   ...TRACKER_TABLES,
   ...DIAGNOSTIC_TABLES,
+  ...FIXTURE_TABLES,
 ] as const;
 
 /** Called only while initializing an empty StateStore. There is no migration path. */
@@ -140,6 +143,7 @@ export function createOrchestrationSchema(db: Database.Database): void {
   createTrackerSchema(db);
   createDecisionSourceSchema(db);
   createDiagnosticsSchema(db);
+  createFixturesSchema(db);
 }
 
 type ControlRow = {
@@ -200,8 +204,37 @@ export class OrchestrationJournal {
   readonly tracker: TrackerJournal;
   readonly decisionSource: DecisionJournal;
   readonly diagnostics: DiagnosticJournal;
+  readonly fixtures: FixtureJournal;
 
   constructor(private readonly db: Database.Database) {
+    this.fixtures = new FixtureJournal(db, {
+      control: (runId) => this.control(runId),
+      policy: (runId) => this.policy(runId),
+      operatorTransaction: (runId, version, body) =>
+        this.db
+          .transaction(() => {
+            const control = this.control(runId);
+            if (control.controlVersion !== version || control.status === "complete")
+              throw new Error(
+                "Control changed or run completed; inspect before changing fixture authority",
+              );
+            const result = body();
+            this.noteSettingsChange(runId);
+            return result;
+          })
+          .immediate(),
+      note: (runId, kind, summary) => {
+        this.recordObservation(runId, {
+          source: "operator",
+          sourceEventId: randomUUID(),
+          kind,
+          summary,
+          identity: null,
+          artifactIds: [],
+          wakesOrchestrator: true,
+        });
+      },
+    });
     this.diagnostics = new DiagnosticJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
       budget: (runId) => this.policy(runId).budgets.artifactBytes,
