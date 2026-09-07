@@ -36,10 +36,17 @@ export class OrchestratorLoop {
     private readonly source: DecisionSource,
     private readonly options: {
       pollMs?: number;
-      onHealthCheck?: () => Promise<void>;
+      healthIntervalMs?: number;
+      onHealthCheck?: (signal?: AbortSignal) => Promise<void>;
       beforeDecision?: (signal?: AbortSignal) => Promise<void>;
     } = {},
-  ) {}
+  ) {
+    if (
+      options.healthIntervalMs !== undefined &&
+      (!Number.isSafeInteger(options.healthIntervalMs) || options.healthIntervalMs < 1)
+    )
+      throw new Error("Health interval must be a positive integer");
+  }
 
   async run(authority: ControllerAuthority, signal?: AbortSignal): Promise<ControlState["status"]> {
     const journal = this.kernel.journal;
@@ -166,21 +173,23 @@ export class OrchestratorLoop {
               ? AbortSignal.any([signal, monitor.signal])
               : monitor.signal;
             const watch = async () => {
-              let nextHealth = Date.now() + 30_000;
+              let nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
               while (journal.control(authority.runId).status === "active") {
                 this.kernel.assertHealthy();
                 journal.assertAuthority(authority);
                 if (Date.now() >= nextHealth) {
-                  await this.options.onHealthCheck?.();
-                  nextHealth = Date.now() + 30_000;
+                  await this.options.onHealthCheck?.(watchedSignal);
+                  nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
                 }
                 await delay(this.options.pollMs ?? 250, undefined, { signal: watchedSignal });
               }
             };
+            const watching = watch();
             try {
-              await Promise.race([operation, watch()]);
+              await Promise.race([operation, watching]);
             } finally {
               monitor.abort();
+              await watching.catch(() => undefined);
             }
           }
         }
@@ -213,7 +222,7 @@ export class OrchestratorLoop {
   ): Promise<DecisionSourceOutcome | null> {
     const sourceJournal = this.kernel.journal.decisionSource;
     let execution = initial;
-    let nextHealth = Date.now() + 30_000;
+    let nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
     for (;;) {
       signal?.throwIfAborted();
       this.kernel.assertHealthy();
@@ -237,8 +246,8 @@ export class OrchestratorLoop {
         return last.outcome;
       if (last?.retryNotBefore && Date.now() < Date.parse(last.retryNotBefore)) {
         if (Date.now() >= nextHealth) {
-          await this.options.onHealthCheck?.();
-          nextHealth = Date.now() + 30_000;
+          await this.options.onHealthCheck?.(signal);
+          nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
         }
         await delay(this.options.pollMs ?? 250, undefined, { signal });
         continue;
@@ -358,7 +367,7 @@ export class OrchestratorLoop {
       );
     request.signal.addEventListener("abort", onInterrupted, { once: true });
     const health = async () => {
-      let nextHealth = Date.now() + 30_000;
+      let nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
       for (;;) {
         await delay(this.options.pollMs ?? 250, undefined, { signal: monitor.signal });
         this.kernel.assertHealthy();
@@ -371,11 +380,12 @@ export class OrchestratorLoop {
         )
           throw new Error("Coordinator request authority changed before settlement");
         if (Date.now() >= nextHealth) {
-          await this.options.onHealthCheck?.();
-          nextHealth = Date.now() + 30_000;
+          await this.options.onHealthCheck?.(monitor.signal);
+          nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
         }
       }
     };
+    const watching = health();
     try {
       // Monitor independently: a native runtime which ignores cancellation must not hold operator control hostage.
       // A late response has no callback that can admit an action or overwrite the recorded uncertainty.
@@ -393,7 +403,7 @@ export class OrchestratorLoop {
             throw new Error("Coordinator request authority changed before dispatch");
           return this.source.decide(input, request.signal);
         }),
-        health(),
+        watching,
         interrupted,
       ]);
     } catch (error) {
@@ -403,6 +413,7 @@ export class OrchestratorLoop {
       signal?.removeEventListener("abort", abortRequest);
       request.signal.removeEventListener("abort", onInterrupted);
       monitor.abort();
+      await watching.catch(() => undefined);
     }
   }
 
@@ -412,7 +423,7 @@ export class OrchestratorLoop {
     deadline: string | null,
     signal?: AbortSignal,
   ): Promise<void> {
-    let nextHealth = Date.now() + 30_000;
+    let nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
     while (!signal?.aborted) {
       this.kernel.assertHealthy();
       this.kernel.journal.assertAuthority(authority);
@@ -420,8 +431,8 @@ export class OrchestratorLoop {
       if (this.kernel.journal.observations(authority.runId, afterCursor, 1, true).length) return;
       if (deadline && Date.now() >= Date.parse(deadline)) return;
       if (Date.now() >= nextHealth) {
-        await this.options.onHealthCheck?.();
-        nextHealth = Date.now() + 30_000;
+        await this.options.onHealthCheck?.(signal);
+        nextHealth = Date.now() + (this.options.healthIntervalMs ?? 30_000);
       }
       await delay(this.options.pollMs ?? 250, undefined, { signal });
     }

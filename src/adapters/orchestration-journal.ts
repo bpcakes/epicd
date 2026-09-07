@@ -64,8 +64,13 @@ import { FixtureJournal, FIXTURE_TABLES, createFixturesSchema } from "./fixture-
 import { observeEpicDelivery, epicRequirements } from "./epic-delivery.js";
 import { scopeClosure } from "./scope-closure.js";
 import { bindEpicRepair, assertEpicRepair } from "./epic-repair.js";
+import {
+  RepositoryAdmissionJournal,
+  REPOSITORY_ADMISSION_TABLES,
+  createRepositoryAdmissionSchema,
+} from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 24;
+export const ORCHESTRATION_SCHEMA_VERSION = 25;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -84,6 +89,7 @@ export const ORCHESTRATION_TABLES = [
   ...TRACKER_COMMIT_TABLES,
   ...DIAGNOSTIC_TABLES,
   ...FIXTURE_TABLES,
+  ...REPOSITORY_ADMISSION_TABLES,
 ] as const;
 
 /** Called only while initializing an empty StateStore. There is no migration path. */
@@ -154,6 +160,7 @@ export function createOrchestrationSchema(db: Database.Database): void {
   createDecisionSourceSchema(db);
   createDiagnosticsSchema(db);
   createFixturesSchema(db);
+  createRepositoryAdmissionSchema(db);
 }
 
 type ControlRow = {
@@ -216,8 +223,12 @@ export class OrchestrationJournal {
   readonly decisionSource: DecisionJournal;
   readonly diagnostics: DiagnosticJournal;
   readonly fixtures: FixtureJournal;
+  readonly repositoryAdmission: RepositoryAdmissionJournal;
 
-  constructor(private readonly db: Database.Database) {
+  constructor(
+    private readonly db: Database.Database,
+    private readonly assertStorage: () => void,
+  ) {
     this.fixtures = new FixtureJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
       action: (runId, actionId) => this.action(runId, actionId),
@@ -440,6 +451,9 @@ export class OrchestrationJournal {
     this.trackerCommits = new TrackerCommitJournal(db, this, (authority, body) =>
       this.transaction(authority, body),
     );
+    this.repositoryAdmission = new RepositoryAdmissionJournal(db, this, (authority, body) =>
+      this.transaction(authority, body),
+    );
   }
 
   hasRun(runId: string): boolean {
@@ -612,6 +626,7 @@ export class OrchestrationJournal {
   }
 
   assertAuthority(authority: ControllerAuthority): void {
+    this.assertStorage();
     const row = this.db
       .prepare(
         `SELECT runs.state_json FROM run_leases JOIN runs USING(run_id)

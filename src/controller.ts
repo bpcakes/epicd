@@ -42,6 +42,7 @@ import { ControlledDecisionSource } from "./orchestrator/sdk-source.js";
 import { OrchestratorLoop } from "./orchestrator/loop.js";
 import { runStatusView } from "./status.js";
 import { redactSensitiveText } from "./util/redact.js";
+import { RepositoryAdmission } from "./kernel/repository-admission.js";
 
 export function agentContract(state: RunState, role: AgentRole) {
   const settings = resolveAgentRoleSettings(state, role);
@@ -100,6 +101,7 @@ export class OrchestratorController {
     this.running = true;
     let authority: ControllerAuthority | null = null;
     let kernel: ActionKernel | null = null;
+    let repositoryAdmission: RepositoryAdmission | null = null;
     try {
       const lease = this.store.acquireLease(this.runId);
       authority = { runId: this.runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
@@ -113,11 +115,15 @@ export class OrchestratorController {
         throw new Error(
           "Repository metadata identity changed; the recorded run cannot attach to this checkout",
         );
+      repositoryAdmission = new RepositoryAdmission(this.store, authority, currentRepository);
+      await repositoryAdmission.enter(signal);
+      if (journal.control(this.runId).status === "complete") return this.status();
+      const admission = repositoryAdmission;
       const driver = (this.options.driver ?? controlledDriver)(this.store, state);
       if (driver.kind !== state.runtime)
         throw new Error("Driver does not match the persisted runtime");
       const workspaces = new WorkspaceManager(journal, config.workspaceRoot);
-      kernel = new ActionKernel(journal);
+      kernel = new ActionKernel(journal, (dispatchSignal) => admission.assertOwned(dispatchSignal));
       const contractFor = (role: AgentRole) => agentContract(this.store.get(this.runId)!, role);
       registerAgentCapabilities(kernel, driver, contractFor);
       registerDeliveryCapabilities(kernel, workspaces);
@@ -325,11 +331,17 @@ export class OrchestratorController {
         await new OrchestratorLoop(
           kernel,
           {
-            decide: (input, turnSignal) => source.decide(input, turnSignal),
+            decide: async (input, turnSignal) => {
+              await admission.assertOwned(turnSignal);
+              return source.decide(input, turnSignal);
+            },
             reconcile: (attempt) => source.reconcile(attempt),
           },
           {
+            healthIntervalMs: 2000,
+            onHealthCheck: (healthSignal) => admission.assertOwned(healthSignal),
             beforeDecision: async (turnSignal) => {
+              await admission.assertOwned(turnSignal);
               const next = await this.coordinator(
                 currentAuthority,
                 this.store.get(this.runId)!,
@@ -388,8 +400,18 @@ export class OrchestratorController {
           }
         }
       } finally {
-        if (authority) this.store.releaseLease(this.runId, authority.ownerToken);
-        this.running = false;
+        try {
+          if (
+            authority &&
+            repositoryAdmission &&
+            !signal?.aborted &&
+            this.store.orchestration.control(this.runId).status === "complete"
+          )
+            await repositoryAdmission.release(signal);
+        } finally {
+          if (authority) this.store.releaseLease(this.runId, authority.ownerToken);
+          this.running = false;
+        }
       }
     }
     return this.status();

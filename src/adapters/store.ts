@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -23,6 +23,7 @@ import {
   ORCHESTRATION_SCHEMA_VERSION,
 } from "./orchestration-journal.js";
 import { RepositoryPolicySchema, type RepositoryPolicy } from "../domain/repository-policy.js";
+import type { StateFileIdentity } from "../domain/repository-admission.js";
 
 type RunRow = {
   run_id: string;
@@ -241,13 +242,17 @@ export class StateStore {
   readonly path: string;
   private readonly db: Database.Database;
   readonly orchestration: OrchestrationJournal;
+  private readonly fileIdentity: StateFileIdentity;
 
   constructor(path = defaultStatePath()) {
     this.path = path;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new Database(path, { timeout: 5_000 });
-    this.orchestration = new OrchestrationJournal(this.db);
+    this.orchestration = new OrchestrationJournal(this.db, () => {
+      this.storageIdentity();
+    });
     try {
+      this.fileIdentity = this.currentStorageIdentity();
       this.initialize();
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
@@ -259,6 +264,21 @@ export class StateStore {
     for (const databaseFile of [path, `${path}-wal`, `${path}-shm`]) {
       if (existsSync(databaseFile)) chmodSync(databaseFile, 0o600);
     }
+  }
+
+  /** Pin the opened state location; copying or replacing a file cannot borrow run ownership. */
+  storageIdentity(): StateFileIdentity {
+    const current = this.currentStorageIdentity();
+    if (JSON.stringify(current) !== JSON.stringify(this.fileIdentity))
+      throw new Error("State file identity changed while this store was open");
+    return { ...current };
+  }
+  private currentStorageIdentity(): StateFileIdentity {
+    const path = realpathSync(this.path),
+      stat = statSync(path, { bigint: true });
+    if (!stat.isFile() || stat.nlink !== 1n)
+      throw new Error("State storage must be one privately owned regular file");
+    return { path, device: stat.dev.toString(), inode: stat.ino.toString() };
   }
 
   /** Hard cut: initialize empty storage or reopen this exact format. Never migrate existing data. */
@@ -814,6 +834,7 @@ export class StateStore {
   }
 
   private acquire(runId: string): RunLease {
+    this.storageIdentity();
     const ownerToken = randomUUID();
     const leaseId = randomUUID();
     this.db.exec("BEGIN IMMEDIATE");

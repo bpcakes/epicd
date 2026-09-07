@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Use a fresh state path. Unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 25. Use a fresh state path; unsupported existing data is left intact.
 
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
@@ -101,7 +101,11 @@ node dist/cli.js run EPIC_ID --repo /path/to/repository \
   --state /path/to/private-state/native.sqlite3 --runtime herdr
 ```
 
-The SDK and Herdr examples are alternatives. Use one state path for a repository: linked-checkout exclusion is enforced within that database, not across independently created state files. Cross-state repository admission fencing remains unfinished; do not run independent state stores against the same repository concurrently.
+The SDK and Herdr examples are alternatives. Before invoking either runtime, the controller acquires `refs/epicd/run-owner` in the repository's physical common Git directory. Separate state files and linked checkouts therefore contend for the same run reservation. Creating another state file does not bypass ownership. The reservation binds the run, a unique owner identity and the state file's canonical path/device/inode; copying, moving or replacing state cannot borrow it.
+
+Pausing, detaching or quarantining a run does not release its reservation. Inspect its diagnostic metadata with `git -C /path/to/repository cat-file -p refs/epicd/run-owner` to locate the recorded owning run and state file. Treat those bytes as metadata, not takeover authority. Do not delete the ref to bypass an interrupted run or unsupported state. Automatic takeover and abandoned-resource disposal are not implemented.
+
+Acquisition and release have durable intents and recorded I/O stop evidence. Lost acknowledgements can be inspected without repeating a write; matching refs or a replacement lease do not prove an unknown old operation stopped. Ownership is checked before coordinator calls and action dispatch, with periodic checks during waits. Verified completion permits exact-owner compare-and-swap release, and a completed run can finish that cleanup on resume without initializing a model. Delivered branches, user checkouts and indexes are retained. Other resource cleanup remains unfinished.
 
 The command prints the new run ID. Subsequent commands target that exact ID:
 

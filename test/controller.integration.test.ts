@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { RUN_OWNERSHIP_REF } from "../dist/adapters/publication-git.js";
 import { StateStore } from "../dist/adapters/store.js";
 import { ControlledSdkRuntime } from "../dist/adapters/controlled-sdk.js";
 import { OrchestratorController, controlledDriver } from "../dist/controller.js";
@@ -400,5 +401,96 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     expect(invoked).toBe(false);
     expect(f.store.controllerLease(f.state.runId)?.leaseId).toBe(lease.leaseId);
     expect(f.store.orchestration.agents.instances(f.state.runId)).toEqual([]);
+  });
+
+  it.each(["sdk", "herdr"] as const)(
+    "rejects another state file before invoking its %s runtime even after the owning controller detached",
+    async (runtime) => {
+      const f = fixture();
+      await new OrchestratorController(f.store, f.state.runId, {
+        driver: f.driverFactory([question]),
+      }).run();
+      expect(f.store.controllerLease(f.state.runId)).toBeNull();
+      const other = new StateStore(join(f.root, "other.sqlite3"));
+      cleanup.push(() => other.close());
+      const next = other.create(
+        {
+          ...f.state,
+          runId: randomUUID(),
+          runtime,
+          runtimeConfiguration: {
+            ...f.state.runtimeConfiguration!,
+            herdr:
+              runtime === "herdr"
+                ? {
+                    executable: "/usr/bin/false",
+                    sessionName: "unopened",
+                    workspaceId: "unopened",
+                  }
+                : null,
+          },
+        },
+        RepositoryPolicySchema.parse({ schemaVersion: 1 }),
+      );
+      let invoked = false;
+      const controller = new OrchestratorController(other, next.runId, {
+        driver: () => {
+          invoked = true;
+          throw new Error("Unexpected runtime");
+        },
+      });
+      await expect(controller.run()).rejects.toThrow("Another run owns");
+      expect(invoked).toBe(false);
+      expect(other.orchestration.agents.instances(next.runId)).toEqual([]);
+      expect(other.orchestration.actions(next.runId)).toEqual([]);
+      expect(other.controllerLease(next.runId)).toBeNull();
+      expect(f.git("rev-parse", RUN_OWNERSHIP_REF)).toBe(
+        f.store.orchestration.repositoryAdmission.record(f.state.runId)!.revision,
+      );
+    },
+  );
+
+  it("refuses a coordinator's next action after the repository reservation is replaced", async () => {
+    const f = fixture();
+    const factory = f.driverFactory([
+      {
+        kind: "record_memory",
+        entry: {
+          kind: "strategy",
+          content: "Must not be admitted after ownership changes",
+          scope: "run",
+          taskId: null,
+          confidence: "hypothesis",
+          observationIds: [],
+          evidenceIds: [],
+          revision: null,
+          environmentGeneration: null,
+          supersedes: null,
+        },
+      },
+    ]);
+    const controller = new OrchestratorController(f.store, f.state.runId, {
+      driver: (store) => {
+        const actual = factory(store);
+        return {
+          ...actual,
+          async run(...args) {
+            const result = await actual.run(...args);
+            f.git("update-ref", RUN_OWNERSHIP_REF, f.state.epicBaseRevision);
+            return result;
+          },
+        };
+      },
+    });
+    await expect(controller.run()).rejects.toThrow(
+      /ownership changed|settled repository ownership/,
+    );
+    expect(f.store.orchestration.repositoryAdmission.record(f.state.runId)?.phase).toBe("conflict");
+    expect(f.store.orchestration.memory(f.state.runId)).toEqual([]);
+    expect(f.git("rev-parse", RUN_OWNERSHIP_REF)).toBe(f.state.epicBaseRevision);
+    expect(
+      f.store.orchestration.agents.turns(f.state.runId).every((turn) => turn.stopEvidence),
+    ).toBe(true);
+    expect(f.store.controllerLease(f.state.runId)).toBeNull();
   });
 });

@@ -14,6 +14,9 @@ import { ActionKernel } from "../src/kernel/actions.js";
 import { registerTrackerCapabilities, reconcileTracker } from "../src/kernel/tracker.js";
 import { OrchestratorLoop, type DecisionSource } from "../src/orchestrator/loop.js";
 import { reconcileActions } from "../src/kernel/reconcile.js";
+import { RepositoryAdmission } from "../src/kernel/repository-admission.js";
+import { PublicationGit, RUN_OWNERSHIP_REF } from "../src/adapters/publication-git.js";
+import { OrchestratorController } from "../src/controller.js";
 
 type Setup = Awaited<ReturnType<typeof closureFixture>>;
 async function deliverTask(s: Setup) {
@@ -86,6 +89,12 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
   it("closes the independently verified root and completes with a proven tracker-only descendant without changing the user checkout", async () => {
     const s = await closureFixture(),
       run = s.authority.runId;
+    const admission = new RepositoryAdmission(
+      s.store,
+      s.authority,
+      await new PublicationGit().bind(s.source),
+    );
+    await admission.enter();
     await deliverTask(s);
     const revision = (await publishTracker(s)).revision;
     expect((await closeRoot(s, revision)).status).toBe("rejected");
@@ -125,7 +134,20 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     expect(git(s.source, "rev-parse", "HEAD")).toBe(s.head);
     expect(readFileSync(join(s.source, "app.txt"), "utf8")).toBe("user-owned work\n");
     expect(readFileSync(join(s.source, ".git/index"))).toEqual(index);
-    expect(s.reopen().get(run)).not.toBeNull();
+    expect(s.journal.repositoryAdmission.record(run)?.phase).toBe("owned");
+    s.store.releaseLease(run, s.authority.ownerToken);
+    const reopened = s.reopen();
+    const controller = new OrchestratorController(reopened, run, {
+      driver: () => {
+        throw new Error("Completed-run cleanup must not initialize a model");
+      },
+    });
+    const cleaned = await controller.run();
+    expect(cleaned.repositoryAdmission).toMatchObject({ phase: "released", ioStopped: true });
+    expect(git(s.source, "for-each-ref", RUN_OWNERSHIP_REF)).toBe("");
+    expect(git(s.source, "rev-parse", `refs/heads/epicd/${run}`)).toBe(trackerPublication.revision);
+    expect(readFileSync(join(s.source, ".git/index"))).toEqual(index);
+    expect(readFileSync(join(s.source, "app.txt"), "utf8")).toBe("user-owned work\n");
   }, 45000);
 
   it("can close a delivered nested container while an unrelated root task remains open", async () => {

@@ -15,6 +15,7 @@ import { KernelGit } from "./kernel-git.js";
 
 const MAX_PACK = 64 * 1024 * 1024;
 export const PUBLICATION_LOCK_REF = "refs/epicd/publication-lock";
+export const RUN_OWNERSHIP_REF = "refs/epicd/run-owner";
 type Guard = (signal: AbortSignal) => Promise<void>;
 type Head = { ref: string; raw: string; target: string | null; revision: string | null };
 export class PublicationGitError extends Error {
@@ -51,6 +52,12 @@ export const publicationKeepMessage = (pack: PublicationPack) =>
  * Ownership-ref release requires an exact-object compare-and-swap and caller stop proof.
  */
 export class PublicationGit {
+  constructor(private readonly ownership: "publication" | "run" = "publication") {}
+
+  private get lockRef() {
+    return this.ownership === "run" ? RUN_OWNERSHIP_REF : PUBLICATION_LOCK_REF;
+  }
+
   /** Read-only planning: persist the returned ownership blob identity before either write. */
   async planLock(repository: PublicationRepository, content: string, signal?: AbortSignal) {
     if (Buffer.byteLength(content) > 4096) conflict("Publication ownership record is too large");
@@ -71,8 +78,8 @@ export class PublicationGit {
   ) {
     if ((await this.planLock(repository, content, signal)) !== revision)
       conflict("Publication lock object differs from its intent");
-    await this.directRef(repository, PUBLICATION_LOCK_REF, signal);
-    if ((await refValue(gitFor(repository), PUBLICATION_LOCK_REF, signal)) !== null)
+    await this.directRef(repository, this.lockRef, signal);
+    if ((await refValue(gitFor(repository), this.lockRef, signal)) !== null)
       throw new PublicationGitError(
         "publication_lock_busy",
         "Another publication owns the repository lock ref",
@@ -86,11 +93,11 @@ export class PublicationGit {
     )
       conflict("Publication ownership object changed");
     await git.text(["update-ref", "--stdin"], {
-      input: `start\noption no-deref\ncreate ${PUBLICATION_LOCK_REF} ${revision}\nprepare\n`,
+      input: `start\noption no-deref\ncreate ${this.lockRef} ${revision}\nprepare\n`,
       signal,
       beforeRefCommit: async (lockedSignal) => {
         await this.assertBinding(repository, lockedSignal);
-        await this.directRef(repository, PUBLICATION_LOCK_REF, lockedSignal);
+        await this.directRef(repository, this.lockRef, lockedSignal);
         await guard(lockedSignal);
         lockedSignal.throwIfAborted();
       },
@@ -98,8 +105,29 @@ export class PublicationGit {
   }
   async inspectLock(repository: PublicationRepository, signal?: AbortSignal) {
     await this.assertBinding(repository, signal);
-    await this.directRef(repository, PUBLICATION_LOCK_REF, signal);
-    return refValue(gitFor(repository), PUBLICATION_LOCK_REF, signal);
+    await this.directRef(repository, this.lockRef, signal);
+    return refValue(gitFor(repository), this.lockRef, signal);
+  }
+  async assertLockContent(
+    repository: PublicationRepository,
+    revision: string,
+    content: string,
+    signal?: AbortSignal,
+  ) {
+    if ((await this.planLock(repository, content, signal)) !== revision)
+      conflict("Ownership bytes differ from the recorded object identity");
+    const git = gitFor(repository);
+    const expected = `${revision} blob ${Buffer.byteLength(content)}`;
+    if (
+      (
+        await git.text(["cat-file", "--batch-check"], {
+          input: `${revision}\n`,
+          ...optionalSignal(signal),
+        })
+      ).trim() !== expected ||
+      (await git.text(["cat-file", "blob", revision], optionalSignal(signal))) !== content
+    )
+      conflict("Retained ownership object differs from its exact content");
   }
   /** CAS release cannot delete a newer owner's ref, even if ownership changes after inspection. */
   async releaseLock(
@@ -115,11 +143,11 @@ export class PublicationGit {
     await guard(signal);
     signal.throwIfAborted();
     await gitFor(repository).text(["update-ref", "--stdin"], {
-      input: `start\noption no-deref\ndelete ${PUBLICATION_LOCK_REF} ${revision}\nprepare\n`,
+      input: `start\noption no-deref\ndelete ${this.lockRef} ${revision}\nprepare\n`,
       signal,
       beforeRefCommit: async (lockedSignal) => {
         await this.assertBinding(repository, lockedSignal);
-        await this.directRef(repository, PUBLICATION_LOCK_REF, lockedSignal);
+        await this.directRef(repository, this.lockRef, lockedSignal);
         await guard(lockedSignal);
         lockedSignal.throwIfAborted();
       },

@@ -7,6 +7,7 @@ export function runStatusView(store: StateStore, runId: string) {
   const state = store.get(runId);
   if (!state) throw new RunNotFoundError(runId);
   const journal = store.orchestration;
+  const admission = journal.repositoryAdmission.record(runId);
   return {
     runId,
     repoPath: state.repoPath,
@@ -16,6 +17,14 @@ export function runStatusView(store: StateStore, runId: string) {
     settings: resolveAgentSettings(state),
     control: journal.control(runId),
     controller: store.controllerLease(runId),
+    repositoryAdmission: admission
+      ? {
+          reservationId: admission.reservationId,
+          phase: admission.phase,
+          ioStopped: admission.ioStopped,
+          detail: admission.detail,
+        }
+      : null,
     escalation: journal.pendingEscalation(runId),
     agents: journal.agents.summaries(runId),
     actions: journal.actions(runId).slice(-20).map(actionContextRecord),
@@ -42,6 +51,7 @@ export function humanRunStatus(status: RunStatus): string {
     `Orchestrator ${status.settings.orchestrator.model} / ${status.settings.orchestrator.reasoningEffort}`,
     `Decisions ${status.control.decisionsUsed}/${status.control.maxDecisions} · control version ${status.control.controlVersion}`,
     `Controller ${status.controller ? `${status.controller.pid} (${status.controller.alive ? "alive" : "stale"}, lease ${status.controller.leaseId})` : "not attached"}`,
+    `Repository ownership ${status.repositoryAdmission ? `${status.repositoryAdmission.phase} (I/O ${status.repositoryAdmission.ioStopped ? "stopped" : "unproven"})` : "not admitted"}`,
   ];
   if (status.escalation)
     lines.push(`Question ${status.escalation.escalationId}: ${status.escalation.question}`);

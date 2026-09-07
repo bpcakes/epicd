@@ -22,7 +22,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function fixture() {
+function fixture(beforeDispatch?: (signal: AbortSignal) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), "epicd-loop-"));
   roots.push(root);
   const store = new StateStore(join(root, "state.sqlite3"));
@@ -34,7 +34,7 @@ function fixture() {
     ownerToken: lease.ownerToken,
     leaseId: lease.leaseId,
   };
-  const kernel = new ActionKernel(store.orchestration);
+  const kernel = new ActionKernel(store.orchestration, beforeDispatch);
   return { store, kernel, authority };
 }
 
@@ -223,6 +223,255 @@ describe("always engaged action loop", () => {
     expect(
       store.orchestration.actions(authority.runId).map((action) => action.request.action.kind),
     ).toEqual(["start_agent", "interrupt_agent", "escalate"]);
+  });
+
+  it("waits for a genuinely delayed dispatch guard, then intervenes on the worker event before completion", async () => {
+    let releaseGuard!: () => void, finishWorker!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGuard = resolve;
+    });
+    const worker = new Promise<void>((resolve) => {
+      finishWorker = resolve;
+    });
+    let guardVerified = false,
+      workerActive = false;
+    const { store, kernel, authority } = fixture(async () => {
+      await gate;
+      guardVerified = true;
+    });
+    kernel.registerExternal("start_agent", async (context) => {
+      expect(guardVerified).toBe(true);
+      workerActive = true;
+      context.observe({
+        source: "worker",
+        sourceEventId: "guarded-command",
+        kind: "command.started",
+        summary: "The worker started only after repository ownership was checked",
+        artifactIds: [],
+        identity: null,
+        wakesOrchestrator: true,
+      });
+      await worker;
+      workerActive = false;
+      return { kind: "resource", resourceId: "worker-result", generation: 1 };
+    });
+    kernel.registerLocal("interrupt_agent", () => {
+      expect(workerActive).toBe(true);
+      finishWorker();
+      return { kind: "resource", resourceId: "interrupted", generation: 1 };
+    });
+    let calls = 0;
+    const source: DecisionSource = {
+      async decide(input) {
+        calls++;
+        if (calls === 1)
+          return response(input, {
+            kind: "start_agent",
+            role: "implementation",
+            purpose: "implementation",
+            taskId: "demo.1",
+            workspaceId: "copy",
+            workspaceGeneration: 1,
+            candidateId: null,
+            instructions: "Implement independently",
+          });
+        if (calls === 2) {
+          expect(workerActive).toBe(false);
+          expect(guardVerified).toBe(false);
+          expect(input.context.observations.some((event) => event.kind === "command.started")).toBe(
+            false,
+          );
+          releaseGuard();
+          return response(input, {
+            kind: "wait_for_events",
+            afterCursor: input.context.observationCursor,
+            deadline: null,
+          });
+        }
+        if (calls === 3) {
+          expect(workerActive).toBe(true);
+          expect(input.context.observations.some((event) => event.kind === "command.started")).toBe(
+            true,
+          );
+          return response(input, {
+            kind: "interrupt_agent",
+            agentId: "worker",
+            agentGeneration: 1,
+            turnId: "turn",
+          });
+        }
+        return response(input, question);
+      },
+    };
+    try {
+      expect(await new OrchestratorLoop(kernel, source).run(authority)).toBe("awaiting_user");
+      expect(calls).toBe(4);
+      expect(
+        store.orchestration.actions(authority.runId).map((action) => action.request.action.kind),
+      ).toEqual(["start_agent", "wait_for_events", "interrupt_agent", "escalate"]);
+    } finally {
+      releaseGuard();
+      finishWorker();
+      kernel.interruptAll();
+      await kernel.drain();
+    }
+  });
+
+  it("rechecks an operator pause after an asynchronous guard and never starts the external handler", async () => {
+    let releaseGuard!: () => void, enteredGuard!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGuard = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      enteredGuard = resolve;
+    });
+    const { store, kernel, authority } = fixture(async () => {
+      enteredGuard();
+      await gate;
+    });
+    let invoked = false;
+    kernel.registerExternal("start_agent", async () => {
+      invoked = true;
+      return { kind: "resource", resourceId: "unexpected-worker", generation: 1 };
+    });
+    const journal = store.orchestration;
+    const ticket = journal.beginDecision(
+      authority,
+      journal.latestObservationCursor(authority.runId),
+      journal.control(authority.runId).controlVersion,
+    );
+    const running = await kernel.execute(
+      {
+        explanation: "Guarded worker admission",
+        evidenceIds: [],
+        request: {
+          schemaVersion: 1,
+          decisionId: ticket.decisionId,
+          observationCursor: ticket.observationCursor,
+          expectedControlVersion: ticket.expectedControlVersion,
+          action: {
+            kind: "start_agent",
+            role: "implementation",
+            purpose: "implementation",
+            taskId: "demo.1",
+            workspaceId: "copy",
+            workspaceGeneration: 1,
+            candidateId: null,
+            instructions: "Implement only while authorized",
+          },
+        },
+      },
+      authority,
+    );
+    if (running.status !== "running") throw new Error("Expected guarded operation");
+    const operation = kernel.operation(running.operationId)!;
+    try {
+      await entered;
+      journal.operatorControl(authority.runId, journal.control(authority.runId).controlVersion, {
+        kind: "pause",
+      });
+      releaseGuard();
+      expect(await operation).toMatchObject({ status: "rejected", code: "stale_dispatch" });
+      expect(invoked).toBe(false);
+    } finally {
+      releaseGuard();
+      kernel.interruptAll();
+      await kernel.drain();
+    }
+  });
+
+  it("cancels and drains a health inspection before dispatching the completed coordinator decision", async () => {
+    const { kernel, authority } = fixture();
+    const abort = new AbortController();
+    let releaseDecision!: () => void,
+      releaseHealth!: () => void,
+      enteredHealth!: () => void,
+      stoppedHealth!: () => void;
+    const decisionReady = new Promise<void>((resolve) => {
+      releaseDecision = resolve;
+    });
+    const healthDrain = new Promise<void>((resolve) => {
+      releaseHealth = resolve;
+    });
+    const healthEntered = new Promise<void>((resolve) => {
+      enteredHealth = resolve;
+    });
+    const stopRequested = new Promise<void>((resolve) => {
+      stoppedHealth = resolve;
+    });
+    let drained = false,
+      workerStarted = false,
+      calls = 0;
+    kernel.registerExternal("start_agent", async () => {
+      expect(drained).toBe(true);
+      workerStarted = true;
+      return { kind: "resource", resourceId: "guarded-worker", generation: 1 };
+    });
+    const source: DecisionSource = {
+      async decide(input) {
+        calls++;
+        if (calls > 1) return response(input, question);
+        await decisionReady;
+        return response(input, {
+          kind: "start_agent",
+          role: "implementation",
+          purpose: "implementation",
+          taskId: "demo.1",
+          workspaceId: "copy",
+          workspaceGeneration: 1,
+          candidateId: null,
+          instructions: "Start only after the coordinator monitor has settled",
+        });
+      },
+    };
+    const running = new OrchestratorLoop(kernel, source, {
+      pollMs: 1,
+      healthIntervalMs: 1,
+      onHealthCheck: async (signal) => {
+        enteredHealth();
+        if (!signal) throw new Error("Health inspection needs its monitor's cancellation signal");
+        await new Promise<void>((resolve) => {
+          const stop = () => {
+            stoppedHealth();
+            resolve();
+          };
+          if (signal.aborted) stop();
+          else signal.addEventListener("abort", stop, { once: true });
+        });
+        await healthDrain;
+        drained = true;
+      },
+    }).run(authority, abort.signal);
+    const outcome = running.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    const premature = outcome.then(() => {
+      throw new Error("Loop finished before its health inspection drained");
+    });
+    // Attach immediately: a failed assertion must not create an unhandled watcher rejection.
+    void premature.catch(() => undefined);
+    try {
+      await Promise.race([healthEntered, premature]);
+      releaseDecision();
+      await Promise.race([stopRequested, premature]);
+      await delay(1); // Give queued dispatch callbacks a turn while the explicit drain barrier remains held.
+      expect(workerStarted).toBe(false);
+      expect(drained).toBe(false);
+      releaseHealth();
+      const result = await outcome;
+      if ("error" in result) throw result.error;
+      expect(result.value).toBe("awaiting_user");
+      expect(workerStarted).toBe(true);
+      expect(drained).toBe(true);
+      expect(calls).toBe(2);
+    } finally {
+      abort.abort();
+      releaseDecision();
+      releaseHealth();
+      await outcome;
+      await kernel.drain();
+    }
   });
 
   it.each([true, false])(

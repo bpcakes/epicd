@@ -43,7 +43,10 @@ export class ActionKernel {
   >();
   private integrityError: Error | null = null;
 
-  constructor(readonly journal: OrchestrationJournal) {
+  constructor(
+    readonly journal: OrchestrationJournal,
+    private readonly beforeDispatch?: (signal: AbortSignal) => Promise<void>,
+  ) {
     this.registerLocal("inspect_artifact", ({ authority }, action) => {
       try {
         const page = journal.diagnostics.read(
@@ -252,6 +255,7 @@ export class ActionKernel {
     };
     try {
       if (handler.mode === "local") {
+        if (this.beforeDispatch) await this.beforeDispatch(controller.signal);
         const settled = this.journal.executeLocalAction(authority, record.actionId, () => {
           const payload = handler.run(context, record.request.action);
           // Local handlers cannot commit a transaction before an asynchronous effect completes.
@@ -289,6 +293,11 @@ export class ActionKernel {
       try {
         assertCurrentDispatch(this.journal, authority, record);
         controller.signal.throwIfAborted();
+        if (this.beforeDispatch) {
+          await this.beforeDispatch(controller.signal);
+          assertCurrentDispatch(this.journal, authority, record);
+          controller.signal.throwIfAborted();
+        }
         const payload = ActionPayloadSchema.parse(
           await handler.run(context, record.request.action),
         );
