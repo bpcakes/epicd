@@ -105,9 +105,10 @@ function epicContext(
 export function observeEpicDelivery(
   journal: OrchestrationJournal,
   runId: string,
+  activeTrackerOperationId?: string,
 ): EpicDeliveryTarget {
   journal.publications.assertIdle(runId);
-  const scope = journal.tracker.closedEpicScope(runId);
+  const scope = journal.tracker.closedEpicScope(runId, activeTrackerOperationId);
   const repository = journal.publications.repository(runId);
   if (!repository?.lastPublishedId || !repository.workspace || !repository.canonicalRepository)
     throw new DeliveryError(

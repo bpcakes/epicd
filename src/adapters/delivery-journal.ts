@@ -104,7 +104,7 @@ type Access = {
   reviewChecks(runId: string, taskId: string): z.infer<typeof RequiredCheckSchema>[];
   exactCommit(runId: string, candidate: CandidateIdentity, revision: string): CommitRecord;
   assertPublicationIdle(runId: string): void;
-  epicTarget(runId: string): EpicDeliveryTarget;
+  epicTarget(runId: string, activeTrackerOperationId?: string): EpicDeliveryTarget;
   epicId(runId: string): string;
 };
 export class DeliveryError extends Error {
@@ -822,7 +822,11 @@ export class DeliveryJournal {
       )[0] ?? null
     );
   }
-  candidateCurrent(runId: string, identity: CandidateIdentity): boolean {
+  candidateCurrent(
+    runId: string,
+    identity: CandidateIdentity,
+    activeTrackerOperationId?: string,
+  ): boolean {
     const candidate = this.candidate(runId, identity);
     if (
       candidate.status !== "captured" ||
@@ -834,7 +838,7 @@ export class DeliveryJournal {
     const source = candidate.source;
     if (source.kind === "published_epic") {
       try {
-        const target = this.access.epicTarget(runId);
+        const target = this.access.epicTarget(runId, activeTrackerOperationId);
         const writers = this.taskWriters(runId, null);
         return (
           !writers.active &&
@@ -868,7 +872,7 @@ export class DeliveryJournal {
       this.latestSourceTurn(runId, source.assignmentId) === source.turnId
     );
   }
-  satisfiesCheck(runId: string, evidenceId: string): boolean {
+  satisfiesCheck(runId: string, evidenceId: string, activeTrackerOperationId?: string): boolean {
     const evidence = this.evidence(runId, evidenceId);
     const candidate = this.candidate(runId, evidence);
     const check = this.plan(runId, evidence.validationPlanId).checks.find(
@@ -892,7 +896,7 @@ export class DeliveryJournal {
     }
     return (
       latest?.evidenceId === evidence.evidenceId &&
-      this.candidateCurrent(runId, evidence) &&
+      this.candidateCurrent(runId, evidence, activeTrackerOperationId) &&
       !!check &&
       digestJson(check) === evidence.commandDigest &&
       candidate.validationPlanId === evidence.validationPlanId &&
@@ -970,6 +974,7 @@ export class DeliveryJournal {
     identity: CandidateIdentity,
     phase: "pre_commit" | "exact_revision",
     revision?: string,
+    activeTrackerOperationId?: string,
   ) {
     const candidate = this.candidate(runId, identity);
     const checks = this.plan(runId, candidate.validationPlanId).checks.filter(
@@ -984,7 +989,7 @@ export class DeliveryJournal {
       (record) =>
         record.phase === phase &&
         (!revision || record.revision === revision) &&
-        this.satisfiesCheck(runId, record.evidenceId),
+        this.satisfiesCheck(runId, record.evidenceId, activeTrackerOperationId),
     );
     return {
       evidence,

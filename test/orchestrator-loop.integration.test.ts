@@ -13,6 +13,7 @@ import type {
   MemoryInput,
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { OperationFailed, CapabilityRejected } from "../src/kernel/guards.js";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
@@ -70,6 +71,59 @@ const memory: MemoryInput = {
 };
 
 describe("always engaged action loop", () => {
+  it("returns an unknown tracker-operation rejection to the model instead of crashing the terminal-wait check", async () => {
+    const { kernel, authority } = fixture();
+    kernel.registerExternal("reconcile_tracker_operation", async () => {
+      throw new CapabilityRejected("unknown_tracker", "No such tracker operation");
+    });
+    let calls = 0;
+    const source: DecisionSource = {
+      async decide(input) {
+        calls += 1;
+        return response(
+          input,
+          calls === 1
+            ? { kind: "reconcile_tracker_operation", trackerOperationId: "unknown-operation" }
+            : question,
+        );
+      },
+    };
+    expect(await new OrchestratorLoop(kernel, source).run(authority)).toBe("awaiting_user");
+    expect(await kernel.drain()).toBe(true);
+    expect(calls).toBe(2);
+    expect(kernel.journal.actions(authority.runId)[0]?.status).toBe("rejected");
+  });
+  it("interrupts the exact pending completion operation on cancellation without starting more reasoning", async () => {
+    const { kernel, authority } = fixture();
+    const cancelled = new AbortController();
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    kernel.registerExternal("complete_run", async ({ signal }) => {
+      started();
+      await delay(10000, undefined, { signal }).catch(() => {});
+      throw new OperationFailed("Terminal inspection cancelled");
+    });
+    let calls = 0;
+    const source: DecisionSource = {
+      async decide(input) {
+        calls += 1;
+        return response(input, { kind: "complete_run" });
+      },
+    };
+    const execution = new OrchestratorLoop(kernel, source, { pollMs: 10 }).run(
+      authority,
+      cancelled.signal,
+    );
+    await ready;
+    cancelled.abort();
+    await expect(execution).rejects.toThrow();
+    expect(await kernel.drain()).toBe(true);
+    expect(calls).toBe(1);
+    expect(kernel.journal.control(authority.runId).status).toBe("active");
+    expect(kernel.journal.actions(authority.runId).at(-1)?.status).toBe("cancelled");
+  });
   it("honors an operator pause during pre-decision preparation without creating or dispatching a ticket", async () => {
     const { store, kernel, authority } = fixture();
     const source: DecisionSource = {

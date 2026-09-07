@@ -39,6 +39,7 @@ export async function closureFixture(
   format: "sha1" | "sha256" = "sha1",
   claimBeforeImplementation = true,
   secondTask: boolean | "preclosed" = false,
+  nestedContainer = false,
 ) {
   let transport!: KernelBeads,
     adapter!: ReturnType<typeof registerTrackerCapabilities>,
@@ -60,6 +61,16 @@ export async function closureFixture(
           closed_at: null,
           close_reason: null,
           closed_by_session: null,
+          container: nestedContainer
+            ? {
+                id: "demo.group",
+                status: "open",
+                assignee: null,
+                closed_at: null,
+                close_reason: null,
+                closed_by_session: null,
+              }
+            : null,
           other_tasks: secondTask
             ? [
                 {
@@ -90,10 +101,14 @@ with (directory/'commands.jsonl').open('a') as log: log.write(json.dumps(args)+'
 x = json.loads((directory/'data.json').read_text())
 def row(id):
     common = {'id':id,'title':id,'priority':1,'description':'Deliver green behavior','acceptance_criteria':'The check passes','labels':[]}
-    if id == 'demo': return {**common,'description':x.get('epic_description',common['description']),'status':x.get('epic_status','open'),'issue_type':'epic','dependencies':[], 'dependents':([{'id':'demo.1','dependency_type':'parent-child','status':x['status']}] if x['parent'] else []) + [{'id':y['id'],'dependency_type':'parent-child','status':y['status']} for y in x.get('other_tasks',[])] + [{'id':id,'dependency_type':'parent-child','status':'open'} for id in x.get('new_children',[])]}
+    if id == 'demo':
+        child = x.get('container') or {'id':'demo.1','status':x['status']}
+        return {**common,**{key:x.get('epic_'+key) for key in ['assignee','closed_at','close_reason','closed_by_session']},'description':x.get('epic_description',common['description']),'status':x.get('epic_status','open'),'issue_type':'epic','dependencies':[], 'dependents':([{'id':child['id'],'dependency_type':'parent-child','status':child['status']}] if x['parent'] else []) + [{'id':y['id'],'dependency_type':'parent-child','status':y['status']} for y in x.get('other_tasks',[])] + [{'id':id,'dependency_type':'parent-child','status':'open'} for id in x.get('new_children',[])]}
+    if id == 'demo.group': return {**common,**x['container'],'issue_type':'epic','dependencies':[{'id':'demo','dependency_type':'parent-child','status':x.get('epic_status','open')}], 'dependents':[{'id':'demo.1','dependency_type':'parent-child','status':x['status']}]}
     if id in x.get('new_children',[]): return {**common,'status':'open','issue_type':'task','dependencies':[{'id':'demo','dependency_type':'parent-child','status':x.get('epic_status','open')}], 'dependents':[]}
     y = x if id == 'demo.1' else next(y for y in x['other_tasks'] if y['id'] == id)
-    return {**common, **y, 'issue_type':'task','dependencies':[{'id':'demo','dependency_type':'parent-child','status':x.get('epic_status','open')}] if x['parent'] else [], 'dependents':[]}
+    parent = x['container'] if id == 'demo.1' and x.get('container') else {'id':'demo','status':x.get('epic_status','open')}
+    return {**common, **y, 'issue_type':'task','dependencies':[{'id':parent['id'],'dependency_type':'parent-child','status':parent['status']}] if x['parent'] else [], 'dependents':[]}
 if args[0] == 'show': print(json.dumps([row(id) for id in args[1:args.index('--db')]]))
 elif args[0] == 'ready': print(json.dumps([row(y.get('id','demo.1')) for y in [x,*x.get('other_tasks',[])] if x['parent'] and y['status'] == 'open' and not y['assignee']]))
 elif args[0] == 'update':
@@ -109,10 +124,11 @@ elif args[0] == 'close':
         subprocess.Popen(['/usr/bin/python3','-c',"import time; time.sleep(1.2); open('/workspace/.beads/late-close','w').write('bad')"],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         while True: time.sleep(1)
-    y = x if args[1] == 'demo.1' else next(y for y in x['other_tasks'] if y['id'] == args[1])
+    y = {key:x.get('epic_'+key) for key in ['status','assignee','closed_at','close_reason','closed_by_session']} if args[1] == 'demo' else x['container'] if args[1] == 'demo.group' else x if args[1] == 'demo.1' else next(y for y in x['other_tasks'] if y['id'] == args[1])
     if y['status'] == 'closed': print('[]'); sys.exit(0)
     y['status'], y['closed_at'] = 'closed', datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
     y['close_reason'], y['closed_by_session'] = args[args.index('--reason')+1], args[args.index('--session')+1]
+    if args[1] == 'demo': x.update({'epic_'+key:value for key,value in y.items()})
     (directory/'data.json').write_text(json.dumps(x))
     print(json.dumps([row(args[1])]))
 else: sys.exit('unsupported')

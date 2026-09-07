@@ -16,7 +16,8 @@ export async function reconcileActions(
 ): Promise<void> {
   journal.markInterruptedActions(authority);
   for (const action of journal.actions(authority.runId)) {
-    if (action.status !== "indeterminate") continue;
+    // Recovering one dependency can atomically settle its related acknowledgement.
+    if (journal.action(authority.runId, action.actionId)?.status !== "indeterminate") continue;
     journal.assertAuthority(authority);
     const outcome = await inspect(action);
     journal.assertAuthority(authority);

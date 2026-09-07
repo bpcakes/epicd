@@ -536,6 +536,7 @@ export class ReviewJournal {
     runId: string,
     candidate: CandidateIdentity,
     phase: ReviewEvidence["phase"] = "pre_commit",
+    activeTrackerOperationId?: string,
   ): string | null {
     const captured = this.access.delivery.candidate(runId, candidate);
     const records = this.records(runId, captured.taskId).filter((record) => record.phase === phase);
@@ -549,7 +550,7 @@ export class ReviewJournal {
       latest.report!.planAdequacy !== "adequate" ||
       latest.report!.findings.length ||
       latest.report!.requiredChecks.length ||
-      !this.access.delivery.candidateCurrent(runId, candidate) ||
+      !this.access.delivery.candidateCurrent(runId, candidate, activeTrackerOperationId) ||
       this.openFindings(runId, candidate).length
     )
       return null;
@@ -566,6 +567,7 @@ export class ReviewJournal {
       candidate,
       phase,
       latest.revision,
+      activeTrackerOperationId,
     );
     if (
       validation.missingCheckIds.length ||

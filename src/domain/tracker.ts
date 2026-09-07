@@ -115,11 +115,27 @@ export const TrackerSnapshotSchema = z.strictObject({
   graph: TrackerGraphSchema,
 });
 export type TrackerSnapshot = z.infer<typeof TrackerSnapshotSchema>;
+const ScopeClosureProof = z.strictObject({
+  scopeDigest: z.string().length(64),
+  closureOperationIds: z.array(z.uuid()).max(1000),
+  preexistingIds: z.array(TrackerIdSchema).max(1000),
+});
+export const TrackerClosureProofSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("task"), claim: TaskClaimBindingSchema }),
+  ScopeClosureProof.extend({ kind: z.literal("container") }),
+  ScopeClosureProof.extend({
+    kind: z.literal("epic"),
+    candidateId: z.string().min(1).max(256),
+    candidateGeneration: z.number().int().positive(),
+    reviewScopeDigest: z.string().length(64),
+    rootClosureOperationId: z.uuid().nullable(),
+  }),
+]);
 export const TrackerClosureSchema = z.strictObject({
   publicationId: z.string().uuid(),
   revision: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
   reviewEvidenceId: z.string().min(1).max(256),
-  claim: TaskClaimBindingSchema,
+  proof: TrackerClosureProofSchema,
   reason: z.string().min(1).max(1024),
   commandReport: z.string().max(4000).optional(),
   // Physical ref inspection is separate from current journal approval.
@@ -127,6 +143,15 @@ export const TrackerClosureSchema = z.strictObject({
   intervention: z.boolean(),
 });
 export type TrackerClosure = z.infer<typeof TrackerClosureSchema>;
+export const CompletionResourcesSchema = z.strictObject({
+  disposition: z.literal("retained_for_inspection"),
+  workspaceIds: z.array(z.string()),
+  agentAssignmentIds: z.array(z.string()),
+  publicationIds: z.array(z.uuid()),
+  fixtureCreationIds: z.array(z.uuid()),
+  detail: z.string().min(1).max(4000),
+});
+export type CompletionResources = z.infer<typeof CompletionResourcesSchema>;
 export const TrackerOperationSchema = z
   .strictObject({
     schemaVersion: z.literal(1),
@@ -137,8 +162,17 @@ export const TrackerOperationSchema = z
     controllerLeaseId: z.string(),
     ioLeaseId: z.string(),
     policyDigest: z.string(),
-    kind: z.enum(["refresh", "claim", "adopt", "close_task"]),
+    kind: z.enum([
+      "refresh",
+      "claim",
+      "adopt",
+      "close_task",
+      "close_container",
+      "close_epic",
+      "complete",
+    ]),
     closure: TrackerClosureSchema.optional(),
+    completion: CompletionResourcesSchema.nullable(),
     taskId: TrackerIdSchema.nullable(),
     dispatched: z.boolean(),
     mutationDispatched: z.boolean(),
@@ -146,7 +180,16 @@ export const TrackerOperationSchema = z
     beforeSnapshotId: z.string().uuid().nullable(),
     afterSnapshotId: z.string().uuid().nullable(),
     outcome: z
-      .enum(["observed", "claimed", "not_claimed", "closed", "not_closed", "conflict", "failed"])
+      .enum([
+        "observed",
+        "claimed",
+        "not_claimed",
+        "closed",
+        "not_closed",
+        "completed",
+        "conflict",
+        "failed",
+      ])
       .nullable(),
     failure: z.string().max(4000).nullable(),
     createdAt: z.iso.datetime(),
@@ -154,16 +197,36 @@ export const TrackerOperationSchema = z
   })
   .refine((operation) => (operation.outcome !== null) === (operation.finishedAt !== null))
   .refine((operation) => operation.outcome === null || operation.ioStopped)
-  .refine((operation) => (operation.kind === "close_task") === (operation.closure !== undefined))
   .refine(
     (operation) =>
-      operation.outcome !== "closed" ||
+      ["close_task", "close_container", "close_epic", "complete"].includes(operation.kind) ===
+      (operation.closure !== undefined),
+  )
+  .refine(
+    (operation) =>
+      !operation.closure ||
+      operation.closure.proof.kind ===
+        (operation.kind === "close_task"
+          ? "task"
+          : operation.kind === "close_container"
+            ? "container"
+            : "epic"),
+  )
+  .refine(
+    (operation) => !operation.completion || (operation.kind === "complete" && operation.ioStopped),
+  )
+  .refine((operation) => operation.outcome !== "completed" || operation.completion !== null)
+  .refine(
+    (operation) =>
+      !["closed", "completed"].includes(operation.outcome ?? "") ||
       (operation.closure?.refsVerified && !operation.closure.intervention),
   )
   .refine(
     (operation) =>
       !operation.mutationDispatched ||
-      (operation.dispatched && operation.kind !== "refresh" && operation.beforeSnapshotId !== null),
+      (operation.dispatched &&
+        !["refresh", "complete"].includes(operation.kind) &&
+        operation.beforeSnapshotId !== null),
   );
 export type TrackerOperation = z.infer<typeof TrackerOperationSchema>;
 export const trackerActor = (runId: string) => `epicd:${runId}`;

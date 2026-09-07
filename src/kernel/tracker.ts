@@ -90,10 +90,11 @@ export function registerTrackerCapabilities(kernel: ActionKernel, transport: Ker
     } = journal.tracker.record(authority.runId, action.trackerOperationId);
     return { kind: "inspection", text: JSON.stringify(record), artifactIds: [] };
   });
-  for (const kind of ["refresh_tracker", "request_beads_transition"] as const)
+  for (const kind of ["refresh_tracker", "request_beads_transition", "complete_run"] as const)
     kernel.registerExternal(kind, async ({ authority, record, signal }) => {
       const intent = journal.tracker.reserve(authority, record.actionId);
       const result = await adapter.execute(authority, intent.trackerOperationId, signal);
+      if (result.kind === "complete" && result.completion) return resource(result);
       if (!result.outcome) throw new Error("Tracker effect requires explicit reconciliation");
       if (
         result.outcome !== "observed" &&
@@ -113,7 +114,8 @@ export function registerTrackerCapabilities(kernel: ActionKernel, transport: Ker
       action.trackerOperationId,
       signal,
     );
-    if (!record.outcome) throw new Error("Tracker reconciliation still awaits current authority");
+    if (!record.outcome && !(record.kind === "complete" && record.completion))
+      throw new Error("Tracker reconciliation still awaits current authority");
     return resource(record);
   });
   return adapter;
@@ -128,15 +130,29 @@ export async function reconcileTracker(
   const record = await adapter.reconcile(authority, id, signal);
   // Read-only bootstrap inspection can run while paused. A stopped physical
   // effect with no admissible outcome must not terminally fail its parent.
-  if (!record.outcome) return record;
+  if (!record.outcome && !(record.kind === "complete" && record.completion)) return record;
   const action = kernel.journal.action(authority.runId, record.actionId);
+  const terminalReconciler =
+    record.kind === "complete" &&
+    record.completion &&
+    !record.outcome &&
+    kernel.journal
+      .actions(authority.runId)
+      .some(
+        (entry) =>
+          entry.status === "running" &&
+          entry.request.action.kind === "reconcile_tracker_operation" &&
+          entry.request.action.trackerOperationId === id,
+      );
   if (
     action &&
     (action.status === "running" || action.status === "indeterminate") &&
-    !kernel.operation(action.operationId)
+    !kernel.operation(action.operationId) &&
+    !terminalReconciler
   ) {
     if (
-      ["observed", "claimed", "closed"].includes(record.outcome ?? "") &&
+      (["observed", "claimed", "closed", "completed"].includes(record.outcome ?? "") ||
+        (record.kind === "complete" && record.completion)) &&
       action.policyDigest === kernel.journal.control(authority.runId).policyDigest
     )
       kernel.journal.settleAction(authority, action.actionId, action.status, {
@@ -151,5 +167,5 @@ export async function reconcileTracker(
         problemId: `tracker-${id}`,
       });
   }
-  return record;
+  return kernel.journal.tracker.record(authority.runId, id);
 }

@@ -470,7 +470,7 @@ describe.skipIf(process.platform !== "linux")("verified task closure", () => {
 describe.skipIf(process.platform !== "linux" || !process.env.EPICD_TEST_BR_PATH)(
   "installed Beads verified closure",
   () => {
-    it("closes a real task only after claim-bound implementation, exact review and publication", async () => {
+    it("closes a real task and epic, then completes only after independent exact-revision verification", async () => {
       const executable = realpathSync(process.env.EPICD_TEST_BR_PATH!);
       let taskId!: string;
       const tracker: ReviewTrackerSetup = {
@@ -533,6 +533,45 @@ describe.skipIf(process.platform !== "linux" || !process.env.EPICD_TEST_BR_PATH)
         closeReason: record.closure!.reason,
       });
       expect(record.closure!.reason).toContain(commit.revision);
+      const epicId = s.journal.runObjective(s.authority.runId).epicId;
+      const { stage: _stage, ...command } = check;
+      const plan = resource(
+        await s.dispatch({
+          kind: "define_validation_plan",
+          taskId: epicId,
+          acceptanceCriteria: ["The complete epic is green"],
+          checks: [command],
+        }),
+      );
+      const prepared = resource(
+        await s.dispatch({
+          kind: "prepare_epic_delivery",
+          publicationId: s.journal.publications.repository(s.authority.runId)!.lastPublishedId!,
+          trackerSnapshotId: s.journal.tracker.snapshot(s.authority.runId).snapshotId,
+          validationPlanId: plan.resourceId,
+        }),
+      );
+      const candidate = {
+        candidateId: prepared.resourceId,
+        candidateGeneration: prepared.generation,
+      };
+      await s.validate(candidate, await s.copy(candidate, commit.revision));
+      await s.review(candidate, {}, [], commit.revision);
+      resource(
+        await s.dispatch({
+          kind: "request_beads_transition",
+          taskId: epicId,
+          transition: "close_epic",
+          revision: commit.revision!,
+        }),
+      );
+      resource(await s.dispatch({ kind: "complete_run" }));
+      expect(s.journal.control(s.authority.runId).status).toBe("complete");
+      expect(
+        s.journal.tracker
+          .snapshot(s.authority.runId)
+          .graph.issues.find((issue) => issue.id === epicId)?.status,
+      ).toBe("closed");
       expect(git(s.source, "rev-parse", "HEAD")).toBe(s.head);
     }, 45000);
   },

@@ -120,7 +120,10 @@ export class OrchestratorController {
       registerReviewCapabilities(kernel, workspaces, driver, () => contractFor("review"));
       registerCommitCapabilities(kernel, workspaces);
       registerPublicationCapabilities(kernel, workspaces);
-      registerTrackerCapabilities(kernel, new KernelBeads(config.trackerExecutable));
+      const tracker = registerTrackerCapabilities(
+        kernel,
+        new KernelBeads(config.trackerExecutable),
+      );
       registerSettingsCapabilities(kernel, this.store);
       const fixtureCreator = new PostgreSqlFixtureCreator();
       registerFixtureCapabilities(kernel, new PostgreSqlFixtureInspector(), fixtureCreator);
@@ -144,6 +147,44 @@ export class OrchestratorController {
         }
       }
       await reconcileActions(journal, authority, async (action) => {
+        if (
+          ["refresh_tracker", "request_beads_transition", "complete_run"].includes(
+            action.request.action.kind,
+          )
+        ) {
+          const intent = journal.tracker
+            .operations(this.runId)
+            .find((record) => record.operationId === action.operationId);
+          if (!intent)
+            return {
+              status: "failed",
+              detail: "No durable tracker intent exists; no tracker mutation was authorized",
+            };
+          try {
+            const record = await tracker.reconcile(authority!, intent.trackerOperationId, signal);
+            if (
+              ["observed", "claimed", "closed", "completed"].includes(record.outcome ?? "") ||
+              (record.kind === "complete" && record.completion)
+            )
+              return {
+                status: "succeeded",
+                result: { kind: "resource", resourceId: record.trackerOperationId, generation: 1 },
+              };
+            if (record.outcome)
+              return { status: "failed", detail: record.failure ?? record.outcome };
+            return {
+              status: "unresolved",
+              detail:
+                "Tracker inspection needs current authority and confirmed I/O stop; no mutation was replayed",
+            };
+          } catch (error) {
+            journal.assertAuthority(authority!);
+            return {
+              status: "unresolved",
+              detail: `Tracker recovery remains unsettled: ${String(error)}. No mutation was replayed.`,
+            };
+          }
+        }
         if (action.request.action.kind === "provision_declared_fixture") {
           const creation = journal.fixtures
             .creations(this.runId)

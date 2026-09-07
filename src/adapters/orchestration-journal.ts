@@ -48,7 +48,7 @@ import {
 } from "./publication-journal.js";
 import { concurrentWithPublication } from "../domain/publication.js";
 import { TrackerJournal, TRACKER_TABLES, createTrackerSchema } from "./tracker-journal.js";
-import { concurrentWithTracker } from "../domain/tracker.js";
+import { concurrentWithTracker, type CompletionResources } from "../domain/tracker.js";
 import {
   DiagnosticJournal,
   DIAGNOSTIC_TABLES,
@@ -57,8 +57,9 @@ import {
 
 import { FixtureJournal, FIXTURE_TABLES, createFixturesSchema } from "./fixture-journal.js";
 import { observeEpicDelivery } from "./epic-delivery.js";
+import { scopeClosure } from "./scope-closure.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 20;
+export const ORCHESTRATION_SCHEMA_VERSION = 21;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -281,7 +282,7 @@ export class OrchestrationJournal {
       reviewChecks: (runId, taskId) => this.reviews.requiredChecks(runId, taskId),
       exactCommit: (runId, candidate, revision) => this.commits.exact(runId, candidate, revision),
       assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
-      epicTarget: (runId) => observeEpicDelivery(this, runId),
+      epicTarget: (runId, operationId) => observeEpicDelivery(this, runId, operationId),
       epicId: (runId) => this.runObjective(runId).epicId,
     });
     this.reviews = new ReviewJournal(db, {
@@ -320,6 +321,9 @@ export class OrchestrationJournal {
       action: (runId, actionId) => this.action(runId, actionId),
       observe: (authority, input) => this.appendObservation(authority, input),
       assertPublicationIdle: (runId) => this.publications.assertIdle(runId),
+      scopeClosure: (runId, kind, taskId, revision, operationId) =>
+        scopeClosure(this, runId, kind, taskId, revision, operationId),
+      completionResources: (runId, operationId) => this.completionResources(runId, operationId),
       closurePublication: (runId, taskId, revision, claim) => {
         const id = this.publications.repository(runId)?.lastPublishedId;
         if (!id)
@@ -363,6 +367,101 @@ export class OrchestrationJournal {
     return (
       this.db.prepare("SELECT 1 FROM orchestration_runs WHERE run_id = ?").get(runId) !== undefined
     );
+  }
+
+  /** Retention is explicit, not a claim that workspaces, panes or fixtures were deleted. */
+  private completionResources(runId: string, ownOperationId: string): CompletionResources {
+    const unfinished = (message: string): never => {
+      throw new DeliveryError("completion_unsettled", message);
+    };
+    const terminal = this.tracker
+      .operations(runId)
+      .find((record) => record.operationId === ownOperationId);
+    // The one live read-only reconciler and lost prior reader acknowledgements
+    // settle with the original completion action. No unrelated action is exempt.
+    const reconcilers = this.actions(runId).filter(
+      (action) =>
+        ["running", "indeterminate"].includes(action.status) &&
+        action.request.action.kind === "reconcile_tracker_operation" &&
+        action.request.action.trackerOperationId === terminal?.trackerOperationId,
+    );
+    if (
+      reconcilers.filter((action) => action.status === "running").length > 1 ||
+      this.actions(runId).some(
+        (action) =>
+          action.operationId !== ownOperationId &&
+          !reconcilers.some((reconciler) => reconciler.actionId === action.actionId) &&
+          ["accepted", "running", "indeterminate"].includes(action.status),
+      )
+    )
+      unfinished("Settle all other actions before completing the run");
+    if (
+      this.agents.turns(runId).some((turn) => !turn.stopEvidence) ||
+      this.decisionSource.unsettled(runId)
+    )
+      unfinished("Completion requires confirmed stop of every agent and coordinator request");
+    if (
+      this.db
+        .prepare(
+          `SELECT 1 FROM workspace_operations WHERE run_id = ? AND
+      json_extract(record_json, '$.stopEvidence') IS NULL LIMIT 1`,
+        )
+        .get(runId)
+    )
+      unfinished("Completion requires confirmed stop of every workspace operation");
+    const agents = this.agents.instances(runId);
+    if (
+      agents.some(
+        (agent) =>
+          agent.activeTurnId !== null ||
+          this.agents
+            .messages(runId, agent)
+            .some((message) => !["acknowledged", "superseded"].includes(message.status)),
+      )
+    )
+      unfinished("Deliver or supersede pending agent instructions before completion");
+    const workspaces = this.db
+      .prepare("SELECT workspace_id FROM workspaces WHERE run_id = ? ORDER BY workspace_id")
+      .all(runId) as { workspace_id: string }[];
+    if (
+      this.db
+        .prepare(
+          `SELECT 1 FROM workspaces WHERE run_id = ? AND
+      json_extract(record_json, '$.activeTurnId') IS NOT NULL LIMIT 1`,
+        )
+        .get(runId)
+    )
+      unfinished("A workspace still has an active turn");
+    this.publications.assertIdle(runId);
+    if (
+      this.commits.records(runId).some((record) => ["preparing", "writing"].includes(record.status))
+    )
+      unfinished("A commit operation remains unsettled");
+    const fixtures = this.fixtures.creations(runId);
+    if (
+      fixtures.some(
+        (fixture) =>
+          !["owned", "not_created"].includes(fixture.status) ||
+          (fixture.status === "owned" &&
+            (!fixture.clientStopEvidence || !fixture.observation?.backendStopped)),
+      )
+    )
+      unfinished("Fixture creation needs a settled outcome and confirmed client/backend stop");
+    return {
+      disposition: "retained_for_inspection",
+      workspaceIds: workspaces.map((workspace) => workspace.workspace_id),
+      agentAssignmentIds: agents.map((agent) => agent.assignmentId).sort(),
+      publicationIds: this.publications
+        .records(runId)
+        .map((record) => record.publicationId)
+        .sort(),
+      fixtureCreationIds: fixtures
+        .filter((fixture) => fixture.status === "owned")
+        .map((fixture) => fixture.creationId)
+        .sort(),
+      detail:
+        "All recorded work is stopped. Managed workspaces, agent sessions, publication artifacts and owned fixtures are retained for inspection; no resource deletion or pane closure was performed.",
+    };
   }
 
   runObjective(runId: string) {
@@ -678,6 +777,75 @@ export class OrchestrationJournal {
         result.status === "succeeded"
       )
         throw new Error("Superseded policy cannot authorize successful settlement");
+      if (
+        action.request.action.kind === "reconcile_tracker_operation" &&
+        result.status === "succeeded"
+      ) {
+        const completion = this.tracker.record(
+          authority.runId,
+          action.request.action.trackerOperationId,
+        );
+        if (
+          completion.kind === "complete" &&
+          completion.completion &&
+          completion.outcome === null
+        ) {
+          if (
+            result.result.kind !== "resource" ||
+            result.result.resourceId !== completion.trackerOperationId ||
+            result.result.generation !== 1
+          )
+            throw new Error("Reconciliation result does not identify its terminal inspection");
+          const parent = this.requiredAction(authority.runId, completion.actionId);
+          if (parent.status !== "running" && parent.status !== "indeterminate")
+            throw new Error("Completion's parent action is not awaiting settlement");
+          this.settleAction(authority, parent.actionId, parent.status, {
+            status: "succeeded",
+            actionId: parent.actionId,
+            result: result.result,
+          });
+        }
+      }
+      if (action.request.action.kind === "complete_run" && result.status === "succeeded") {
+        const completion = this.tracker
+          .operations(authority.runId)
+          .find((record) => record.actionId === actionId);
+        if (
+          !completion ||
+          result.result.kind !== "resource" ||
+          result.result.generation !== 1 ||
+          result.result.resourceId !== completion.trackerOperationId
+        )
+          throw new Error("Completion result does not identify its exact terminal inspection");
+        // A crash may have interrupted the read-only reconciliation action too.
+        // Discard its lost acknowledgement in this transaction; the parent's
+        // fresh stopped inspection, not the interrupted reader, proves completion.
+        for (const reconciler of this.actions(authority.runId)) {
+          if (
+            reconciler.status === "indeterminate" &&
+            reconciler.request.action.kind === "reconcile_tracker_operation" &&
+            reconciler.request.action.trackerOperationId === completion.trackerOperationId
+          ) {
+            this.settleAction(authority, reconciler.actionId, "indeterminate", {
+              status: "failed",
+              actionId: reconciler.actionId,
+              problemId: `interrupted-reader-${reconciler.actionId}`,
+            });
+          }
+        }
+        this.tracker.complete(authority, actionId);
+        this.db
+          .prepare(
+            "UPDATE orchestration_runs SET status = 'complete', control_version = control_version + 1 WHERE run_id = ?",
+          )
+          .run(authority.runId);
+        const completedAt = now();
+        this.db
+          .prepare(
+            "UPDATE runs SET phase = 'complete', updated_at = ?, state_json = json_set(state_json, '$.updatedAt', ?) WHERE run_id = ?",
+          )
+          .run(completedAt, completedAt, authority.runId);
+      }
       this.db
         .prepare(
           "UPDATE actions SET status = ?, result_json = ?, updated_at = ? WHERE action_id = ? AND status = ?",

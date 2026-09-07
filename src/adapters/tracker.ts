@@ -36,31 +36,33 @@ export class TrackerAdapter {
             authority,
             id,
             await this.transport.graph(binding, run.epicId, closeGuard, lockedSignal),
-            "before",
+            record.kind === "complete" ? "after" : "before",
           );
-          tracker.mutation(authority, id);
-          try {
-            const report = await this.transport.close(
-              binding,
-              record.taskId!,
-              record.runId,
-              record.operationId,
-              record.closure!.reason,
-              closeGuard,
-              lockedSignal,
+          if (record.kind !== "complete") {
+            tracker.mutation(authority, id);
+            try {
+              const report = await this.transport.close(
+                binding,
+                record.taskId!,
+                record.runId,
+                record.operationId,
+                record.closure!.reason,
+                closeGuard,
+                lockedSignal,
+              );
+              tracker.closureReport(authority, id, report);
+            } catch (error) {
+              if (error instanceof NamespaceStopUnprovenError) throw error;
+              failure = detail(error);
+            }
+            closeGuard();
+            tracker.recordSnapshot(
+              authority,
+              id,
+              await this.transport.graph(binding, run.epicId, closeGuard, lockedSignal),
+              "after",
             );
-            tracker.closureReport(authority, id, report);
-          } catch (error) {
-            if (error instanceof NamespaceStopUnprovenError) throw error;
-            failure = detail(error);
           }
-          closeGuard();
-          tracker.recordSnapshot(
-            authority,
-            id,
-            await this.transport.graph(binding, run.epicId, closeGuard, lockedSignal),
-            "after",
-          );
         });
         tracker.closureRefs(authority, id, true);
       } else {
@@ -72,7 +74,8 @@ export class TrackerAdapter {
           record.kind === "refresh" ? "after" : "before",
         );
         if (record.kind !== "refresh") {
-          if (record.kind === "close_task") throw new Error("Closure grant missing");
+          if (record.kind !== "claim" && record.kind !== "adopt")
+            throw new Error("Closure grant missing");
           claimable(graph, record.taskId!, record.kind);
           tracker.mutation(authority, id);
           try {
@@ -116,7 +119,11 @@ export class TrackerAdapter {
     let failure: string | null = null;
     let stopUnproven = false;
     try {
-      if (record.mutationDispatched || (record.kind === "refresh" && initial.dispatched)) {
+      if (
+        record.mutationDispatched ||
+        record.kind === "complete" ||
+        (record.kind === "refresh" && initial.dispatched)
+      ) {
         const run = tracker.run(authority.runId);
         const binding = tracker.binding(authority.runId);
         if (!binding && record.mutationDispatched)

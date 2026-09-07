@@ -143,7 +143,47 @@ export class OrchestratorLoop {
           journal.rejectDecision(authority, execution.ticket.decisionId, outcome.detail);
           continue;
         }
-        await this.kernel.execute(outcome.decision, authority);
+        const result = await this.kernel.execute(outcome.decision, authority);
+        const requested = outcome.decision.request.action;
+        if (
+          result.status === "running" &&
+          (requested.kind === "complete_run" ||
+            (requested.kind === "reconcile_tracker_operation" &&
+              journal.tracker
+                .operations(authority.runId)
+                .some(
+                  (record) =>
+                    record.trackerOperationId === requested.trackerOperationId &&
+                    record.kind === "complete",
+                )))
+        ) {
+          // The model requested termination. Do not launch new reasoning while
+          // its terminal inspection is proving that every request has stopped.
+          const operation = this.kernel.operation(result.operationId);
+          if (operation) {
+            const monitor = new AbortController();
+            const watchedSignal = signal
+              ? AbortSignal.any([signal, monitor.signal])
+              : monitor.signal;
+            const watch = async () => {
+              let nextHealth = Date.now() + 30_000;
+              while (journal.control(authority.runId).status === "active") {
+                this.kernel.assertHealthy();
+                journal.assertAuthority(authority);
+                if (Date.now() >= nextHealth) {
+                  await this.options.onHealthCheck?.();
+                  nextHealth = Date.now() + 30_000;
+                }
+                await delay(this.options.pollMs ?? 250, undefined, { signal: watchedSignal });
+              }
+            };
+            try {
+              await Promise.race([operation, watch()]);
+            } finally {
+              monitor.abort();
+            }
+          }
+        }
       }
       return journal.control(authority.runId).status;
     } finally {

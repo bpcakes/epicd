@@ -4,7 +4,7 @@ Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra 
 
 This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Use a fresh state path. Unsupported existing data is left intact.
 
-The CLI and controlled runtimes are wired, but complete epic delivery is not yet ready. Independent whole-epic verification is implemented; container/root closure, epic-scoped repair, terminal completion, host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
+The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, guarded container/root closure and atomic run completion are implemented. Epic-scoped repair, guarded tracker export/commit handling, host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
 ## Requirements
 
@@ -176,6 +176,8 @@ The model chooses the next useful capability. The kernel validates control versi
 - Implementation and review use private repository copies. The user's checkout and index are not a scratch workspace.
 - Review judgments and validation evidence are tied to exact candidate/workspace/turn identities; actual-SHA verification is separate from pre-commit review.
 - A task close requires a current verified publication and claim. The installed Beads close interface lacks atomic expected-owner/parentage comparison; fresh before/after checks detect conflicts but cannot eliminate that race. This remains a release blocker.
+- Container closure requires proven closure of its own descendants; unrelated root tasks may remain open. Root closure additionally requires current independent whole-epic verification at the published SHA. Neither a model verdict nor a successful Beads exit code substitutes for those proofs.
+- `complete_run` inspects the live tracker graph and both publication refs, verifies this run's root-closure markers and stopped work, then records completion and the successful action result in one SQLite transaction. Interrupted inspections can be reconciled without repeating a close. Workspaces, agent sessions, publication artifacts and owned fixtures are explicitly retained for inspection, not silently deleted.
 - Unknown stop state stays unknown. Restart reconciles recorded work; it does not replay an uncertain external mutation.
 - Epicd creates local commits/refs, never pushes.
 

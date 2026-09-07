@@ -163,13 +163,11 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       "request_commit",
       "request_publish",
       "request_beads_transition",
+      "complete_run",
     ])
       expect(f.observed[0]?.context.capabilities).toContainEqual(
         expect.objectContaining({ kind, available: true }),
       );
-    expect(f.observed[0]?.context.capabilities).toContainEqual(
-      expect.objectContaining({ kind: "complete_run", available: false }),
-    );
     expect(
       f.store.orchestration.actions(f.state.runId).map((action) => action.request.action.kind),
     ).toEqual(["inspect_run", "escalate"]);
