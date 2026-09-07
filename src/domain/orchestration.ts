@@ -143,6 +143,8 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("replace_agent"),
     ...AgentTarget,
+    ...WorkspaceTarget,
+    instructions: z.string().min(1).max(16000),
     reason: z.string().min(1).max(4000),
   }),
   z.strictObject({

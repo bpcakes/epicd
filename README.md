@@ -58,6 +58,8 @@ Commands and dependencies must be available inside the isolated validation envir
 
 Policy is frozen when a run is created. Editing the repository file does not change an existing run's permissions or required checks.
 
+To let the orchestrator change worker settings itself, list exact permitted model/effort pairs in `autonomousWorkerSettings`, for example `[{"model":"YOUR_WORKER_MODEL","reasoningEffort":"high"}]`. An empty or omitted list does not grant unrestricted model choice. Operator-selected initial settings remain usable; this list bounds autonomous changes, not explicit operator settings commands.
+
 ## Start and operate a run
 
 Use an explicit state path outside the target repository for this experimental branch:
@@ -101,6 +103,10 @@ node dist/cli.js settings RUN_ID --role review --model WORKER_MODEL \
 ```
 
 The coordinator model must remain `gpt-6-astra`. A changed coordinator effort takes effect through a new assignment after the prior turn has stopped; existing worker assignments retain their contracts.
+
+During a run, the orchestrator can invoke `change_agent_settings` within frozen policy. A coordinator effort change creates a fresh conversation before the next decision, retaining journaled memory, findings and budgets. It does not use provider-specific in-place effort updates or silently change models.
+
+`replace_agent` requires the old worker's confirmed stop and a separately created workspace. It preserves the old copy, retires that generation and reserves a fresh one with the same task/purpose and current permitted settings. The orchestrator supplies handoff instructions and chooses when to continue; independent reviewers still run through `run_review`. Replacement does not erase findings, reuse a contaminated copy or count as completed work.
 
 ## Safety and recovery
 

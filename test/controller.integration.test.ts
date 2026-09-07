@@ -75,7 +75,7 @@ function fixture() {
     },
     RepositoryPolicySchema.parse({ schemaVersion: 1 }),
   );
-  const providerId = randomUUID();
+  const providerIds = new Map<string, string>();
   const observed: {
     ticket: Record<string, unknown>;
     context: { objective: unknown; capabilities: { kind: string; available: boolean }[] };
@@ -88,6 +88,9 @@ function fixture() {
       return {
         kind: "sdk" as const,
         async run(authority: ControllerAuthority, identity: TurnIdentity, signal?: AbortSignal) {
+          const key = `${identity.agentId}/${identity.agentGeneration}`;
+          const providerId = providerIds.get(key) ?? randomUUID();
+          providerIds.set(key, providerId);
           const prompt = journal.agents.turn(authority.runId, identity).prompt.instructions;
           const input = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1));
           observed.push(input);
@@ -236,6 +239,55 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     });
     expect(f.store.orchestration.actions(f.state.runId)).toEqual([]);
     expect(f.store.controllerLease(f.state.runId)).toBeNull();
+  });
+  it("changes coordinator effort through a journaled capability and cold-starts a new conversation without operator restart", async () => {
+    const f = fixture();
+    await new OrchestratorController(f.store, f.state.runId, {
+      driver: f.driverFactory([
+        {
+          kind: "record_memory",
+          entry: {
+            kind: "strategy",
+            content: "Inspect before delivery; preserve the user's checkout",
+            scope: "run",
+            taskId: null,
+            confidence: "hypothesis",
+            observationIds: [],
+            evidenceIds: [],
+            revision: null,
+            environmentGeneration: null,
+            supersedes: null,
+          },
+        },
+        {
+          kind: "change_agent_settings",
+          role: "orchestrator",
+          settings: { model: "gpt-6-astra", reasoningEffort: "xhigh" },
+        },
+        { kind: "inspect_run" },
+        question,
+      ]),
+    }).run();
+    const journal = f.store.orchestration;
+    const agents = journal.agents.instances(f.state.runId);
+    expect(agents).toHaveLength(2);
+    expect(agents[0]).toMatchObject({
+      status: "released",
+      contract: { effective: { model: "gpt-6-astra", reasoningEffort: "high" } },
+    });
+    expect(agents[1]).toMatchObject({
+      contract: { effective: { model: "gpt-6-astra", reasoningEffort: "xhigh" } },
+    });
+    expect(agents[1]?.provider).not.toEqual(agents[0]?.provider);
+    expect(agents[1]?.workspaceId).not.toBe(agents[0]?.workspaceId);
+    expect(journal.agents.turns(f.state.runId)).toHaveLength(4);
+    expect(journal.control(f.state.runId).decisionsUsed).toBe(4);
+    expect(journal.actions(f.state.runId).every((action) => action.status === "succeeded")).toBe(
+      true,
+    );
+    expect(journal.memory(f.state.runId)[0]?.content).toContain("preserve the user's checkout");
+    expect(JSON.stringify(f.observed.at(-1))).toContain("preserve the user's checkout");
+    expect(f.git("status", "--porcelain")).toBe("");
   });
   it("rejects a competing controller before creating a coordinator or invoking a runtime", async () => {
     const f = fixture();

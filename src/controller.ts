@@ -24,6 +24,7 @@ import { registerReviewCapabilities } from "./kernel/reviews.js";
 import { registerCommitCapabilities } from "./kernel/commits.js";
 import { registerPublicationCapabilities } from "./kernel/publication.js";
 import { registerTrackerCapabilities } from "./kernel/tracker.js";
+import { registerSettingsCapabilities } from "./kernel/settings.js";
 import { reconcileActions } from "./kernel/reconcile.js";
 import { ControlledDecisionSource } from "./orchestrator/sdk-source.js";
 import { OrchestratorLoop } from "./orchestrator/loop.js";
@@ -113,6 +114,7 @@ export class OrchestratorController {
       registerCommitCapabilities(kernel, workspaces);
       registerPublicationCapabilities(kernel, workspaces);
       registerTrackerCapabilities(kernel, new KernelBeads(config.trackerExecutable));
+      registerSettingsCapabilities(kernel, this.store);
 
       // A replaced controller lease is never evidence that its external work stopped.
       for (const turn of journal.agents.turns(this.runId)) {
@@ -152,9 +154,38 @@ export class OrchestratorController {
         };
       });
       if (journal.control(this.runId).status === "active" && !signal?.aborted) {
-        const coordinator = await this.coordinator(authority, state, workspaces, signal);
-        const source = new ControlledDecisionSource(journal, authority, coordinator, driver);
-        await new OrchestratorLoop(kernel, source).run(authority, signal);
+        let coordinator = await this.coordinator(authority, state, workspaces, signal);
+        let source = new ControlledDecisionSource(journal, authority, coordinator, driver);
+        const currentAuthority = authority;
+        await new OrchestratorLoop(
+          kernel,
+          {
+            decide: (input, turnSignal) => source.decide(input, turnSignal),
+            reconcile: (attempt) => source.reconcile(attempt),
+          },
+          {
+            beforeDecision: async (turnSignal) => {
+              const next = await this.coordinator(
+                currentAuthority,
+                this.store.get(this.runId)!,
+                workspaces,
+                turnSignal,
+              );
+              if (
+                next.agentId !== coordinator.agentId ||
+                next.agentGeneration !== coordinator.agentGeneration
+              ) {
+                coordinator = next;
+                source = new ControlledDecisionSource(
+                  journal,
+                  currentAuthority,
+                  coordinator,
+                  driver,
+                );
+              }
+            },
+          },
+        ).run(authority, signal);
       }
     } catch (error) {
       if (authority && !signal?.aborted) {
@@ -216,11 +247,7 @@ export class OrchestratorController {
     if (existing) {
       if (existing.activeTurnId) throw new Error("The previous coordinator has no confirmed stop");
       if (digestJson(existing.contract) === digestJson(contract)) return existing;
-      journal.agents.revokeAgent(
-        authority,
-        existing,
-        "Operator changed future-thread coordinator settings",
-      );
+      journal.agents.revokeAgent(authority, existing, "Future-thread coordinator settings changed");
       journal.agents.releaseAgent(authority, existing);
     }
     const operation = `coordinator-${digestJson([this.runId, prior.length, contract]).slice(0, 40)}`;

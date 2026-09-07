@@ -24,7 +24,10 @@ export type OrchestratorContext = {
   tracker: ReturnType<ActionKernel["journal"]["tracker"]["summary"]>;
   diagnostics: ReturnType<ActionKernel["journal"]["diagnostics"]["summary"]>;
   constraints: string[];
-  policy: Pick<RepositoryPolicy, "coordinator" | "budgets" | "writableScratch"> & {
+  policy: Pick<
+    RepositoryPolicy,
+    "coordinator" | "autonomousWorkerSettings" | "budgets" | "writableScratch"
+  > & {
     requiredCheckIds: string[];
     fixtures: { id: string; operations: ("create" | "reset" | "cleanup")[] }[];
   };
@@ -52,6 +55,7 @@ export function buildOrchestratorContext(kernel: ActionKernel, runId: string): O
     diagnostics: kernel.journal.diagnostics.summary(runId),
     policy: {
       coordinator: policy.coordinator,
+      autonomousWorkerSettings: policy.autonomousWorkerSettings,
       budgets: policy.budgets,
       writableScratch: policy.writableScratch,
       requiredCheckIds: policy.requiredChecks.map((check) => check.id),

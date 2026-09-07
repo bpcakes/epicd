@@ -34,7 +34,11 @@ export class OrchestratorLoop {
   constructor(
     private readonly kernel: ActionKernel,
     private readonly source: DecisionSource,
-    private readonly options: { pollMs?: number; onHealthCheck?: () => Promise<void> } = {},
+    private readonly options: {
+      pollMs?: number;
+      onHealthCheck?: () => Promise<void>;
+      beforeDecision?: (signal?: AbortSignal) => Promise<void>;
+    } = {},
   ) {}
 
   async run(authority: ControllerAuthority, signal?: AbortSignal): Promise<ControlState["status"]> {
@@ -96,6 +100,12 @@ export class OrchestratorLoop {
           return "awaiting_user";
         }
         if (!execution) {
+          // Rotation changes control facts, so do it before freezing context and
+          // issuing the next ticket, never in the middle of a provider attempt.
+          if (this.options.beforeDecision) await this.options.beforeDecision(signal);
+          signal?.throwIfAborted();
+          control = journal.control(authority.runId);
+          if (control.status !== "active") return control.status;
           const context = buildOrchestratorContext(this.kernel, authority.runId);
           if (
             currentPending &&

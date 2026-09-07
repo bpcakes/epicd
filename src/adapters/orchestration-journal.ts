@@ -55,7 +55,7 @@ import {
   createDiagnosticsSchema,
 } from "./diagnostic-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 15;
+export const ORCHESTRATION_SCHEMA_VERSION = 16;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",

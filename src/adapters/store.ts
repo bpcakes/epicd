@@ -419,59 +419,56 @@ export class StateStore {
     authority: PersistenceAuthority,
   ): AgentSettingsUpdate {
     const parsedSettings = AgentPreferencesSchema.parse(settings);
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const row = this.db
-        .prepare(`SELECT ${RUN_ROW_COLUMNS} FROM runs WHERE run_id = ?`)
-        .get(runId) as RunRow | undefined;
-      if (!row) throw new RunNotFoundError(runId);
-      const source = decodeRunRow(row);
-      if (this.orchestration.control(runId).status === "complete") {
-        throw new Error("A completed run cannot create new agent threads");
-      }
-      if (authority.kind === "unleased") this.removeStaleLeaseOrThrow(runId);
-      const candidate = RunStateSchema.parse({
-        ...source,
-        ...(runWide ? { model: runWide.model, reasoningEffort: runWide.reasoningEffort } : {}),
-        agentSettings: parsedSettings,
-        updatedAt: new Date().toISOString(),
-      });
-      {
-        const effective = resolveAgentRoleSettings(candidate, "orchestrator");
-        const policy = this.orchestration.policy(runId);
-        if (
-          !policy.coordinator.reasoningEfforts.some(
-            (effort) => effort === effective.reasoningEffort,
+    return this.db
+      .transaction(() => {
+        const row = this.db
+          .prepare(`SELECT ${RUN_ROW_COLUMNS} FROM runs WHERE run_id = ?`)
+          .get(runId) as RunRow | undefined;
+        if (!row) throw new RunNotFoundError(runId);
+        const source = decodeRunRow(row);
+        if (this.orchestration.control(runId).status === "complete") {
+          throw new Error("A completed run cannot create new agent threads");
+        }
+        if (authority.kind === "unleased") this.removeStaleLeaseOrThrow(runId);
+        const candidate = RunStateSchema.parse({
+          ...source,
+          ...(runWide ? { model: runWide.model, reasoningEffort: runWide.reasoningEffort } : {}),
+          agentSettings: parsedSettings,
+          updatedAt: new Date().toISOString(),
+        });
+        {
+          const effective = resolveAgentRoleSettings(candidate, "orchestrator");
+          const policy = this.orchestration.policy(runId);
+          if (
+            !policy.coordinator.reasoningEfforts.some(
+              (effort) => effort === effective.reasoningEffort,
+            )
           )
-        )
-          throw new Error("Coordinator effort is not allowed by frozen policy");
-        candidate.agentSettings.orchestrator.model = effective.model;
-      }
-      const result = this.writeSettings(candidate, authority);
-      if (result.changes !== 1) {
-        throw new Error(`Run ${runId} is not controlled by this epicd process`);
-      }
-      const event = this.addEventAuthorized(
-        runId,
-        "success",
-        "agent.settings_updated",
-        "Updated model and reasoning settings for future agent sessions",
-        "Existing agent sessions keep the settings they started with",
-        authority,
-      );
-      this.orchestration.noteSettingsChange(runId);
-      this.db.exec("COMMIT");
-      return {
-        event,
-        agentSettings: candidate.agentSettings,
-        model: candidate.model,
-        reasoningEffort: candidate.reasoningEffort,
-        updatedAt: candidate.updatedAt,
-      };
-    } catch (error) {
-      if (this.db.inTransaction) this.db.exec("ROLLBACK");
-      throw error;
-    }
+            throw new Error("Coordinator effort is not allowed by frozen policy");
+          candidate.agentSettings.orchestrator.model = effective.model;
+        }
+        const result = this.writeSettings(candidate, authority);
+        if (result.changes !== 1) {
+          throw new Error(`Run ${runId} is not controlled by this epicd process`);
+        }
+        const event = this.addEventAuthorized(
+          runId,
+          "success",
+          "agent.settings_updated",
+          "Updated model and reasoning settings for future agent sessions",
+          "Existing agent sessions keep the settings they started with",
+          authority,
+        );
+        this.orchestration.noteSettingsChange(runId);
+        return {
+          event,
+          agentSettings: candidate.agentSettings,
+          model: candidate.model,
+          reasoningEffort: candidate.reasoningEffort,
+          updatedAt: candidate.updatedAt,
+        };
+      })
+      .immediate();
   }
 
   /** Keep lease validation and the write atomic, including within administrative transactions. */

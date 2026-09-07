@@ -335,7 +335,7 @@ describe("retained diagnostic artifacts", () => {
     const original = s.db.prepare("SELECT * FROM observations").all();
     s.reopen();
     expect(s.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-      version: 15,
+      version: 16,
     });
     expect(s.db.prepare("SELECT * FROM observations").all()).toEqual(original);
     expect(

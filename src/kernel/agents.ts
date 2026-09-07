@@ -27,6 +27,80 @@ export function registerAgentCapabilities(
   contractFor: (role: Exclude<AgentRole, "orchestrator">) => AgentSessionContract,
 ) {
   const agents = kernel.journal.agents;
+  kernel.registerLocal("replace_agent", ({ authority }, action) => {
+    const old = agents.instance(authority.runId, action);
+    if (old.role === "orchestrator")
+      throw new CapabilityRejected(
+        "coordinator_owned",
+        "Coordinator rotation belongs to the decision source; use change_agent_settings for a policy-approved effort change",
+      );
+    if (old.contract.runtime !== driver.kind)
+      throw new CapabilityRejected("wrong_runtime", "Agent belongs to a different runtime");
+    if (
+      old.activeTurnId ||
+      agents
+        .turns(authority.runId)
+        .some(
+          (turn) =>
+            turn.identity.agentId === old.agentId &&
+            turn.identity.agentGeneration === old.agentGeneration &&
+            !turn.stopEvidence,
+        )
+    )
+      throw new CapabilityRejected(
+        "agent_not_stopped",
+        "Interrupt and confirm the exact old turn stopped before replacing it",
+      );
+    if (old.workspaceId === action.workspaceId)
+      throw new CapabilityRejected(
+        "fresh_workspace_required",
+        "Replacement must use a separately created workspace; the old workspace is retained",
+      );
+    const assignment = agents.assignment(authority.runId, old.assignmentId);
+    if (["review", "verification", "final_review"].includes(assignment.purpose)) {
+      const binding = kernel.journal.delivery.binding(authority.runId, action);
+      if (
+        binding.candidateId !== assignment.candidateId ||
+        binding.phase !== (assignment.purpose === "review" ? "pre_commit" : "exact_revision") ||
+        !kernel.journal.delivery.candidateCurrent(authority.runId, binding)
+      )
+        throw new CapabilityRejected(
+          "replacement_candidate_mismatch",
+          "Replacement reviewer must retain the current candidate and evidence phase",
+        );
+    }
+    const contract = contractFor(old.role);
+    if (contract.runtime !== driver.kind)
+      throw new CapabilityRejected(
+        "wrong_runtime",
+        "Replacement settings belong to a different driver",
+      );
+    // executeLocalAction owns one transaction: invalid reservation, audit failure
+    // or result failure rolls back revocation and the new generation together.
+    agents.revokeAgent(authority, old, action.reason);
+    agents.releaseAgent(authority, old);
+    const replacement = agents.reserveAgent(
+      authority,
+      {
+        role: old.role,
+        purpose: assignment.purpose,
+        taskId: assignment.taskId,
+        candidateId: assignment.candidateId,
+        workspaceId: action.workspaceId,
+        workspaceGeneration: action.workspaceGeneration,
+        instructions: action.instructions,
+        confinementProfile: "epicd-isolated",
+        contract,
+        replaces: old,
+      },
+      kernel.journal.control(authority.runId).controlVersion,
+    );
+    return {
+      kind: "resource",
+      resourceId: replacement.agentId,
+      generation: replacement.agentGeneration,
+    };
+  });
   const run = async (context: ActionContext, agent: AgentIdentity, instructions: string) => {
     const instance = agents.instance(context.authority.runId, agent);
     const assignment = agents.assignment(context.authority.runId, instance.assignmentId);

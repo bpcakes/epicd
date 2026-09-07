@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { ORCHESTRATOR_MODEL, AstraReasoningEffortSchema } from "./types.js";
+import {
+  ORCHESTRATOR_MODEL,
+  AstraReasoningEffortSchema,
+  ModelIdSchema,
+  ReasoningEffortSchema,
+} from "./types.js";
 
 const RelativePath = z
   .string()
@@ -39,6 +44,17 @@ export const RepositoryPolicySchema = z
         model: ORCHESTRATOR_MODEL,
         reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
       }),
+    // Explicit permission for autonomous model/effort changes. An empty list
+    // retains the operator-selected worker settings, not an unrestricted default.
+    autonomousWorkerSettings: z
+      .array(
+        z.strictObject({
+          model: ModelIdSchema,
+          reasoningEffort: ReasoningEffortSchema,
+        }),
+      )
+      .max(32)
+      .default([]),
     requiredChecks: z.array(RequiredCheckSchema).max(100).default([]),
     writableScratch: z
       .array(RelativePath.refine((value) => value !== ".", "Scratch cannot be the repository root"))

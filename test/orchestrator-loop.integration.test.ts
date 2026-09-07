@@ -70,6 +70,28 @@ const memory: MemoryInput = {
 };
 
 describe("always engaged action loop", () => {
+  it("honors an operator pause during pre-decision preparation without creating or dispatching a ticket", async () => {
+    const { store, kernel, authority } = fixture();
+    const source: DecisionSource = {
+      async decide() {
+        throw new Error("Paused preparation must not invoke the coordinator");
+      },
+    };
+    const status = await new OrchestratorLoop(kernel, source, {
+      beforeDecision: async () => {
+        await delay(1);
+        store.orchestration.operatorControl(
+          authority.runId,
+          store.orchestration.control(authority.runId).controlVersion,
+          { kind: "pause" },
+        );
+      },
+    }).run(authority);
+    expect(status).toBe("paused");
+    expect(store.orchestration.control(authority.runId).decisionsUsed).toBe(0);
+    expect(store.orchestration.pendingDecision(authority.runId)).toBeNull();
+    expect(store.orchestration.actions(authority.runId)).toEqual([]);
+  });
   it("does not recursively grow inspection context across repeated decisions", async () => {
     const { kernel, authority } = fixture();
     let calls = 0;
