@@ -39,7 +39,12 @@ async function node(path: string, kind: "directory" | "socket") {
   const stat = await lstat(path, { bigint: true });
   if (!(kind === "directory" ? stat.isDirectory() : stat.isSocket()))
     throw new FixtureTransportError(`Expected fixture ${kind}`);
-  return { path, device: String(stat.dev), inode: String(stat.ino) };
+  return {
+    path,
+    device: String(stat.dev),
+    inode: String(stat.ino),
+    ...(kind === "socket" ? { changeTimeNs: String(stat.ctimeNs) } : {}),
+  };
 }
 
 /** Operator-only preparation: file inspection, never a server query or resource mutation. */

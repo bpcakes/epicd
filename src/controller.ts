@@ -25,8 +25,9 @@ import { registerCommitCapabilities } from "./kernel/commits.js";
 import { registerPublicationCapabilities } from "./kernel/publication.js";
 import { registerTrackerCapabilities } from "./kernel/tracker.js";
 import { registerSettingsCapabilities } from "./kernel/settings.js";
-import { registerFixtureCapabilities } from "./kernel/fixtures.js";
+import { registerFixtureCapabilities, reconcileFixtureCreation } from "./kernel/fixtures.js";
 import { PostgreSqlFixtureInspector } from "./adapters/fixtures.js";
+import { PostgreSqlFixtureCreator } from "./adapters/fixture-creation.js";
 import {
   registerDiagnosticWorkspaceCapabilities,
   reconcileDiagnosticWorkspace,
@@ -121,7 +122,8 @@ export class OrchestratorController {
       registerPublicationCapabilities(kernel, workspaces);
       registerTrackerCapabilities(kernel, new KernelBeads(config.trackerExecutable));
       registerSettingsCapabilities(kernel, this.store);
-      registerFixtureCapabilities(kernel, new PostgreSqlFixtureInspector());
+      const fixtureCreator = new PostgreSqlFixtureCreator();
+      registerFixtureCapabilities(kernel, new PostgreSqlFixtureInspector(), fixtureCreator);
       registerDiagnosticWorkspaceCapabilities(kernel, workspaces, state.repoPath);
 
       // A replaced controller lease is never evidence that its external work stopped.
@@ -142,6 +144,56 @@ export class OrchestratorController {
         }
       }
       await reconcileActions(journal, authority, async (action) => {
+        if (action.request.action.kind === "provision_declared_fixture") {
+          const creation = journal.fixtures
+            .creations(this.runId)
+            .find((item) => item.operationId === action.operationId);
+          if (!creation)
+            return {
+              status: "failed",
+              detail:
+                "No durable creation intent exists, so no CREATE dispatch could be authorized; the old controller is fenced",
+            };
+          if (creation) {
+            try {
+              const recovered = await reconcileFixtureCreation(
+                journal,
+                fixtureCreator,
+                authority!,
+                creation.creationId,
+                signal ?? new AbortController().signal,
+              );
+              if (recovered.status === "owned")
+                return {
+                  status: "succeeded",
+                  result: {
+                    kind: "resource",
+                    resourceId: recovered.creationId,
+                    generation: recovered.generation,
+                  },
+                };
+              if (recovered.status === "not_created")
+                return { status: "failed", detail: recovered.detail! };
+            } catch (error) {
+              journal.assertAuthority(authority!);
+              return {
+                status: "unresolved",
+                detail: `Fixture reconciliation could not establish the outcome: ${String(error)}. No mutation was replayed.`,
+              };
+            }
+          }
+          return {
+            status: "unresolved",
+            detail:
+              "Fixture creation needs confirmed PostgreSQL backend stop and exact resource provenance; no mutation was replayed",
+          };
+        }
+        if (action.request.action.kind === "reconcile_fixture_creation")
+          return {
+            status: "failed",
+            detail:
+              "Interrupted read-only fixture reconciliation has no retained action result. Inspect the recorded creation and choose another observation if needed; no provider mutation was replayed.",
+          };
         if (action.request.action.kind === "inspect_fixture")
           return {
             status: "failed",

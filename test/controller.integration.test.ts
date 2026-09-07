@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../dist/adapters/store.js";
 import { ControlledSdkRuntime } from "../dist/adapters/controlled-sdk.js";
 import { OrchestratorController, controlledDriver } from "../dist/controller.js";
+import { ActionKernel } from "../dist/kernel/actions.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import type {
   ControllerAuthority,
@@ -155,6 +156,8 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       "start_agent",
       "create_diagnostic_workspace",
       "inspect_fixture",
+      "provision_declared_fixture",
+      "reconcile_fixture_creation",
       "run_validation",
       "run_review",
       "request_commit",
@@ -214,6 +217,59 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     expect(second.orchestration.agents.turns(f.state.runId)).toHaveLength(3);
     expect(second.controllerLease(f.state.runId)).toBeNull();
   });
+  it.each([
+    {
+      kind: "provision_declared_fixture",
+      fixtureId: "never-reserved",
+      operation: "create",
+      expectedGeneration: 0,
+    },
+    { kind: "reconcile_fixture_creation", creationId: "lost-read" },
+  ] satisfies KernelAction[])(
+    "settles an interrupted $kind without an authorized external mutation",
+    async (action) => {
+      const f = fixture(),
+        journal = f.store.orchestration;
+      const lease = f.store.acquireLease(f.state.runId);
+      const authority = {
+        runId: f.state.runId,
+        ownerToken: lease.ownerToken,
+        leaseId: lease.leaseId,
+      };
+      const kernel = new ActionKernel(journal);
+      kernel.registerExternal(action.kind, async () => {
+        throw new Error("Lost result before any fixture intent or provider I/O");
+      });
+      const ticket = journal.beginDecision(
+        authority,
+        journal.latestObservationCursor(f.state.runId),
+        journal.control(f.state.runId).controlVersion,
+      );
+      const pending = await kernel.execute(
+        {
+          explanation: "Inject a pre-I/O interruption",
+          evidenceIds: [],
+          request: {
+            schemaVersion: 1,
+            decisionId: ticket.decisionId,
+            observationCursor: ticket.observationCursor,
+            expectedControlVersion: ticket.expectedControlVersion,
+            action,
+          },
+        },
+        authority,
+      );
+      const result =
+        pending.status === "running" ? await kernel.operation(pending.operationId) : pending;
+      expect(result?.status).toBe("indeterminate");
+      f.store.releaseLease(f.state.runId, authority.ownerToken);
+      await new OrchestratorController(f.store, f.state.runId, {
+        driver: f.driverFactory([question]),
+      }).run();
+      expect(journal.action(f.state.runId, pending.actionId)?.status).toBe("failed");
+      expect(journal.fixtures.creations(f.state.runId)).toEqual([]);
+    },
+  );
   it("pauses a live coordinator and waits for its supervised stop before releasing ownership", async () => {
     const f = fixture();
     const controller = new OrchestratorController(f.store, f.state.runId, {

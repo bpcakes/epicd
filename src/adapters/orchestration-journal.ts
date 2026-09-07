@@ -57,7 +57,7 @@ import {
 
 import { FixtureJournal, FIXTURE_TABLES, createFixturesSchema } from "./fixture-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 17;
+export const ORCHESTRATION_SCHEMA_VERSION = 18;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -208,6 +208,8 @@ export class OrchestrationJournal {
 
   constructor(private readonly db: Database.Database) {
     this.fixtures = new FixtureJournal(db, {
+      transaction: (authority, body) => this.transaction(authority, body),
+      action: (runId, actionId) => this.action(runId, actionId),
       control: (runId) => this.control(runId),
       policy: (runId) => this.policy(runId),
       operatorTransaction: (runId, version, body) =>
@@ -225,7 +227,9 @@ export class OrchestrationJournal {
           .immediate(),
       note: (runId, kind, summary) => {
         this.recordObservation(runId, {
-          source: "operator",
+          source: ["fixture.granted", "fixture.grant_revoked"].includes(kind)
+            ? "operator"
+            : "fixture-kernel",
           sourceEventId: randomUUID(),
           kind,
           summary,

@@ -4,7 +4,7 @@ Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra 
 
 This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Use a fresh state path. Unsupported existing data is left intact.
 
-The CLI and controlled runtimes are wired, but complete epic delivery is not yet ready. Final epic review/closure, declared fixture provisioning, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
+The CLI and controlled runtimes are wired, but complete epic delivery is not yet ready. Final epic review/closure, fixture reset/cleanup and scoped validation access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
 ## Requirements
 
@@ -54,7 +54,7 @@ The JSON declaration uses schema version 1. Include the checks that actually est
 }
 ```
 
-Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Fixture declarations do not themselves grant host-service authority. Explicit fixture grants and catalog inspection are implemented; provisioning and scoped fixture access for repository tests are not yet implemented.
+Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Fixture declarations do not themselves grant host-service authority. Explicit grants, catalog inspection and absent-database creation are implemented; reset, cleanup and scoped fixture access for repository tests are not yet implemented.
 
 Policy is frozen when a run is created. Editing the repository file does not change an existing run's permissions or required checks.
 
@@ -110,7 +110,7 @@ During a run, the orchestrator can invoke `change_agent_settings` within frozen 
 
 `create_diagnostic_workspace` gives specialists a writable private copy for experiments. With `candidate` and `revision` both null it copies the frozen epic baseline, even while implementation is active. A candidate identity selects its captured snapshot; an explicit revision must also identify that candidate's kernel-recorded exact commit. Candidate copying requires its source workspace to be stopped. The orchestrator then chooses `start_specialist`, follow-up, inspection or replacement through the selected SDK/native Herdr driver. Diagnostic edits and reports cannot satisfy delivery validation or independent review. Restart can recover a lost creation acknowledgement only from an intact recorded copy with confirmed I/O stop; it never recreates an uncertain copy or discards its delta.
 
-## Fixture authority and inspection
+## Fixture authority, inspection and creation
 
 Review the frozen fixture declarations in `status RUN_ID --json` before granting access. A declaration identifies its canonical local PostgreSQL socket directory, port, existing role, exact database and expected owner. Grant only the operations you intend, with an ISO-8601 UTC expiry in the next 24 hours:
 
@@ -127,7 +127,13 @@ Use the canonical native `psql` executable, not a shell wrapper such as `pg_wrap
 
 The orchestrator chooses when to invoke `inspect_fixture`. Its fixed read-only catalog query connects to the declared local server's `postgres` maintenance database using the declared role; startup files, inherited PostgreSQL environment and password files are not loaded. Only the trusted inspection process receives the exact socket, inside a separate PID/network sandbox. [The `psql` options reference](https://www.postgresql.org/docs/current/app-psql.html) documents the startup-file and error-stop controls used here.
 
-Inspection distinguishes a missing socket, an absent database, a present database and a failed query. Matching database ownership does not establish epicd ownership. Successful local authentication is not reported as proof of peer authentication, and neither observation grants service access to repository commands. `create`, `reset` and `cleanup` can be explicitly authorized within the declaration, but their capabilities remain unavailable until durable provisioning, ownership and cleanup are implemented.
+Inspection distinguishes a missing socket, an absent database, a present database and a failed query. Matching database ownership does not establish epicd ownership. Successful local authentication is not reported as proof of peer authentication, and neither observation grants service access to repository commands.
+
+To authorize creation too, use `--operations inspect,create` with a declaration that allows `create`. The orchestrator may then request `provision_declared_fixture` with `operation: "create"` and the observed `expectedGeneration` (initially 0). The kernel creates only an absent exact database, using the existing declared role. It does not install/start PostgreSQL, change roles or authentication rules, or adopt an existing database. The real provider contract is tested against PostgreSQL 18 with a non-superuser `CREATEDB` role; repository commands never receive that role's socket.
+
+Before mutation, SQLite records the generation, planned database OID, operation marker and exact creation backend. A one-use dispatch gate prevents mutation replay. The new database starts with connections disabled; a locked transaction verifies its identity before installing the ownership marker and enabling connections. Completion requires a separate observation proving that backend has stopped and the resource's OID, name, owner and marker match. [PostgreSQL's CREATE DATABASE reference](https://www.postgresql.org/docs/current/sql-createdatabase.html) describes the explicit OID, ownership and transaction constraints.
+
+`reconcile_fixture_creation` inspects a recorded creation without repeating SQL mutations. It requires an inspection grant after dispatch. An unmarked, changed or possibly still-running creation remains uncertain and is preserved. A replaced socket cannot prove that the old backend stopped. Only a never-dispatched intent, or confirmed backend stop followed by an absent resource, permits a new creation generation. Reset/cleanup remain unavailable, and successful creation does not make the fixture accessible to repository validation.
 
 ## Safety and recovery
 
@@ -171,7 +177,7 @@ Normal integration tests use owned temporary repositories and scripted provider 
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 
 ```bash
-EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin npm test -- test/fixture-postgresql.integration.test.ts
+EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin npm test -- test/fixture-postgresql.integration.test.ts test/fixture-creation-postgresql.integration.test.ts
 ```
 
 The original dispatcher and its dedicated tests have been removed. Their history remains in Git; old state, user repositories, and user-owned Herdr resources are not deleted by this hard cut.

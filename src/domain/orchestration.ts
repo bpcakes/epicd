@@ -112,6 +112,7 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
     limit: z.number().int().positive().max(65536),
   }),
   z.strictObject({ kind: z.literal("inspect_fixture"), fixtureId: Id }),
+  z.strictObject({ kind: z.literal("reconcile_fixture_creation"), creationId: Id }),
   z.strictObject({
     kind: z.literal("start_agent"),
     role: AgentRoleSchema.exclude(["orchestrator"]),

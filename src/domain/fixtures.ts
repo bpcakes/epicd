@@ -10,7 +10,7 @@ const NodeIdentity = z.strictObject({
 export const FixtureProviderBindingSchema = z.strictObject({
   executable: NodeIdentity.extend({ digest: z.string().regex(/^[a-f0-9]{64}$/) }),
   directory: NodeIdentity,
-  socket: NodeIdentity.nullable(),
+  socket: NodeIdentity.extend({ changeTimeNs: z.string().regex(/^\d+$/) }).nullable(),
 });
 export type FixtureProviderBinding = z.infer<typeof FixtureProviderBindingSchema>;
 export const FixtureGrantSchema = z.strictObject({
@@ -44,3 +44,46 @@ export const FixtureCatalogSchema = z.strictObject({
     .nullable(),
 });
 export type FixtureCatalog = z.infer<typeof FixtureCatalogSchema>;
+
+export const FixtureBackendSchema = z.strictObject({
+  pid: z.number().int().positive(),
+  startedAt: z.string().regex(/^\d{1,20}(\.\d{1,6})?$/),
+});
+export type FixtureBackend = z.infer<typeof FixtureBackendSchema>;
+export const FixtureCreationObservationSchema = z.strictObject({
+  backendStopped: z.boolean(),
+  database: z
+    .strictObject({
+      oid: z.string().max(10).regex(/^\d+$/),
+      name: z.string().min(1).max(63),
+      owner: z.string().min(1).max(63),
+      markerMatches: z.boolean(),
+      allowConnections: z.boolean(),
+    })
+    .nullable(),
+});
+export type FixtureCreationObservation = z.infer<typeof FixtureCreationObservationSchema>;
+export const FixtureCreationSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  creationId: z.uuid(),
+  runId: z.string().min(1),
+  fixtureId: z.string().min(1).max(256),
+  operationId: z.string().min(1),
+  generation: z.number().int().positive(),
+  policyDigest: z.string(),
+  definitionDigest: z.string(),
+  grantId: z.uuid(),
+  binding: FixtureProviderBindingSchema,
+  plannedOid: z.number().int().min(16384).max(4294967295),
+  marker: z.string().min(1).max(256),
+  alias: z.string().regex(/^epicd_lock_[a-f0-9]{32}$/),
+  controllerLeaseId: z.string(),
+  status: z.enum(["reserved", "dispatching", "owned", "not_created", "uncertain"]),
+  backend: FixtureBackendSchema.nullable(),
+  clientStopEvidence: z.string().max(4000).nullable(),
+  observation: FixtureCreationObservationSchema.nullable(),
+  detail: z.string().max(4000).nullable(),
+  createdAt: z.iso.datetime(),
+  finishedAt: z.iso.datetime().nullable(),
+});
+export type FixtureCreation = z.infer<typeof FixtureCreationSchema>;

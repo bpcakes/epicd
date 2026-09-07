@@ -99,7 +99,7 @@ export function createProgram() {
     .requiredOption("--control-version <number>", "version observed in status", versionNumber)
     .requiredOption(
       "--operations <list>",
-      "comma-separated inspect,create,reset,cleanup; provisioning is not implemented yet",
+      "comma-separated inspect,create,reset,cleanup; reset and cleanup are not implemented yet",
     )
     .requiredOption("--expires-at <ISO-time>", "expiry within the next 24 hours")
     .requiredOption(

@@ -39,7 +39,7 @@ const definition = FixtureDefinitionSchema.parse({
 const binding: FixtureProviderBinding = {
   executable: { path: "/usr/bin/psql", device: "1", inode: "2", digest: "a".repeat(64) },
   directory: { path: definition.socketDirectory, device: "1", inode: "3" },
-  socket: { path: "/fixture-socket/.s.PGSQL.5432", device: "1", inode: "4" },
+  socket: { path: "/fixture-socket/.s.PGSQL.5432", device: "1", inode: "4", changeTimeNs: "1" },
 };
 const catalog = {
   serverVersion: "180000",
