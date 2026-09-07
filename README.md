@@ -226,6 +226,7 @@ The model chooses the next useful capability. The kernel validates control versi
 - Only the kernel claims/closes Beads and stages/commits/publishes Git changes.
 - Implementation and review use private repository copies. The user's checkout and index are not a scratch workspace.
 - Review judgments and validation evidence are tied to exact candidate/workspace/turn identities; actual-SHA verification is separate from pre-commit review.
+- `inspect_review` explains approval through a current kernel-derived assessment: the latest evidence ID, first unsatisfied condition and bounded references. The same evaluator guards commits. A review's `requiredChecks` lists outstanding demands, not already-satisfied tests; earlier demands remain binding after later reports or reviewer replacement.
 - A task close requires a current verified publication and claim. The installed Beads close interface lacks atomic expected-owner/parentage comparison; fresh before/after checks detect conflicts but cannot eliminate that race. This remains a release blocker.
 - Container closure requires proven closure of its own descendants; unrelated root tasks may remain open. Root closure additionally requires current independent whole-epic verification at the published SHA or its proven tracker-only ancestor. Neither a model verdict nor a successful Beads exit code substitutes for those proofs.
 - `complete_run` inspects the live tracker graph and both publication refs, verifies this run's root-closure markers, published closed-scope tracker export and stopped work, then records completion and the successful action result in one SQLite transaction. Interrupted inspections can be reconciled without repeating a close. Workspaces, agent sessions, publication artifacts, tracker export copies and owned fixtures are explicitly retained for inspection, not silently deleted.
@@ -266,7 +267,7 @@ The unscripted SDK delivery acceptance uses the existing Codex authentication ca
 EPICD_LIVE_DELIVERY=1 npm test -- test/model-led-delivery.integration.test.ts
 ```
 
-It allows up to 20 minutes of actual Astra work and always retains its printed private `/var/tmp/epicd-live-delivery-*` directory for diagnosis. It does not use the project's tracker or modify the user's checkout. This is an unfinished release check: the current recorded run reaches independent review but fails on an approval-contract diagnostic gap. Native Herdr delivery acceptance remains separate.
+It allows up to 20 minutes of actual Astra work and always retains its printed private `/var/tmp/epicd-live-delivery-*` directory for diagnosis. It does not use the project's tracker or modify the user's checkout. This is an unfinished release check: the current recorded run creates and independently verifies a local commit, publishes it and closes the real task and epic, but exhausts coordinator context before final tracker publication and run completion. Bounded context rollover is still required. Native Herdr delivery acceptance remains separate.
 
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 

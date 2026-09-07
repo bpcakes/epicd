@@ -19,6 +19,8 @@ export const AdaptiveReviewResultSchema = z.strictObject({
   validationPlanId: Id,
   planAdequacy: z.enum(["adequate", "inadequate"]),
   adequacyReason: z.string().min(1).max(4000),
+  // Outstanding reviewer demands, not a summary of checks already satisfied.
+  // Any current demand blocks approval; earlier demands remain in the task ledger.
   requiredChecks: z.array(RequiredCheckSchema).max(100),
   validationEvidenceIds: z.array(Id).max(100),
   findings: z.array(AdaptiveFindingSchema).max(100),
@@ -35,6 +37,43 @@ export const AdaptiveReviewResultSchema = z.strictObject({
 });
 export type AdaptiveReviewResult = z.infer<typeof AdaptiveReviewResultSchema>;
 export const ADAPTIVE_REVIEW_OUTPUT_SCHEMA = agentOutputSchema(AdaptiveReviewResultSchema);
+
+export type ReviewApprovalBlockerCode =
+  | "review_missing"
+  | "candidate_mismatch"
+  | "review_unfinished"
+  | "review_source_changed"
+  | "review_failed"
+  | "review_report_missing"
+  | "review_turn_ineligible"
+  | "review_work_pending"
+  | "verdict_not_approved"
+  | "plan_inadequate"
+  | "reported_findings"
+  | "reviewer_required_checks"
+  | "candidate_not_current"
+  | "unresolved_findings"
+  | "revision_not_available"
+  | "missing_validation"
+  | "uncited_validation"
+  | "retained_checks_missing"
+  | "reviewer_turn_superseded";
+
+/** Derived current evidence, never a persisted approval flag or permission token. */
+export type ReviewApprovalAssessment =
+  | { approved: true; evidenceId: string; latestEvidenceId: string; blocker: null }
+  | {
+      approved: false;
+      evidenceId: null;
+      latestEvidenceId: string | null;
+      /** First unsatisfied predicate; later predicates are not established by this result. */
+      blocker: {
+        code: ReviewApprovalBlockerCode;
+        detail: string;
+        referenceIds: string[];
+        omittedReferenceCount: number;
+      };
+    };
 
 export const ReviewEvidenceSchema = z
   .strictObject({

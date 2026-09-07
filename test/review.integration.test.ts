@@ -10,6 +10,164 @@ import type { AdaptiveReviewResult } from "../src/domain/reviews.js";
 import { fixture, check, finding, git, success, target, waitFor } from "./fixtures/review.js";
 
 describe.skipIf(process.platform !== "linux")("independent pre-commit review evidence", () => {
+  it(
+    "explains outstanding reviewer demands and admits only a fresh independent reassessment",
+    { timeout: 15_000 },
+    async () => {
+      const s = await fixture(),
+        run = s.authority.runId;
+      const candidate = await s.capture(await s.define());
+      expect(s.journal.reviews.assessApproval(run, candidate)).toMatchObject({
+        approved: false,
+        latestEvidenceId: null,
+        blocker: { code: "review_missing" },
+      });
+      await s.validate(candidate, await s.copy(candidate));
+      const reviewed = await s.review(candidate, { requiredChecks: [check] });
+      const expected = {
+        approved: false,
+        evidenceId: null,
+        latestEvidenceId: reviewed.evidence.evidenceId,
+        blocker: {
+          code: "reviewer_required_checks",
+          referenceIds: [check.id],
+          omittedReferenceCount: 0,
+        },
+      };
+      expect(s.journal.reviews.assessApproval(run, candidate)).toMatchObject(expected);
+      expect(s.journal.reviews.approval(run, candidate)).toBeNull();
+      const inspected = success(
+        await s.dispatch({ kind: "inspect_review", evidenceId: reviewed.evidence.evidenceId }),
+      );
+      if (inspected.kind !== "inspection") throw new Error("Expected inspection");
+      expect(JSON.parse(inspected.text)).toMatchObject({
+        currentApproval: false,
+        approvalAssessment: expected,
+      });
+      expect(s.journal.reviews.summaries(run)[0]).toMatchObject({
+        approved: false,
+        approvalBlocker: "reviewer_required_checks",
+      });
+      const denied = await s.dispatch({
+        kind: "request_commit",
+        ...candidate,
+        subject: "Cannot bypass demands",
+      });
+      expect(denied).toMatchObject({ status: "rejected", code: "commit_not_approved" });
+      expect(JSON.stringify(denied)).toContain("reviewer_required_checks");
+      expect(JSON.stringify(denied)).toContain(check.id);
+      expect(s.journal.commits.forCandidate(run, candidate)).toBeNull();
+      const agent = s.journal.agents.instance(run, reviewed.evidence.turnIdentity!);
+      if (agent.provider?.runtime !== "sdk") throw new Error("Expected SDK session");
+      s.response(
+        s.report(candidate, {
+          requiredChecks: [],
+          residualRisks: ["The next delivery phase still requires exact-SHA verification."],
+        }),
+        [],
+        agent.provider.sessionId,
+      );
+      success(
+        await s.dispatch({
+          kind: "run_review",
+          ...candidate,
+          ...target(reviewed.reviewCopy),
+          agent: { agentId: agent.agentId, agentGeneration: agent.agentGeneration },
+          instructions: "Reassess the unchanged candidate and retained evidence independently.",
+        }),
+      );
+      const latest = s.journal.reviews.records(run).at(-1)!;
+      expect(s.journal.reviews.assessApproval(run, candidate)).toEqual({
+        approved: true,
+        evidenceId: latest.evidenceId,
+        latestEvidenceId: latest.evidenceId,
+        blocker: null,
+      });
+      expect(s.journal.reviews.requiredChecks(run, "demo.1")).toEqual([check]);
+      const historical = success(
+        await s.dispatch({ kind: "inspect_review", evidenceId: reviewed.evidence.evidenceId }),
+      );
+      if (historical.kind !== "inspection") throw new Error("Expected inspection");
+      expect(JSON.parse(historical.text)).toMatchObject({
+        currentApproval: false,
+        approvalAssessment: { approved: true, evidenceId: latest.evidenceId },
+      });
+      success(
+        await s.dispatch({
+          kind: "request_commit",
+          ...candidate,
+          subject: "Implement independently approved green behavior",
+        }),
+      );
+      expect(s.journal.commits.forCandidate(run, candidate)?.reviewEvidenceId).toBe(
+        latest.evidenceId,
+      );
+      expect(s.reopen().orchestration.reviews.assessApproval(run, candidate).approved).toBe(true);
+    },
+  );
+
+  it(
+    "bounds approval references and cannot erase earlier check demands by clearing the current report",
+    { timeout: 15_000 },
+    async () => {
+      const s = await fixture(),
+        run = s.authority.runId;
+      const candidate = await s.capture(await s.define());
+      await s.validate(candidate, await s.copy(candidate));
+      const demands = Array.from({ length: 12 }, (_, i) => ({ ...check, id: `additional-${i}` }));
+      await s.review(candidate, { requiredChecks: demands });
+      expect(s.journal.reviews.assessApproval(run, candidate)).toMatchObject({
+        approved: false,
+        blocker: {
+          code: "reviewer_required_checks",
+          referenceIds: demands.slice(0, 10).map((entry) => entry.id),
+          omittedReferenceCount: 2,
+        },
+      });
+      await s.review(candidate, { requiredChecks: [] });
+      expect(s.journal.reviews.assessApproval(run, candidate)).toMatchObject({
+        approved: false,
+        blocker: { code: "retained_checks_missing", omittedReferenceCount: 2 },
+      });
+      expect(s.journal.reviews.requiredChecks(run, "demo.1")).toEqual(demands);
+      expect(
+        await s.dispatch({
+          kind: "request_commit",
+          ...candidate,
+          subject: "Cannot erase requirements",
+        }),
+      ).toMatchObject({ status: "rejected", code: "commit_not_approved" });
+      expect(s.journal.commits.forCandidate(run, candidate)).toBeNull();
+    },
+  );
+
+  it(
+    "distinguishes missing validation from passing evidence that was never assessed by the reviewer",
+    { timeout: 15_000 },
+    async () => {
+      const s = await fixture(),
+        run = s.authority.runId;
+      const candidate = await s.capture(await s.define());
+      await s.review(candidate);
+      expect(s.journal.reviews.assessApproval(run, candidate)).toMatchObject({
+        approved: false,
+        blocker: { code: "missing_validation", referenceIds: [check.id] },
+      });
+      const validated = await s.validate(candidate, await s.copy(candidate));
+      if (validated.kind !== "validation") throw new Error("Expected validation");
+      expect(s.journal.reviews.assessApproval(run, candidate)).toMatchObject({
+        approved: false,
+        blocker: { code: "uncited_validation", referenceIds: [validated.evidenceId] },
+      });
+      const reviewed = await s.review(candidate);
+      expect(s.journal.reviews.assessApproval(run, candidate)).toMatchObject({
+        approved: true,
+        evidenceId: reviewed.evidence.evidenceId,
+        blocker: null,
+      });
+    },
+  );
+
   it("keeps unresolved findings when a stopped reviewer conversation is retired", async () => {
     const s = await fixture();
     const run = s.authority.runId;
@@ -356,7 +514,15 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
       await s.dispatch({ kind: "inspect_review", evidenceId: first.evidence.evidenceId }),
     );
     if (inspect.kind !== "inspection") throw new Error("Expected inspection");
-    expect(JSON.parse(inspect.text)).toMatchObject({ reportOmitted: true, findingCount: 16 });
+    expect(JSON.parse(inspect.text)).toMatchObject({
+      reportOmitted: true,
+      findingCount: 16,
+      approvalAssessment: {
+        approved: false,
+        latestEvidenceId: first.evidence.evidenceId,
+        blocker: { code: "verdict_not_approved" },
+      },
+    });
     let offset: number | null = 0;
     let record = "";
     while (offset !== null) {

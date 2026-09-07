@@ -22,10 +22,17 @@ export function registerReviewCapabilities(
       authority.runId,
       action.evidenceId,
     );
+    const approvalAssessment = journal.reviews.assessApproval(
+      authority.runId,
+      review,
+      review.phase,
+    );
     const content = {
       ...review,
-      currentApproval:
-        journal.reviews.approval(authority.runId, review, review.phase) === review.evidenceId,
+      currentApproval: approvalAssessment.evidenceId === review.evidenceId,
+      approvalAssessment,
+      approvalWarning:
+        "Derived current candidate/phase assessment; latestEvidenceId identifies the report evaluated. A blocker is the first unsatisfied condition, not an exhaustive list. Historical reports cannot replace the latest review.",
       evidenceWarning:
         review.phase === "pre_commit"
           ? "Independent judgment on a synthetic pre-commit snapshot, not exact-commit verification"
@@ -39,6 +46,8 @@ export function registerReviewCapabilities(
           candidateId: review.candidateId,
           status: review.status,
           currentApproval: content.currentApproval,
+          approvalAssessment,
+          approvalWarning: content.approvalWarning,
           verdict: review.report?.verdict ?? null,
           failure: review.failure,
           reportOmitted: true,

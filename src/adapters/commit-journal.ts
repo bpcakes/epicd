@@ -76,11 +76,12 @@ export class CommitJournal {
           "commit_source",
           "A published epic target is read-only; repairs need a separately reviewed implementation candidate",
         );
-      const approved = this.access.reviews.approval(authority.runId, candidate);
+      const assessment = this.access.reviews.assessApproval(authority.runId, candidate);
+      const approved = assessment.evidenceId;
       if (!approved || !candidate.snapshot)
         throw new DeliveryError(
           "commit_not_approved",
-          "Commit requires current independent approval, passing pre-commit checks and no unresolved findings",
+          `Commit requires current independent approval, passing pre-commit checks and no unresolved findings. Current assessment: ${JSON.stringify(assessment)}`,
         );
       if (this.forCandidate(authority.runId, candidate))
         throw new DeliveryError(
