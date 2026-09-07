@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
-import type { ControlledSdkRuntime } from "../adapters/controlled-sdk.js";
+import type { ControlledAgentDriver } from "../kernel/agents.js";
 import type { AgentIdentity } from "../domain/agents.js";
 import { DecisionSourceError, type DecisionSourceAttempt } from "../domain/decision-source.js";
 import {
@@ -23,13 +23,13 @@ export const DECISION_OUTPUT_SCHEMA = agentOutputSchema(
   }),
 );
 
-/** Native SDK decision transport. It can reason and emit requests, but cannot execute delivery capabilities. */
-export class SdkDecisionSource implements DecisionSource {
+/** A controlled agent emits requests; only the kernel executes delivery capabilities. */
+export class ControlledDecisionSource implements DecisionSource {
   constructor(
     private readonly journal: OrchestrationJournal,
     private readonly authority: ControllerAuthority,
     private readonly agent: AgentIdentity,
-    private readonly runtime: ControlledSdkRuntime,
+    private readonly runtime: ControlledAgentDriver,
   ) {}
 
   async decide(
@@ -60,12 +60,12 @@ export class SdkDecisionSource implements DecisionSource {
     const instance = this.journal.agents.instance(this.authority.runId, this.agent);
     if (
       instance.role !== "orchestrator" ||
-      instance.contract.runtime !== "sdk" ||
+      instance.contract.runtime !== this.runtime.kind ||
       instance.contract.effective.model !== ADAPTIVE_ORCHESTRATOR_MODEL
     )
       throw new DecisionSourceError(
         "configuration",
-        "Coordinator requires its pinned Astra SDK assignment; no model fallback is allowed",
+        "Coordinator requires its pinned Astra runtime assignment; no model fallback is allowed",
       );
     const turn = this.journal.agents.prepareTurn(
       this.authority,
@@ -93,3 +93,6 @@ export class SdkDecisionSource implements DecisionSource {
     await this.runtime.reconcile(this.authority, attempt.turnIdentity);
   }
 }
+
+// Preserve the existing SDK constructor export while the bootstrap adopts the shared source.
+export { ControlledDecisionSource as SdkDecisionSource };

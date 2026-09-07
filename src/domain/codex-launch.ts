@@ -46,10 +46,23 @@ export const CodexLaunchStopSchema = z
   );
 export type CodexLaunchStop = z.infer<typeof CodexLaunchStopSchema>;
 
+export const NativeLaunchEndpointSchema = z.strictObject({
+  sessionName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/),
+  socketPath: LaunchPathSchema,
+  socketIdentity: z.string().min(1).max(256),
+  workspaceId: z.string().min(1).max(256),
+  tabId: z.string().min(1).max(256),
+  paneId: z.string().min(1).max(256),
+  terminalId: z.string().min(1).max(256),
+  name: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
+});
+export type NativeLaunchEndpoint = z.infer<typeof NativeLaunchEndpointSchema>;
+
 export const TurnLaunchSchema = z.strictObject({
   controllerLeaseId: z.string().min(1),
   manifest: CodexLaunchSchema,
   manifestDigest: z.string().length(64),
   stop: CodexLaunchStopSchema.nullable(),
+  native: NativeLaunchEndpointSchema.nullable().default(null),
 });
 export type TurnLaunch = z.infer<typeof TurnLaunchSchema>;

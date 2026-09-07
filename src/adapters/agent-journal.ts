@@ -40,6 +40,8 @@ import {
   CodexLaunchStopSchema,
   type CodexLaunch,
   type CodexLaunchStop,
+  NativeLaunchEndpointSchema,
+  type NativeLaunchEndpoint,
 } from "../domain/codex-launch.js";
 
 export const AGENT_TABLES = [
@@ -110,6 +112,9 @@ export function migrateAgents(db: Database.Database): void {
       WHERE json_extract(record_json, '$.launch') IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS one_turn_launch_directory ON agent_turns(json_extract(record_json, '$.launch.manifest.controlDirectory'))
       WHERE json_extract(record_json, '$.launch') IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS one_turn_native_terminal ON agent_turns(
+      json_extract(record_json, '$.launch.native.socketIdentity'), json_extract(record_json, '$.launch.native.terminalId'))
+      WHERE json_extract(record_json, '$.launch.native') IS NOT NULL;
     CREATE TABLE IF NOT EXISTS agent_messages (
       message_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
       agent_id TEXT NOT NULL, agent_generation INTEGER NOT NULL, operation_id TEXT NOT NULL UNIQUE,
@@ -590,27 +595,41 @@ export class AgentJournal {
     });
   }
 
-  /** A fresh SDK session ID arrives in thread.started, after the durable dispatch intent. */
+  /** Runtime identity arrives after durable dispatch intent; native endpoints must already be bound. */
   bindTurnProvider(
     authority: ControllerAuthority,
     identity: TurnIdentity,
-    input: Extract<ProviderIdentity, { runtime: "sdk" }>,
+    input: ProviderIdentity,
   ): AgentInstance {
     return this.access.transaction(authority, () => {
       const turn = this.turn(authority.runId, identity);
       const agent = this.instance(authority.runId, identity);
       if (
-        agent.contract.runtime !== "sdk" ||
+        agent.contract.runtime !== input.runtime ||
         agent.activeTurnId !== identity.turnId ||
         terminal(turn) ||
         turn.status === "prepared"
       )
         throw new AgentCoordinationError(
           "stale_turn",
-          "Provider start event does not belong to the exact dispatched SDK turn",
+          "Provider start event does not belong to the exact dispatched turn",
         );
+      if (input.runtime === "herdr") {
+        const native = turn.launch?.native;
+        if (
+          !native ||
+          native.name !== input.name ||
+          native.paneId !== input.paneId ||
+          native.tabId !== input.tabId ||
+          native.terminalId !== input.terminalId
+        )
+          throw new AgentCoordinationError(
+            "wrong_native_endpoint",
+            "Native provider does not match the bound launch endpoint",
+          );
+      }
       // Revoked instances may still reveal identity for cleanup; never restore their authority.
-      return this.recordProvider(authority, agent, input);
+      return this.recordProvider(authority, agent, input, input.runtime === "herdr");
     });
   }
 
@@ -618,6 +637,7 @@ export class AgentJournal {
     authority: ControllerAuthority,
     agent: AgentInstance,
     input: ProviderIdentity,
+    nativeTurnBinding = false,
   ): AgentInstance {
     const provider = ProviderIdentitySchema.parse(input);
     if (provider.runtime !== agent.contract.runtime)
@@ -633,7 +653,19 @@ export class AgentJournal {
         agent.provider.sessionId === null &&
         provider.sessionId !== null &&
         digestJson({ ...provider, sessionId: null }) === digestJson(agent.provider);
-      if (!initialNativeSession)
+      const resumedNativeTerminal =
+        nativeTurnBinding &&
+        agent.provider.runtime === "herdr" &&
+        provider.runtime === "herdr" &&
+        (agent.provider.sessionId === null || provider.sessionId === agent.provider.sessionId) &&
+        this.turns(authority.runId).every(
+          (turn) =>
+            turn.identity.agentId !== agent.agentId ||
+            turn.identity.agentGeneration !== agent.agentGeneration ||
+            turn.identity.turnId === agent.activeTurnId ||
+            terminal(turn),
+        );
+      if (!initialNativeSession && !resumedNativeTerminal)
         throw new AgentCoordinationError(
           "provider_changed",
           "Provider identity cannot be replaced in place",
@@ -766,9 +798,7 @@ export class AgentJournal {
       const workspace = this.workspace(authority.runId, agent);
       const available =
         (agent.status === "ready" && agent.provider !== null) ||
-        (agent.status === "reserved" &&
-          agent.contract.runtime === "sdk" &&
-          agent.provider === null);
+        (agent.status === "reserved" && agent.provider === null);
       if (
         !available ||
         agent.activeTurnId ||
@@ -951,9 +981,62 @@ export class AgentJournal {
             );
         }
       }
-      turn.launch = { controllerLeaseId: authority.leaseId, manifest, manifestDigest, stop: null };
+      turn.launch = {
+        controllerLeaseId: authority.leaseId,
+        manifest,
+        manifestDigest,
+        stop: null,
+        native: null,
+      };
       this.saveTurn(turn);
       this.event(authority, "agent.launch_reserved", identity.turnId, identity);
+      return turn;
+    });
+  }
+
+  /** Persist the observed owned terminal before issuing native agent start. */
+  bindNativeLaunch(
+    authority: ControllerAuthority,
+    identity: TurnIdentity,
+    input: NativeLaunchEndpoint,
+  ): TurnRecord {
+    return this.access.transaction(authority, () => {
+      const turn = this.turn(authority.runId, identity);
+      const agent = this.instance(authority.runId, identity);
+      const native = NativeLaunchEndpointSchema.parse(input);
+      this.active(authority);
+      this.requireCurrent(turn);
+      if (
+        agent.contract.runtime !== "herdr" ||
+        !turn.launch ||
+        turn.launch.controllerLeaseId !== authority.leaseId ||
+        turn.status !== "submitting"
+      )
+        throw new AgentCoordinationError(
+          "wrong_native_launch",
+          "Native endpoint requires the current controlled Herdr launch",
+        );
+      if (turn.launch.native && digestJson(turn.launch.native) !== digestJson(native))
+        throw new AgentCoordinationError(
+          "native_endpoint_changed",
+          "Native launch endpoint cannot be replaced",
+        );
+      if (!turn.launch.native) {
+        if (
+          this.db
+            .prepare(
+              "SELECT 1 FROM agent_turns WHERE json_extract(record_json, '$.launch.native.socketIdentity') = ? AND json_extract(record_json, '$.launch.native.terminalId') = ?",
+            )
+            .get(native.socketIdentity, native.terminalId)
+        )
+          throw new AgentCoordinationError(
+            "native_endpoint_in_use",
+            "Native terminal already belongs to another launch",
+          );
+        turn.launch.native = native;
+        this.saveTurn(turn);
+        this.event(authority, "agent.native_bound", identity.turnId, identity);
+      }
       return turn;
     });
   }

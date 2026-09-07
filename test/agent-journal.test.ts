@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
+import { ControlledLaunches } from "../src/adapters/controlled-launch.js";
+import type { NativeLaunchEndpoint } from "../src/domain/codex-launch.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import {
@@ -65,6 +67,7 @@ function fixture(maxWorkers = 4) {
   function reserve(
     purpose: "implementation" | "review" | "specialist" = "implementation",
     replaces?: AgentIdentity,
+    runtime: "sdk" | "herdr" = "sdk",
   ) {
     const ws = workspace(purpose === "specialist" ? "diagnostic" : purpose);
     const settings = { model: "worker-model", reasoningEffort: "high" as const };
@@ -77,8 +80,11 @@ function fixture(maxWorkers = 4) {
         taskId: "demo.1",
         candidateId: purpose === "review" ? "candidate" : null,
         instructions: "Investigate and report the actual outcome",
-        contract: SdkAgentSessionContractSchema.parse({
-          runtime: "sdk",
+        contract: (runtime === "sdk"
+          ? SdkAgentSessionContractSchema
+          : HerdrAgentSessionContractSchema
+        ).parse({
+          runtime,
           requested: settings,
           effective: settings,
         }),
@@ -113,6 +119,11 @@ function fixture(maxWorkers = 4) {
   };
   const db = new Database(path);
   databases.push(db);
+  const launches = new ControlledLaunches({
+    root: join(root, "runtime"),
+    executable: process.execPath,
+    authCachePath: null,
+  });
   return {
     root,
     path,
@@ -127,6 +138,22 @@ function fixture(maxWorkers = 4) {
     prepare,
     submit,
     db,
+    launches,
+    native: (purpose: "implementation" | "review" = "implementation") =>
+      reserve(purpose, undefined, "herdr"),
+  };
+}
+
+function nativeEndpoint(root: string): NativeLaunchEndpoint {
+  return {
+    sessionName: "owned",
+    socketPath: join(root, "herdr.sock"),
+    socketIdentity: "one-server-incarnation",
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    paneId: "w1:p1",
+    terminalId: randomUUID(),
+    name: "owned-agent",
   };
 }
 function decision(setup: ReturnType<typeof fixture>, action: KernelAction): OrchestratorDecision {
@@ -149,6 +176,186 @@ function decision(setup: ReturnType<typeof fixture>, action: KernelAction): Orch
 }
 
 describe("durable agent coordination", () => {
+  it("binds a native terminal once before accepting provider identity and never reuses it for a later turn", () => {
+    const setup = fixture();
+    const agent = setup.native();
+    const prepared = setup.prepare(agent);
+    const { turn, manifest } = setup.launches.reserve(
+      setup.journal,
+      setup.authority,
+      prepared.identity,
+    );
+    const endpoint = nativeEndpoint(setup.root);
+    const provider = {
+      runtime: "herdr" as const,
+      name: endpoint.name,
+      paneId: endpoint.paneId,
+      tabId: endpoint.tabId,
+      terminalId: endpoint.terminalId,
+      sessionId: randomUUID(),
+    };
+    expect(() => setup.agents.bindTurnProvider(setup.authority, turn.identity, provider)).toThrow(
+      "bound launch endpoint",
+    );
+    expect(
+      setup.agents.bindNativeLaunch(setup.authority, turn.identity, endpoint).launch?.native,
+    ).toEqual(endpoint);
+    expect(
+      setup.agents.bindNativeLaunch(setup.authority, turn.identity, endpoint).launch?.native,
+    ).toEqual(endpoint);
+    expect(() =>
+      setup.agents.bindNativeLaunch(setup.authority, turn.identity, {
+        ...endpoint,
+        terminalId: "replacement",
+      }),
+    ).toThrow("cannot be replaced");
+    expect(() =>
+      setup.agents.bindTurnProvider(setup.authority, turn.identity, {
+        ...provider,
+        paneId: "another-pane",
+      }),
+    ).toThrow("bound launch endpoint");
+    setup.agents.bindTurnProvider(setup.authority, turn.identity, { ...provider, sessionId: null });
+    setup.agents.bindTurnProvider(setup.authority, turn.identity, provider);
+    setup.agents.acknowledgePrompt(
+      setup.authority,
+      turn.identity,
+      turn.promptDigest,
+      "Fixture exact accepted input",
+    );
+    setup.agents.recordLaunchStop(setup.authority, turn.identity, {
+      generation: manifest.generation,
+      kind: "stopped",
+      code: 0,
+      signal: null,
+      interrupted: false,
+      processTreeStopped: true,
+      stoppedAt: new Date().toISOString(),
+    });
+    setup.agents.finishTurn(setup.authority, turn.identity, {
+      status: "completed",
+      result: {},
+      stopEvidence: "Fixture trusted process stop",
+    });
+
+    const next = setup.launches.reserve(
+      setup.journal,
+      setup.authority,
+      setup.prepare(agent).identity,
+    ).turn;
+    expect(() => setup.agents.bindNativeLaunch(setup.authority, next.identity, endpoint)).toThrow(
+      "another launch",
+    );
+    const nextEndpoint = {
+      ...endpoint,
+      terminalId: randomUUID(),
+      paneId: "w1:p2",
+      tabId: "w1:t2",
+      name: "next-agent",
+    };
+    setup.agents.bindNativeLaunch(setup.authority, next.identity, nextEndpoint);
+    const nextProvider = {
+      ...provider,
+      name: nextEndpoint.name,
+      terminalId: nextEndpoint.terminalId,
+      paneId: nextEndpoint.paneId,
+      tabId: nextEndpoint.tabId,
+    };
+    expect(() =>
+      setup.agents.bindTurnProvider(setup.authority, next.identity, {
+        ...nextProvider,
+        sessionId: randomUUID(),
+      }),
+    ).toThrow("replaced in place");
+    expect(
+      setup.agents.bindTurnProvider(setup.authority, next.identity, nextProvider).provider,
+    ).toEqual(nextProvider);
+    expect(() => setup.agents.bindTurnProvider(setup.authority, turn.identity, provider)).toThrow(
+      "exact dispatched turn",
+    );
+    expect(setup.agents.turn(setup.authority.runId, turn.identity).launch?.native).toEqual(
+      endpoint,
+    );
+  });
+
+  it("excludes another native agent from the same terminal and fences old-controller endpoint binding", () => {
+    const setup = fixture();
+    const first = setup.launches.reserve(
+      setup.journal,
+      setup.authority,
+      setup.prepare(setup.native()).identity,
+    ).turn;
+    const second = setup.launches.reserve(
+      setup.journal,
+      setup.authority,
+      setup.prepare(setup.native("review")).identity,
+    ).turn;
+    const endpoint = nativeEndpoint(setup.root);
+    setup.agents.bindNativeLaunch(setup.authority, first.identity, endpoint);
+    expect(() => setup.agents.bindNativeLaunch(setup.authority, second.identity, endpoint)).toThrow(
+      "another launch",
+    );
+    setup.store.releaseLease(setup.authority.runId, setup.authority.ownerToken);
+    const lease = setup.store.acquireLease(setup.authority.runId);
+    const authority = {
+      runId: setup.authority.runId,
+      ownerToken: lease.ownerToken,
+      leaseId: lease.leaseId,
+    };
+    expect(() =>
+      setup.agents.bindNativeLaunch(setup.authority, second.identity, nativeEndpoint(setup.root)),
+    ).toThrow();
+    expect(() =>
+      setup.agents.bindNativeLaunch(authority, second.identity, nativeEndpoint(setup.root)),
+    ).toThrow("current controlled Herdr launch");
+    expect(setup.agents.turn(authority.runId, second.identity).launch?.native).toBeNull();
+  });
+
+  it("snapshots schema-six launch records before adding native terminal ownership", () => {
+    const setup = fixture();
+    const turn = setup.launches.reserve(
+      setup.journal,
+      setup.authority,
+      setup.prepare(setup.reserve()).identity,
+    ).turn;
+    setup.db.exec(
+      "DROP INDEX one_turn_native_terminal; DELETE FROM orchestration_schema; INSERT INTO orchestration_schema(version) VALUES (6)",
+    );
+    setup.db
+      .prepare(
+        "UPDATE agent_turns SET record_json = json_remove(record_json, '$.launch.native') WHERE turn_id = ?",
+      )
+      .run(turn.identity.turnId);
+    const original = setup.db
+      .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
+      .get(turn.identity.turnId);
+    const upgraded = new StateStore(setup.path);
+    stores.push(upgraded);
+    expect(
+      upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity).launch?.native,
+    ).toBeNull();
+    expect(
+      setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 7 });
+    expect(
+      setup.db
+        .prepare("SELECT name FROM sqlite_master WHERE name = 'one_turn_native_terminal'")
+        .get(),
+    ).toEqual({ name: "one_turn_native_terminal" });
+    const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
+    expect(backup).toBeDefined();
+    const snapshot = new Database(join(setup.root, backup!), { readonly: true });
+    databases.push(snapshot);
+    expect(
+      snapshot.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
+    ).toEqual({ version: 6 });
+    expect(
+      snapshot
+        .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
+        .get(turn.identity.turnId),
+    ).toEqual(original);
+  });
+
   it("requires a materialized directory before a workspace can be marked ready", () => {
     const setup = fixture();
     const workspace = setup.agents.reserveWorkspace(
@@ -290,7 +497,7 @@ describe("durable agent coordination", () => {
         runtime: "sdk",
         sessionId: "thread",
       }),
-    ).toThrow("dispatched SDK turn");
+    ).toThrow("exact dispatched turn");
     setup.agents.markSubmitting(setup.authority, turn.identity);
     expect(() =>
       setup.agents.bindTurnProvider(
@@ -749,7 +956,7 @@ describe("durable agent coordination", () => {
     stores.push(upgraded);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 6 });
+    ).toEqual({ version: 7 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"));
     expect(backup).toBeDefined();
     const snapshot = new Database(join(setup.root, backup!), { readonly: true });
@@ -782,7 +989,7 @@ describe("durable agent coordination", () => {
     expect(upgraded.orchestration.agents.turn(setup.authority.runId, turn.identity)).toEqual(turn);
     expect(
       setup.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get(),
-    ).toEqual({ version: 6 });
+    ).toEqual({ version: 7 });
     const backup = readdirSync(setup.root).find((name) => name.includes("before-orchestration"))!;
     const snapshot = new Database(join(setup.root, backup), { readonly: true });
     databases.push(snapshot);

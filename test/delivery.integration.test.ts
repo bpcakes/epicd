@@ -381,7 +381,7 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
         backup.close();
       }
       expect(db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-        version: 6,
+        version: 7,
       });
       expect(db.pragma("foreign_key_check")).toEqual([]);
     } finally {

@@ -39,7 +39,7 @@ import {
   migrateDelivery,
 } from "./delivery-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 6;
+export const ORCHESTRATION_SCHEMA_VERSION = 7;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",

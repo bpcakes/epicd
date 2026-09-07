@@ -51,6 +51,39 @@ describe("Herdr native observations", () => {
     expect((await observer.observe(identity.name, identity)).ready).toBe(false);
   });
 
+  it("treats omitted native readiness and a pending launch as not ready", async () => {
+    commands.runJson.mockResolvedValueOnce(agent({ interactive_ready: undefined }));
+    expect((await observer.observe(identity.name, identity)).ready).toBe(false);
+    commands.runJson.mockResolvedValueOnce(agent({ launch_pending: true }));
+    expect((await observer.observe(identity.name, identity)).ready).toBe(false);
+  });
+
+  it("routes all native observations and diagnostics to the explicitly selected session", async () => {
+    const env = { HERDR_ENV: "1", HERDR_SESSION: "unrelated" };
+    const selected = new HerdrObserver({
+      cwd: "/repo",
+      herdrPath: "herdr-test",
+      sessionName: "owned",
+      env,
+    });
+    commands.runJson.mockResolvedValue(agent());
+    commands.runCommand.mockResolvedValue({ stdout: "bounded text" });
+    await selected.readDiagnostic(identity);
+    expect(commands.runJson).toHaveBeenCalledTimes(2);
+    for (const call of [...commands.runJson.mock.calls, ...commands.runCommand.mock.calls]) {
+      expect(call[1].slice(0, 2)).toEqual(["--session", "owned"]);
+      expect(call[2]).toMatchObject({ cwd: "/repo", env });
+    }
+  });
+
+  it("rejects diagnostics if the native occupant changed during the read", async () => {
+    commands.runJson
+      .mockResolvedValueOnce(agent())
+      .mockResolvedValueOnce(agent({ terminal_id: "replacement" }));
+    commands.runCommand.mockResolvedValueOnce({ stdout: "unrelated claims" });
+    await expect(observer.readDiagnostic(identity)).rejects.toThrow("identity changed");
+  });
+
   it.each(["name", "pane_id", "tab_id", "terminal_id"])(
     "rejects replacement of the registered %s",
     async (field) => {
@@ -69,24 +102,13 @@ describe("Herdr native observations", () => {
   });
 
   it("redacts diagnostic text without interpreting claims as evidence", async () => {
-    commands.runJson
-      .mockResolvedValueOnce(agent())
-      .mockResolvedValueOnce({
-        result: {
-          read: {
-            pane_id: identity.paneId,
-            tab_id: identity.tabId,
-            text: "token=secret tests passed",
-            truncated: true,
-          },
-        },
-      })
-      .mockResolvedValueOnce(agent());
+    commands.runJson.mockResolvedValueOnce(agent()).mockResolvedValueOnce(agent());
+    commands.runCommand.mockResolvedValueOnce({ stdout: "token=secret tests passed" });
     expect(await observer.readDiagnostic(identity)).toEqual({
       text: "token=[REDACTED] tests passed",
       truncated: true,
     });
-    expect(commands.runJson.mock.calls[1]?.[1]).toEqual([
+    expect(commands.runCommand.mock.calls[0]?.[1]).toEqual([
       "agent",
       "read",
       identity.name,

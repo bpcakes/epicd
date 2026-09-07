@@ -14,6 +14,10 @@ import {
 } from "../src/adapters/codex-launch.js";
 import { writeCodexConfinement } from "../src/adapters/codex-confinement.js";
 import { CommandError, runCommand } from "../src/util/command.js";
+import {
+  nativeCodexAcceptedPrompt,
+  readNativeCodexSession,
+} from "../src/adapters/codex-native-state.js";
 
 describe("native confined Herdr launch", () => {
   it.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === "1")(
@@ -233,12 +237,8 @@ describe("native confined Herdr launch", () => {
         });
         expect((await controlCodexLaunch(launch, "inspect")).state).toBe("running");
         const resultPath = join(confinement.artifacts, "result.json");
-        await cli(
-          "agent",
-          "prompt",
-          "epicd-probe",
-          `This is a bounded runtime integration test. Read source.txt without modifying it, then write {"status":"observed"} to ${JSON.stringify(resultPath)} using your shell tool. Do not perform other work. Report completion.`,
-        );
+        const prompt = `This is a bounded runtime integration test. Read source.txt without modifying it, then write {"status":"observed"} to ${JSON.stringify(resultPath)} using your shell tool. Do not perform other work. Report completion.`;
+        await cli("agent", "prompt", "epicd-probe", prompt);
         for (let attempt = 0; attempt < 90; attempt += 1) {
           try {
             if (JSON.parse(await readFile(resultPath, "utf8")).status === "observed") break;
@@ -264,7 +264,11 @@ describe("native confined Herdr launch", () => {
         expect(await readFile(join(confinement.workspace, "source.txt"), "utf8")).toBe(
           "approved source\n",
         );
-        await controlCodexLaunch(launch, "interrupt");
+        const nativeSession = await readNativeCodexSession(launch, null);
+        expect(nativeSession).not.toBeNull();
+        expect(await nativeCodexAcceptedPrompt(launch, nativeSession!.id, prompt)).toBe(true);
+        await cli("agent", "wait", "epicd-probe", "--timeout", "10000");
+        await cli("agent", "send-keys", "epicd-probe", "ctrl+d");
         for (let attempt = 0; attempt < 50; attempt += 1) {
           try {
             terminal = (await readCodexLaunchStop(launch)) !== null;
@@ -276,7 +280,8 @@ describe("native confined Herdr launch", () => {
         expect(await readCodexLaunchStop(launch)).toMatchObject({
           generation: launch.generation,
           kind: "stopped",
-          interrupted: true,
+          interrupted: false,
+          code: 0,
           processTreeStopped: true,
         });
       } finally {

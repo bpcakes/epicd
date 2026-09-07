@@ -39,7 +39,18 @@ export type HerdrObservation = {
 
 /** Native lifecycle is observation, never proof that a command passed or descendants stopped. */
 export class HerdrObserver {
-  constructor(private readonly options: { cwd: string; herdrPath: string }) {}
+  constructor(
+    private readonly options: {
+      cwd: string;
+      herdrPath: string;
+      sessionName?: string;
+      env?: NodeJS.ProcessEnv;
+    },
+  ) {}
+
+  private args(args: string[]) {
+    return this.options.sessionName ? ["--session", this.options.sessionName, ...args] : args;
+  }
 
   async observe(
     target: string,
@@ -48,9 +59,10 @@ export class HerdrObserver {
   ): Promise<HerdrObservation> {
     const envelope = await runJson(
       this.options.herdrPath,
-      ["agent", "get", target],
+      this.args(["agent", "get", target]),
       {
         cwd: this.options.cwd,
+        ...(this.options.env ? { env: this.options.env } : {}),
         timeoutMs: 10_000,
         ...(signal ? { signal } : {}),
       },
@@ -94,40 +106,37 @@ export class HerdrObserver {
     identity: NativeHerdrIdentity,
   ): Promise<{ text: string; truncated: boolean }> {
     await this.observe(identity.name, identity);
-    const result = await runJson(
+    const result = await runCommand(
       this.options.herdrPath,
-      ["agent", "read", identity.name, "--source", "recent-unwrapped", "--lines", "120"],
-      { cwd: this.options.cwd, timeoutMs: 10_000 },
-      z.object({
-        result: z.object({
-          read: z.object({
-            pane_id: z.string(),
-            tab_id: z.string(),
-            text: z.string(),
-            truncated: z.boolean(),
-          }),
-        }),
-      }),
+      this.args(["agent", "read", identity.name, "--source", "recent-unwrapped", "--lines", "120"]),
+      {
+        cwd: this.options.cwd,
+        timeoutMs: 10_000,
+        ...(this.options.env ? { env: this.options.env } : {}),
+      },
     );
-    if (
-      result.result.read.pane_id !== identity.paneId ||
-      result.result.read.tab_id !== identity.tabId
-    ) {
-      throw new Error("Herdr diagnostic output belongs to a different pane");
-    }
+    // Installed Herdr returns plain text, not a JSON read envelope. Check the
+    // exact occupant before and after; text cannot attest to its own provenance.
     await this.observe(identity.name, identity);
     return {
-      text: redactSensitiveText(result.result.read.text, 16 * 1024),
-      truncated: result.result.read.truncated || result.result.read.text.length > 16 * 1024,
+      text: redactSensitiveText(result.stdout, 16 * 1024),
+      // This is at most 120 screen/scrollback lines. The text CLI cannot prove
+      // that earlier output was retained, even when no local clipping occurred.
+      truncated: true,
     };
   }
 
   async requestInterrupt(identity: NativeHerdrIdentity): Promise<void> {
     await this.observe(identity.name, identity);
-    await runCommand(this.options.herdrPath, ["agent", "send-keys", identity.name, "ctrl+c"], {
-      cwd: this.options.cwd,
-      timeoutMs: 10_000,
-    });
+    await runCommand(
+      this.options.herdrPath,
+      this.args(["agent", "send-keys", identity.name, "ctrl+c"]),
+      {
+        cwd: this.options.cwd,
+        timeoutMs: 10_000,
+        ...(this.options.env ? { env: this.options.env } : {}),
+      },
+    );
     // A delivered key is not a StopAcknowledgement. The outer process owner must prove stop.
   }
 }
