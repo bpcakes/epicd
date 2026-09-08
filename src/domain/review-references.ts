@@ -6,8 +6,11 @@ const Window = {
   limit: z.number().int().min(1).max(4000),
 };
 
-/** Select retained records, never caller-supplied evidence content or authority. */
-export const ReviewReferenceSchema = z.discriminatedUnion("kind", [
+/** Select retained records, never caller-supplied evidence content or authority.
+ * A regular union emits supported nested anyOf for Structured Outputs. Its required,
+ * distinct kind literals make the alternatives disjoint; strict admission is unchanged.
+ */
+export const ReviewReferenceSchema = z.union([
   z.strictObject({
     kind: z.literal("action"),
     actionId: z.string().min(1).max(256),
