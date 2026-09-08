@@ -305,6 +305,7 @@ export function concurrentWithTracker(kind: KernelAction["kind"]): boolean {
       "wait_for_events",
       "message_agent",
       "interrupt_agent",
+      "interrupt_action",
       "escalate",
       "reconcile_tracker_operation",
       "reconcile_action",

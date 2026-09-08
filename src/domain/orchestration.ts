@@ -162,6 +162,11 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({ kind: z.literal("interrupt_agent"), ...AgentTarget, turnId: Id }),
   z.strictObject({
+    kind: z.literal("interrupt_action"),
+    actionId: Id,
+    reason: z.string().min(1).max(4000),
+  }),
+  z.strictObject({
     kind: z.literal("replace_agent"),
     ...AgentTarget,
     ...WorkspaceTarget,

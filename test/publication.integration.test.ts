@@ -236,6 +236,13 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
       ).toMatchObject({ status: "rejected", code: "publication_unsettled" });
       expect((await s.dispatch({ kind: "inspect_run" })).status).toBe("succeeded");
       expect(
+        await s.dispatch({
+          kind: "interrupt_action",
+          actionId: "not-a-run-action",
+          reason: "Check interruption admission while publication is pending",
+        }),
+      ).toMatchObject({ status: "rejected", code: "unknown_action" });
+      expect(
         (
           await s.dispatch({
             kind: "message_agent",

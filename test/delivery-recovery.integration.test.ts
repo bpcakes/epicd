@@ -126,6 +126,140 @@ function inspection(input: Awaited<ReturnType<Setup["dispatch"]>>) {
 
 describe.skipIf(process.platform !== "linux")("model-requested and cold delivery recovery", () => {
   it.each([
+    { phase: "before-signal", via: "model" },
+    { phase: "before-signal", via: "cold" },
+    { phase: "after-signal", via: "model" },
+    { phase: "after-signal", via: "cold" },
+  ])(
+    "settles a lost interruption acknowledgment $phase through $via recovery without changing its target",
+    async ({ phase, via }) => {
+      const s = await fixture(),
+        run = s.authority.runId;
+      let finish!: () => void,
+        targetSignal: AbortSignal | undefined,
+        signals = 0;
+      const gate = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      s.kernel.registerExternal("refresh_tracker", async ({ signal }) => {
+        targetSignal = signal;
+        signal.addEventListener(
+          "abort",
+          () => {
+            signals += 1;
+          },
+          { once: true },
+        );
+        await gate;
+        return {
+          kind: "inspection",
+          text: "Controlled target finished unwinding",
+          artifactIds: [],
+        };
+      });
+      const running = await s.kernel.execute(s.decision({ kind: "refresh_tracker" }), s.authority);
+      if (running.status !== "running") throw new Error("Expected asynchronous controlled target");
+      const targetResult = s.kernel.operation(running.operationId)!;
+      const action: KernelAction = {
+        kind: "interrupt_action",
+        actionId: running.actionId,
+        reason: "Stop this controlled target",
+      };
+      let interruptionId: string;
+      try {
+        if (phase === "after-signal") {
+          interruptionId = (await loseAcknowledgement(s, action)).actionId;
+          expect(targetSignal?.aborted).toBe(true);
+        } else {
+          const append = s.journal.appendObservation.bind(s.journal);
+          const fault = vi
+            .spyOn(s.journal, "appendObservation")
+            .mockImplementation((authority, event) => {
+              if (event.kind === "action.interruption_requested")
+                throw new Error("Lost pre-signal audit");
+              return append(authority, event);
+            });
+          try {
+            const result = await s.dispatch(action);
+            expect(result.status).toBe("indeterminate");
+            interruptionId = result.actionId;
+            expect(targetSignal?.aborted).toBe(false);
+          } finally {
+            fault.mockRestore();
+          }
+        }
+      } finally {
+        finish();
+        await targetResult;
+      }
+      const expectedStatus = phase === "after-signal" ? "cancelled" : "succeeded";
+      expect(await targetResult).toMatchObject({ status: expectedStatus });
+      const original = s.journal.action(run, running.actionId);
+      const recovered = cold(s);
+      const reconcileDriver = vi.spyOn(recovered.driver, "reconcile");
+      if (via === "model") {
+        expect(
+          inspection(
+            await recovered.dispatch({ kind: "reconcile_action", actionId: interruptionId! }),
+          ),
+        ).toMatchObject({
+          actionId: interruptionId!,
+          status: "failed",
+        });
+      } else {
+        await reconcileActions(
+          recovered.journal,
+          s.authority,
+          async (record) =>
+            (await reconcileDeliveryAction(
+              recovered.journal,
+              recovered.manager,
+              recovered.driver,
+              s.authority,
+              record,
+            ))!,
+        );
+      }
+      expect(recovered.journal.action(run, interruptionId!)?.status).toBe("failed");
+      expect(recovered.journal.action(run, running.actionId)).toEqual(original);
+      expect(signals).toBe(phase === "after-signal" ? 1 : 0);
+      expect(reconcileDriver).not.toHaveBeenCalled();
+      expect(
+        recovered.journal
+          .actions(run)
+          .filter((record) => record.request.action.kind === "refresh_tracker"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("settles only an interrupted control acknowledgment while its target remains indeterminate", async () => {
+    const s = await fixture(),
+      run = s.authority.runId;
+    const target = s.journal.acceptAction(s.authority, s.decision({ kind: "refresh_tracker" }));
+    if (target.kind !== "accepted") throw new Error("Expected retained target intent");
+    s.journal.startAction(s.authority, target.action.actionId);
+    const request = s.journal.acceptAction(
+      s.authority,
+      s.decision({
+        kind: "interrupt_action",
+        actionId: target.action.actionId,
+        reason: "Retained cancellation request",
+      }),
+    );
+    if (request.kind !== "accepted") throw new Error("Expected retained control intent");
+    s.journal.startAction(s.authority, request.action.actionId);
+    const recovered = cold(s);
+    const original = recovered.journal.action(run, target.action.actionId);
+    expect(original?.status).toBe("indeterminate");
+    expect(
+      inspection(
+        await recovered.dispatch({ kind: "reconcile_action", actionId: request.action.actionId }),
+      ),
+    ).toMatchObject({ status: "failed" });
+    expect(recovered.journal.action(run, target.action.actionId)).toEqual(original);
+  });
+
+  it.each([
     "capture_candidate",
     "create_review_workspace",
     "create_implementation_workspace",

@@ -391,6 +391,13 @@ describe.skipIf(process.platform !== "linux")(
         code: "tracker_unsettled",
       });
       success(await s.dispatch({ kind: "inspect_run" }));
+      expect(
+        await s.dispatch({
+          kind: "interrupt_action",
+          actionId: "not-a-run-action",
+          reason: "Check interruption admission while tracker work is pending",
+        }),
+      ).toMatchObject({ status: "rejected", code: "unknown_action" });
       expect(() => s.journal.tracker.assertTaskOwned(s.run.runId, "work-a")).toThrow("unsettled");
       expect(s.commands().filter((x) => x[0] === "update")).toHaveLength(1);
     });

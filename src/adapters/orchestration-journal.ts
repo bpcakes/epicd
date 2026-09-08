@@ -72,7 +72,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 33;
+export const ORCHESTRATION_SCHEMA_VERSION = 34;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",

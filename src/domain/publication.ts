@@ -177,6 +177,7 @@ export function concurrentWithPublication(kind: KernelAction["kind"]): boolean {
       "wait_for_events",
       "message_agent",
       "interrupt_agent",
+      "interrupt_action",
       "escalate",
       "reconcile_publication",
       "reconcile_action",

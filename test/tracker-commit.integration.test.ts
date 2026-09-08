@@ -179,6 +179,13 @@ describe.skipIf(process.platform !== "linux")("tracker-only delivery lineage", (
       "pending tracker commit",
     );
     expect(s.journal.publications.pending(s.authority.runId)).toBeNull();
+    expect(
+      await s.dispatch({
+        kind: "interrupt_action",
+        actionId: "not-a-run-action",
+        reason: "Check interruption admission while tracker commit work is pending",
+      }),
+    ).toMatchObject({ status: "rejected", code: "unknown_action" });
   }, 45000);
 
   it("settles an unused dispatch gate without Git writes and refuses to publish it", async () => {

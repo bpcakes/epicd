@@ -537,6 +537,84 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
     expect(readFileSync(join(copy.path, "scratch", "heartbeat"))).toEqual(stoppedBytes);
   });
 
+  it("interrupts one real validation through the model capability while another check keeps running", async () => {
+    const waiting = {
+      ...check,
+      timeoutMs: 10000,
+      args: ["-c", "while :; do echo alive >> scratch/heartbeat; sleep .05; done"],
+    };
+    const setup = await fixture({ requiredChecks: [waiting], writableScratch: ["scratch"] });
+    const planId = await setup.define([actionCheck(waiting)]);
+    const candidate = await setup.capture(planId);
+    const first = await setup.review(candidate),
+      second = await setup.review(candidate);
+    const pendingChecks: Promise<ActionResult>[] = [];
+    const start = async (copy: typeof first) => {
+      const result = await setup.kernel.execute(
+        setup.decision({
+          kind: "run_validation",
+          ...candidate,
+          ...target(copy),
+          validationPlanId: planId,
+          checkId: waiting.id,
+        }),
+        setup.authority,
+      );
+      if (result.status !== "running") throw new Error("Expected asynchronous validation");
+      const pending = setup.kernel.operation(result.operationId)!;
+      pendingChecks.push(pending);
+      await waitForFile(join(copy.path, "scratch", "heartbeat"));
+      return { ...result, pending };
+    };
+    let b: Awaited<ReturnType<typeof start>> | undefined;
+    try {
+      const a = await start(first);
+      b = await start(second);
+      const request = setup.decision({
+        kind: "interrupt_action",
+        actionId: a.actionId,
+        reason: "Stop this obsolete diagnostic hypothesis",
+      });
+      const result = await setup.kernel.execute(request, setup.authority);
+      const acknowledgment =
+        result.status === "running"
+          ? ((await setup.kernel.operation(result.operationId)) ??
+            setup.journal.action(setup.authority.runId, result.actionId)!.result!)
+          : result;
+      const payload = success(acknowledgment);
+      if (payload.kind !== "inspection") throw new Error("Expected interruption acknowledgment");
+      expect(JSON.parse(payload.text)).toMatchObject({
+        actionId: a.actionId,
+        interruption: "requested",
+      });
+      expect(await a.pending).toMatchObject({ status: "cancelled" });
+      expect(setup.journal.action(setup.authority.runId, b.actionId)?.status).toBe("running");
+      expect(
+        setup.journal.agents.activeWorkspaceOperation(setup.authority.runId, first),
+      ).toBeNull();
+      expect(
+        setup.journal.agents.activeWorkspaceOperation(setup.authority.runId, second)?.kind,
+      ).toBe("validation");
+      const stoppedBytes = readFileSync(join(first.path, "scratch/heartbeat"));
+      const runningBytes = readFileSync(join(second.path, "scratch/heartbeat"));
+      await delay(180);
+      expect(readFileSync(join(first.path, "scratch/heartbeat"))).toEqual(stoppedBytes);
+      expect(readFileSync(join(second.path, "scratch/heartbeat")).length).toBeGreaterThan(
+        runningBytes.length,
+      );
+      expect(setup.journal.delivery.summaries(setup.authority.runId).validation).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ status: "cancelled", satisfiesCheck: false }),
+        ]),
+      );
+      expect(setup.journal.control(setup.authority.runId).status).toBe("active");
+    } finally {
+      setup.kernel.interruptAll();
+      await Promise.allSettled(pendingChecks);
+    }
+    expect(await b!.pending).toMatchObject({ status: "cancelled" });
+  });
+
   it("stops on lease loss but does not accept late evidence or release an old exclusion", async () => {
     const waiting = {
       ...check,

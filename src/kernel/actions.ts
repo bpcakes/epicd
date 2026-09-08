@@ -40,7 +40,12 @@ export class ActionKernel {
   private readonly handlers = new Map<ActionKind, Handler>();
   private readonly operations = new Map<
     string,
-    { controller: AbortController; dispatchSettled: Promise<void>; result: Promise<ActionResult> }
+    {
+      authority: ControllerAuthority;
+      controller: AbortController;
+      dispatchSettled: Promise<void>;
+      result: Promise<ActionResult>;
+    }
   >();
   private integrityError: Error | null = null;
 
@@ -48,6 +53,11 @@ export class ActionKernel {
     readonly journal: OrchestrationJournal,
     private readonly beforeDispatch?: (signal: AbortSignal) => Promise<void>,
   ) {
+    // Signalling is an external effect: commit admission and its audit before
+    // touching a live handle. A rolled-back local action must never send a signal.
+    this.registerExternal("interrupt_action", async (context, action) =>
+      this.interruptAction(context, action.actionId),
+    );
     this.registerLocal("inspect_action", ({ authority }, action) => {
       const target = journal.action(authority.runId, action.actionId);
       if (!target) throw new CapabilityRejected("unknown_action", "No such action in this run");
@@ -429,7 +439,12 @@ export class ActionKernel {
       }
       return this.journal.settleAction(authority, record.actionId, "running", outcome).result!;
     });
-    this.operations.set(record.operationId, { controller, dispatchSettled, result });
+    this.operations.set(record.operationId, {
+      authority: { ...authority },
+      controller,
+      dispatchSettled,
+      result,
+    });
     void result.then(
       () => {
         this.operations.delete(record.operationId);
@@ -441,6 +456,62 @@ export class ActionKernel {
       },
     );
     return { status: "running", actionId: record.actionId, operationId: record.operationId };
+  }
+
+  private interruptAction(context: ActionContext, actionId: string): ActionPayload {
+    const { authority, record, signal } = context;
+    assertCurrentDispatch(this.journal, authority, record);
+    signal.throwIfAborted();
+    const target = this.journal.action(authority.runId, actionId);
+    if (!target) throw new CapabilityRejected("unknown_action", "No such action in this run");
+    if (target.request.action.kind === "interrupt_action")
+      throw new CapabilityRejected(
+        "invalid_interruption_target",
+        "An interruption request cannot target itself or another interruption request",
+      );
+    let interruption: "requested" | "already_requested" | "already_settled";
+    if (["succeeded", "failed", "rejected", "cancelled"].includes(target.status)) {
+      interruption = "already_settled";
+    } else {
+      const operation = this.operations.get(target.operationId);
+      if (
+        target.status !== "running" ||
+        !operation ||
+        operation.authority.runId !== authority.runId ||
+        operation.authority.leaseId !== authority.leaseId ||
+        operation.authority.ownerToken !== authority.ownerToken
+      )
+        throw new CapabilityRejected(
+          "action_interruption_unavailable",
+          "No running handle owned by this controller. Inspect the original action and reconcile its resources; do not infer process stop.",
+        );
+      interruption = operation.controller.signal.aborted ? "already_requested" : "requested";
+      context.observe({
+        source: "kernel",
+        sourceEventId: `interrupt:${record.actionId}`,
+        kind: "action.interruption_requested",
+        summary: `Cancellation requested for action ${target.actionId}, operation ${target.operationId}; process and external-effect stop remain unproven`,
+        artifactIds: [],
+        identity: null,
+        wakesOrchestrator: true,
+      });
+      // No await between the durable request, final authority check and signal.
+      // Only the original handler may settle its result and resource journals.
+      assertCurrentDispatch(this.journal, authority, record);
+      signal.throwIfAborted();
+      operation.controller.abort(new Error("Orchestrator requested action interruption"));
+    }
+    return {
+      kind: "inspection",
+      text: JSON.stringify({
+        actionId: target.actionId,
+        operationId: target.operationId,
+        interruption,
+        evidenceWarning:
+          "This acknowledges only the interruption request, not process stop, rollback, released resource exclusions, or passing validation. Inspect the original action and resource evidence; completed or uncertain external effects remain authoritative.",
+      }),
+      artifactIds: [],
+    };
   }
 
   interruptAll(): void {
