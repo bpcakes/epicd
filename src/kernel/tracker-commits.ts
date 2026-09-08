@@ -3,7 +3,8 @@ import type { ActionKernel } from "./actions.js";
 import type { ControllerAuthority } from "../domain/orchestration.js";
 import type { WorkspaceManager } from "../adapters/workspaces.js";
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
-import { OperationFailed } from "./guards.js";
+import { CapabilityRejected, OperationFailed } from "./guards.js";
+import { reconcileCommitIO } from "../adapters/commit-io.js";
 
 export function registerTrackerCommitCapabilities(
   kernel: ActionKernel,
@@ -57,6 +58,12 @@ export function registerTrackerCommitCapabilities(
     return { kind: "resource", resourceId: settled.trackerCommitId, generation: 1 };
   });
   kernel.registerExternal("reconcile_tracker_commit", async ({ authority }, action) => {
+    const intent = journal.trackerCommits.record(authority.runId, action.trackerCommitId);
+    if (kernel.operation(intent.operationId))
+      throw new CapabilityRejected(
+        "tracker_commit_live",
+        "Inspect or interrupt the current tracker write before reconciliation; its live operation cannot be fenced as abandoned",
+      );
     const settled = await reconcileTrackerCommit(
       journal,
       workspaces,
@@ -107,6 +114,7 @@ export async function reconcileTrackerCommit(
   journal.assertAuthority(authority);
   const record = journal.trackerCommits.record(authority.runId, id);
   if (["created", "failed"].includes(record.status)) return record;
+  await reconcileCommitIO(journal, authority, { kind: "tracker", trackerCommitId: id });
   if (!record.dispatched) return journal.trackerCommits.cancelUndispatched(authority, id);
   const result = await workspaces.inspectTrackerCommit(authority, record);
   return journal.trackerCommits.finish(

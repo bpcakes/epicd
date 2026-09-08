@@ -21,10 +21,10 @@ async function work() {
   try {
     const journal = store.orchestration;
     const record = assertCommitWorker(journal, request);
-    await new WorkspaceManager(journal, request.workspaceRoot).executeCandidateCommit(
-      request.authority,
-      record,
-    );
+    const workspaces = new WorkspaceManager(journal, request.workspaceRoot);
+    if ("trackerCommitId" in record)
+      await workspaces.executeTrackerCommit(request.authority, record);
+    else await workspaces.executeCandidateCommit(request.authority, record);
   } finally {
     store.close();
   }

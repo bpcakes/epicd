@@ -2,7 +2,6 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { StateFileIdentitySchema } from "../domain/state-file-identity.js";
 import type { ControllerAuthority } from "../domain/orchestration.js";
-import type { CommitRecord } from "../domain/commits.js";
 import { workspaceExecutionScope } from "../domain/workspaces.js";
 import { digestJson } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
@@ -16,6 +15,12 @@ import {
   type CommandLaunch,
 } from "./command-lifetime.js";
 
+const CommitTargetSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("application"), commitId: z.uuid() }),
+  z.strictObject({ kind: z.literal("tracker"), trackerCommitId: z.uuid() }),
+]);
+export type CommitIOTarget = z.infer<typeof CommitTargetSchema>;
+
 /** Fixed kernel worker request, never an orchestrator-selected command or pathname. */
 export const CommitIORequestSchema = z.strictObject({
   stateFile: StateFileIdentitySchema,
@@ -25,7 +30,7 @@ export const CommitIORequestSchema = z.strictObject({
     ownerToken: z.string().min(1),
     leaseId: z.string().min(1),
   }),
-  commitId: z.uuid(),
+  target: CommitTargetSchema,
 });
 type CommitIORequest = z.infer<typeof CommitIORequestSchema>;
 const entrypoint = fileURLToPath(new URL("../../dist/adapters/commit-io-cli.js", import.meta.url));
@@ -39,15 +44,31 @@ function launchFor(request: CommitIORequest, workspace: string): CommandLaunch {
   };
 }
 
+function recordFor(journal: OrchestrationJournal, runId: string, target: CommitIOTarget) {
+  return target.kind === "application"
+    ? journal.commits.record(runId, target.commitId)
+    : journal.trackerCommits.record(runId, target.trackerCommitId);
+}
+function assertWritable(
+  journal: OrchestrationJournal,
+  authority: ControllerAuthority,
+  target: CommitIOTarget,
+) {
+  return target.kind === "application"
+    ? journal.commits.assertWritable(authority, target.commitId)
+    : journal.trackerCommits.assertWritable(authority, target.trackerCommitId);
+}
+
 /** Check the original live intent again inside the worker before any repository I/O. */
 export function assertCommitWorker(journal: OrchestrationJournal, request: CommitIORequest) {
   const { authority } = request;
-  const record = journal.commits.assertWritable(authority, request.commitId);
+  const record = assertWritable(journal, authority, request.target);
   const operation = journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId);
   const workspace = journal.agents.workspace(authority.runId, record);
   if (
     digestJson(journal.storageIdentity()) !== digestJson(request.stateFile) ||
     record.status !== "preparing" ||
+    ("dispatched" in record && record.dispatched) ||
     operation.kind !== "commit" ||
     operation.workspaceId !== record.workspaceId ||
     operation.workspaceGeneration !== record.workspaceGeneration ||
@@ -65,10 +86,10 @@ export function assertCommitWorker(journal: OrchestrationJournal, request: Commi
 export async function reconcileCommitIO(
   journal: OrchestrationJournal,
   authority: ControllerAuthority,
-  commitId: string,
+  target: CommitIOTarget,
 ) {
   journal.assertAuthority(authority);
-  const record = journal.commits.record(authority.runId, commitId);
+  const record = recordFor(journal, authority.runId, target);
   let operation = journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId);
   // An unbound/unknown operation still needs its own independent stop proof. In
   // particular, a missing ref or a lost lease cannot release an old exclusion.
@@ -104,17 +125,17 @@ export async function runCommitIO(
   journal: OrchestrationJournal,
   workspaces: WorkspaceManager,
   authority: ControllerAuthority,
-  record: CommitRecord,
+  target: CommitIOTarget,
   signal?: AbortSignal,
 ) {
-  journal.commits.assertWritable(authority, record.commitId);
+  const record = assertWritable(journal, authority, target);
   const operation = journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId);
   const workspace = journal.agents.workspace(authority.runId, record);
   const request = CommitIORequestSchema.parse({
     stateFile: journal.storageIdentity(),
     workspaceRoot: workspaces.storageRoot(),
     authority,
-    commitId: record.commitId,
+    target,
   });
   const launch = launchFor(request, workspace.path);
   try {
@@ -162,6 +183,6 @@ export async function runCommitIO(
   } finally {
     // Reconciliation reads the original one-use gate/receipt even if dispatch or
     // result delivery failed. Missing proof deliberately keeps the exclusion.
-    await reconcileCommitIO(journal, authority, record.commitId);
+    await reconcileCommitIO(journal, authority, target);
   }
 }

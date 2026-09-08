@@ -202,7 +202,13 @@ describe.skipIf(process.platform !== "linux")("private commit writer lifetime", 
           { ...request, workspaceRoot: `${request.workspaceRoot}/different` },
           { ...request, stateFile: { ...request.stateFile, inode: "0" } },
           { ...request, authority: { ...request.authority, leaseId: "foreign-lease" } },
-          { ...request, commitId: "00000000-0000-4000-8000-000000000001" },
+          {
+            ...request,
+            target: {
+              kind: "application" as const,
+              commitId: "00000000-0000-4000-8000-000000000001",
+            },
+          },
         ].map((changed) => {
           try {
             assertCommitWorker(f.journal, changed);

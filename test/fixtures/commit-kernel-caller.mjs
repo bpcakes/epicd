@@ -13,6 +13,7 @@ try {
   const recordStop = journal.agents.recordWorkspaceExecutionStop.bind(journal.agents);
   journal.agents.recordWorkspaceExecutionStop = (authority, operationId, receipt) => {
     if (journal.agents.workspaceOperation(authority.runId, operationId).kind === "commit") {
+      if (input.crashPoint === "after_ack") recordStop(authority, operationId, receipt);
       process.kill(process.pid, "SIGKILL");
       throw new Error("SIGKILL did not terminate the caller");
     }

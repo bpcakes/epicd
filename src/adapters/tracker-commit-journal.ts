@@ -227,18 +227,28 @@ export class TrackerCommitJournal {
       if (
         operation.kind !== "commit" ||
         operation.workspaceId !== record.workspaceId ||
-        operation.workspaceGeneration !== record.workspaceGeneration
+        operation.workspaceGeneration !== record.workspaceGeneration ||
+        operation.controllerLeaseId !== record.controllerLeaseId
       )
         return fail("Tracker commit exclusion does not match its unused gate");
-      const stopped = WorkspaceOperationSchema.parse({
-        ...operation,
-        status: "failed",
-        stopEvidence: "Kernel proved tracker commit never dispatched from its durable start gate",
-        updatedAt: new Date().toISOString(),
-      });
-      this.db
-        .prepare("UPDATE workspace_operations SET record_json=? WHERE run_id=? AND operation_id=?")
-        .run(JSON.stringify(stopped), authority.runId, operation.operationId);
+      if (!operation.stopEvidence) {
+        // An unused inner Git gate cannot prove a bound host worker has stopped.
+        // Preserve its independently retained receipt and terminal evidence when
+        // the supervisor has already settled it; never overwrite that evidence.
+        if (operation.execution)
+          return fail("Stop the supervised tracker writer before cancelling its unused Git gate");
+        const stopped = WorkspaceOperationSchema.parse({
+          ...operation,
+          status: "failed",
+          stopEvidence: "Kernel proved tracker commit never dispatched from its durable start gate",
+          updatedAt: new Date().toISOString(),
+        });
+        this.db
+          .prepare(
+            "UPDATE workspace_operations SET record_json=? WHERE run_id=? AND operation_id=?",
+          )
+          .run(JSON.stringify(stopped), authority.runId, operation.operationId);
+      }
       return this.finish(authority, id, false, false, "Tracker commit was never dispatched");
     });
   }

@@ -1,9 +1,9 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
-import { KernelGit } from "../src/adapters/kernel-git.js";
+import * as lifetime from "../src/adapters/command-lifetime.js";
 import { PublicationAdapter } from "../src/adapters/publication.js";
 import { reconcileTrackerCommit } from "../src/kernel/tracker-commits.js";
 import { closureFixture, publishVerified, publishTracker } from "./fixtures/tracker-closure.js";
@@ -267,12 +267,18 @@ describe.skipIf(process.platform !== "linux")("tracker-only delivery lineage", (
     const finish = vi.spyOn(s.journal.agents, "finishWorkspaceOperation").mockImplementation(() => {
       throw new Error("Lost durable stop acknowledgement");
     });
+    const acknowledge = vi
+      .spyOn(s.journal.agents, "recordWorkspaceExecutionStop")
+      .mockImplementation(() => {
+        throw new Error("Lost durable stop acknowledgement");
+      });
     try {
       await expect(s.manager.writeTrackerCommit(s.authority, intent)).rejects.toThrow(
         "Lost durable stop",
       );
     } finally {
       finish.mockRestore();
+      acknowledge.mockRestore();
     }
     const pending = s.journal.trackerCommits.record(run, intent.trackerCommitId);
     expect(
@@ -283,9 +289,16 @@ describe.skipIf(process.platform !== "linux")("tracker-only delivery lineage", (
       ),
     ).toBe(pending.revision);
     s.newLease();
-    await expect(
-      reconcileTrackerCommit(s.journal, s.manager, s.authority, pending.trackerCommitId),
-    ).rejects.toThrow("Independently prove");
+    // A real supervisor now retains proof outside SQLite. Make that proof
+    // unavailable to the reconciler as well; a matching ref remains insufficient.
+    const unavailable = vi.spyOn(lifetime, "recoverCommandStop").mockResolvedValue(null);
+    try {
+      await expect(
+        reconcileTrackerCommit(s.journal, s.manager, s.authority, pending.trackerCommitId),
+      ).rejects.toThrow(/independent.*stop|Independently prove/i);
+    } finally {
+      unavailable.mockRestore();
+    }
     expect(s.journal.agents.activeWorkspaceOperation(run, pending)?.operationId).toBe(
       pending.workspaceOperationId,
     );
@@ -305,16 +318,20 @@ describe.skipIf(process.platform !== "linux")("tracker-only delivery lineage", (
       run = s.authority.runId;
     await publishVerified(s);
     const request = await trackerRequest(s);
-    const original = KernelGit.prototype.text;
-    const fault = vi.spyOn(KernelGit.prototype, "text").mockImplementation(async function (
-      this: KernelGit,
-      args,
-      options,
-    ) {
-      if (args[0] === "update-ref" && args[1]?.startsWith("refs/epicd/tracker-commits/"))
-        throw new Error("Retention ref failed");
-      return original.call(this, args, options);
-    });
+    const write = s.manager.writeTrackerCommit.bind(s.manager);
+    const fault = vi
+      .spyOn(s.manager, "writeTrackerCommit")
+      .mockImplementation(async (authority, intent, signal) => {
+        const directory = join(
+          s.journal.agents.workspace(run, intent).path,
+          ".git/refs/epicd/tracker-commits",
+        );
+        mkdirSync(directory, { recursive: true });
+        writeFileSync(join(directory, `${intent.trackerCommitId}.lock`), "fixture-owned lock\n", {
+          flag: "wx",
+        });
+        await write(authority, intent, signal);
+      });
     try {
       expect((await s.dispatch(request)).status).toBe("failed");
     } finally {

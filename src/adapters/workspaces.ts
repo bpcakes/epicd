@@ -359,7 +359,13 @@ export class WorkspaceManager {
     input: CommitRecord,
     signal?: AbortSignal,
   ): Promise<void> {
-    await runCommitIO(this.journal, this, authority, input, signal);
+    await runCommitIO(
+      this.journal,
+      this,
+      authority,
+      { kind: "application", commitId: input.commitId },
+      signal,
+    );
   }
 
   /** Fixed supervised worker only. Its host supervisor, not this process, proves final stop. */
@@ -437,145 +443,158 @@ export class WorkspaceManager {
     input: TrackerCommitRecord,
     signal?: AbortSignal,
   ) {
+    await runCommitIO(
+      this.journal,
+      this,
+      authority,
+      { kind: "tracker", trackerCommitId: input.trackerCommitId },
+      signal,
+    );
+  }
+
+  /** The fixed worker owns all tracker-object construction; only its supervisor proves stop. */
+  async executeTrackerCommit(
+    authority: ControllerAuthority,
+    input: TrackerCommitRecord,
+    signal?: AbortSignal,
+  ) {
+    const operation = this.journal.agents.workspaceOperation(
+      authority.runId,
+      input.workspaceOperationId,
+    );
+    if (!operation.execution || operation.executionStop || operation.stopEvidence)
+      throw new WorkspaceError(
+        "tracker_commit_worker_unbound",
+        "Tracker construction requires its live supervised execution",
+      );
     const record = this.journal.trackerCommits.start(authority, input.trackerCommitId);
     if (record.status !== "preparing")
       throw new WorkspaceError("tracker_commit_dispatched", "Tracker commit write is one-use");
-    let succeeded = false;
-    try {
-      const workspace = await this.assertTrackerCustody(authority, record, signal);
-      const git = new KernelGit(workspace.path);
-      const parent = this.journal.publications.record(authority.runId, record.parentPublicationId);
-      const object = this.journal.publications.objectRecord(authority.runId, parent);
-      if (
-        (await git.text(["cat-file", "commit", record.parentRevision], optionalSignal(signal))) !==
-        object.objectContent
-      )
-        throw new WorkspaceError(
-          "tracker_parent_changed",
-          "Tracker parent differs from its retained publication object",
-        );
-      const entries = await this.treeEntries(git, record.parentRevision, signal);
-      const previous = entries.find((entry) => entry.path === ".beads/issues.jsonl");
-      if (previous && previous.mode !== "100644")
-        throw new WorkspaceError(
-          "tracker_path_changed",
-          "Tracker JSONL must be an ordinary non-executable file",
-        );
-      if (
-        entries.some(
-          (entry) => entry.path === ".beads" || entry.path.startsWith(".beads/issues.jsonl/"),
-        )
-      )
-        throw new WorkspaceError(
-          "tracker_path_changed",
-          "Tracker path collides with the committed tree",
-        );
-      const applicationTree = await this.writeTree(
-        git,
-        entries.filter((entry) => !trackerPath(entry.path)),
-        signal,
+    const workspace = await this.assertTrackerCustody(authority, record, signal);
+    const git = new KernelGit(workspace.path);
+    const parent = this.journal.publications.record(authority.runId, record.parentPublicationId);
+    const object = this.journal.publications.objectRecord(authority.runId, parent);
+    if (
+      (await git.text(["cat-file", "commit", record.parentRevision], optionalSignal(signal))) !==
+      object.objectContent
+    )
+      throw new WorkspaceError(
+        "tracker_parent_changed",
+        "Tracker parent differs from its retained publication object",
       );
-      if (applicationTree !== record.applicationTree)
-        throw new WorkspaceError(
-          "tracker_application_changed",
-          "Tracker parent does not preserve the reviewed application tree",
-        );
-      const bytes = this.journal.tracker.exportBytes(authority.runId, record.exportOperationId);
-      this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
-      const blob = (
-        await git.text(["hash-object", "-w", "--no-filters", "--stdin"], {
-          input: bytes,
-          ...optionalSignal(signal),
-        })
-      ).trim();
-      const fullTree = await this.writeTree(
-        git,
-        [
-          ...entries.filter((entry) => entry.path !== ".beads/issues.jsonl"),
-          { path: ".beads/issues.jsonl", mode: "100644", objectId: blob },
-        ],
-        signal,
+    const entries = await this.treeEntries(git, record.parentRevision, signal);
+    const previous = entries.find((entry) => entry.path === ".beads/issues.jsonl");
+    if (previous && previous.mode !== "100644")
+      throw new WorkspaceError(
+        "tracker_path_changed",
+        "Tracker JSONL must be an ordinary non-executable file",
       );
-      if (
-        fullTree ===
-        (
-          await git.text(["rev-parse", `${record.parentRevision}^{tree}`], optionalSignal(signal))
-        ).trim()
+    if (
+      entries.some(
+        (entry) => entry.path === ".beads" || entry.path.startsWith(".beads/issues.jsonl/"),
       )
-        throw new WorkspaceError(
-          "tracker_unchanged",
-          "The delivery tree already contains this tracker export",
-        );
-      const seconds = Math.floor(Date.parse(record.createdAt) / 1000);
-      const objectContent = `tree ${fullTree}\nparent ${record.parentRevision}\nauthor Epicd <epicd@epicd.local> ${seconds} +0000\ncommitter Epicd <epicd@epicd.local> ${seconds} +0000\n\nchore: record Beads tracker state\n\nEpicd-Operation: ${record.operationId}\nEpicd-Tracker-Export: ${record.exportMetadata.sha256}\nEpicd-Reviewed-Application: ${record.applicationRevision}\n`;
-      const revision = (
-        await git.text(["hash-object", "-t", "commit", "--stdin"], {
+    )
+      throw new WorkspaceError(
+        "tracker_path_changed",
+        "Tracker path collides with the committed tree",
+      );
+    const applicationTree = await this.writeTree(
+      git,
+      entries.filter((entry) => !trackerPath(entry.path)),
+      signal,
+    );
+    if (applicationTree !== record.applicationTree)
+      throw new WorkspaceError(
+        "tracker_application_changed",
+        "Tracker parent does not preserve the reviewed application tree",
+      );
+    const bytes = this.journal.tracker.exportBytes(authority.runId, record.exportOperationId);
+    this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
+    const blob = (
+      await git.text(["hash-object", "-w", "--no-filters", "--stdin"], {
+        input: bytes,
+        ...optionalSignal(signal),
+      })
+    ).trim();
+    const fullTree = await this.writeTree(
+      git,
+      [
+        ...entries.filter((entry) => entry.path !== ".beads/issues.jsonl"),
+        { path: ".beads/issues.jsonl", mode: "100644", objectId: blob },
+      ],
+      signal,
+    );
+    if (
+      fullTree ===
+      (
+        await git.text(["rev-parse", `${record.parentRevision}^{tree}`], optionalSignal(signal))
+      ).trim()
+    )
+      throw new WorkspaceError(
+        "tracker_unchanged",
+        "The delivery tree already contains this tracker export",
+      );
+    const seconds = Math.floor(Date.parse(record.createdAt) / 1000);
+    const objectContent = `tree ${fullTree}\nparent ${record.parentRevision}\nauthor Epicd <epicd@epicd.local> ${seconds} +0000\ncommitter Epicd <epicd@epicd.local> ${seconds} +0000\n\nchore: record Beads tracker state\n\nEpicd-Operation: ${record.operationId}\nEpicd-Tracker-Export: ${record.exportMetadata.sha256}\nEpicd-Reviewed-Application: ${record.applicationRevision}\n`;
+    const revision = (
+      await git.text(["hash-object", "-t", "commit", "--stdin"], {
+        input: objectContent,
+        ...optionalSignal(signal),
+      })
+    ).trim();
+    const original = this.journal.delivery.candidate(authority.runId, parent).snapshot!;
+    const manifest = [
+      ...original.manifest.filter((entry) => entry.path !== ".beads/issues.jsonl"),
+      {
+        path: ".beads/issues.jsonl",
+        mode: "100644" as const,
+        objectId: blob,
+        size: Buffer.byteLength(bytes),
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      },
+    ].sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+    if ((await this.writeTree(git, manifest, signal)) !== fullTree)
+      throw new WorkspaceError(
+        "tracker_manifest_changed",
+        "Tracker-only tree contains changes outside the recorded export",
+      );
+    const snapshot = WorkspaceSnapshotSchema.parse({
+      schemaVersion: 1,
+      runId: authority.runId,
+      workspaceId: record.workspaceId,
+      workspaceGeneration: record.workspaceGeneration,
+      parentRevision: record.parentRevision,
+      fullTree,
+      applicationTree,
+      snapshotRevision: revision,
+      fingerprint: digestJson(manifest),
+      manifest,
+    });
+    this.journal.trackerCommits.prepareWrite(
+      authority,
+      record.trackerCommitId,
+      snapshot,
+      objectContent,
+    );
+    await this.assertTrackerCustody(authority, record, signal);
+    this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
+    if (
+      (
+        await git.text(["hash-object", "-w", "-t", "commit", "--stdin"], {
           input: objectContent,
           ...optionalSignal(signal),
         })
-      ).trim();
-      const original = this.journal.delivery.candidate(authority.runId, parent).snapshot!;
-      const manifest = [
-        ...original.manifest.filter((entry) => entry.path !== ".beads/issues.jsonl"),
-        {
-          path: ".beads/issues.jsonl",
-          mode: "100644" as const,
-          objectId: blob,
-          size: Buffer.byteLength(bytes),
-          sha256: createHash("sha256").update(bytes).digest("hex"),
-        },
-      ].sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
-      if ((await this.writeTree(git, manifest, signal)) !== fullTree)
-        throw new WorkspaceError(
-          "tracker_manifest_changed",
-          "Tracker-only tree contains changes outside the recorded export",
-        );
-      const snapshot = WorkspaceSnapshotSchema.parse({
-        schemaVersion: 1,
-        runId: authority.runId,
-        workspaceId: record.workspaceId,
-        workspaceGeneration: record.workspaceGeneration,
-        parentRevision: record.parentRevision,
-        fullTree,
-        applicationTree,
-        snapshotRevision: revision,
-        fingerprint: digestJson(manifest),
-        manifest,
-      });
-      this.journal.trackerCommits.prepareWrite(
-        authority,
-        record.trackerCommitId,
-        snapshot,
-        objectContent,
+      ).trim() !== revision
+    )
+      throw new WorkspaceError(
+        "tracker_object_changed",
+        "Stored tracker object differs from its write intent",
       );
-      await this.assertTrackerCustody(authority, record, signal);
-      this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
-      if (
-        (
-          await git.text(["hash-object", "-w", "-t", "commit", "--stdin"], {
-            input: objectContent,
-            ...optionalSignal(signal),
-          })
-        ).trim() !== revision
-      )
-        throw new WorkspaceError(
-          "tracker_object_changed",
-          "Stored tracker object differs from its write intent",
-        );
-      this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
-      await git.text(
-        ["update-ref", `refs/epicd/tracker-commits/${record.trackerCommitId}`, revision, ""],
-        optionalSignal(signal),
-      );
-      succeeded = true;
-    } finally {
-      this.journal.agents.finishWorkspaceOperation(
-        authority,
-        record.workspaceOperationId,
-        succeeded ? "succeeded" : "failed",
-        "Trusted tracker-commit adapter awaited every filesystem and Git operation",
-      );
-    }
+    this.journal.trackerCommits.assertWritable(authority, record.trackerCommitId);
+    await git.text(
+      ["update-ref", `refs/epicd/tracker-commits/${record.trackerCommitId}`, revision, ""],
+      optionalSignal(signal),
+    );
   }
 
   async inspectTrackerCommit(
