@@ -13,15 +13,25 @@ const { closeSync, writeSync } = require("node:fs");
 const { Socket } = require("node:net");
 const command = process.argv[1];
 const extraInput = process.argv[2] === "extra-input";
-const args = process.argv.slice(3);
+const deadline = BigInt(process.argv[3]);
+const args = process.argv.slice(4);
 if (process.pid !== 1) process.exit(125);
-const stop = () => process.exit(130);
+const finish = (code, reason) => {
+  writeSync(6, JSON.stringify({ code, reason }));
+  process.exit(code);
+};
+const stop = () => finish(130, "cancelled");
 process.on("SIGTERM", stop);
 process.on("SIGINT", stop);
 const control = new Socket({ fd: 3, readable: true, writable: false });
 control.on("end", stop);
 control.on("error", stop);
 control.resume();
+if (deadline !== 0n) {
+  const remaining = deadline - process.hrtime.bigint();
+  if (remaining <= 0n) finish(130, "timed_out");
+  setTimeout(() => finish(130, "timed_out"), Number((remaining + 999999n) / 1000000n));
+}
 const target = spawn(command, args, { stdio: [0, 1, 2, extraInput ? 5 : "ignore"] });
 if (extraInput) closeSync(5);
 target.once("error", error => {
@@ -30,8 +40,13 @@ target.once("error", error => {
 });
 // Do not wait for command output EOF: a background descendant may retain it.
 // Exiting PID 1 makes the kernel kill and reap the entire nested namespace tree.
-target.once("exit", (code, signal) => process.exit(code ?? 128));
+target.once("exit", (code, signal) => finish(code ?? 128, null));
 `;
+
+export type NamespaceCompletion = {
+  code: number;
+  reason: "cancelled" | "timed_out" | null;
+};
 
 /**
  * Own a sandbox lifetime independently of Bubblewrap's startup PDEATHSIG race.
@@ -48,8 +63,23 @@ export function startNamespaceProcess(
     stdio: "pipe" | "inherit";
     stdin?: "pipe";
     extraInput?: string;
+    /** Enforced by the guardian even when the caller cannot process JS callbacks. */
+    timeoutMs?: number;
   },
 ) {
+  if (
+    options.timeoutMs !== undefined &&
+    (!Number.isSafeInteger(options.timeoutMs) ||
+      options.timeoutMs <= 0 ||
+      options.timeoutMs > 2_147_483_647)
+  )
+    throw new Error("Namespace deadline must be a positive bounded integer");
+  // hrtime uses the system monotonic clock across processes. Include guardian startup
+  // in the bound; a delayed guardian must not launch an already-expired command.
+  const deadline =
+    options.timeoutMs === undefined
+      ? 0n
+      : process.hrtime.bigint() + BigInt(options.timeoutMs) * 1_000_000n;
   const child = spawn(
     "/usr/bin/unshare",
     [
@@ -67,6 +97,7 @@ export function startNamespaceProcess(
       "--",
       command,
       options.extraInput === undefined ? "no-extra-input" : "extra-input",
+      deadline.toString(),
       ...args,
     ],
     {
@@ -79,6 +110,7 @@ export function startNamespaceProcess(
         "pipe",
         "pipe",
         options.extraInput === undefined ? "ignore" : "pipe",
+        "pipe",
       ],
       shell: false,
     },
@@ -93,7 +125,17 @@ export function startNamespaceProcess(
     failure = error;
   });
   const status = child.stdio[4] as Readable;
+  const completion = child.stdio.at(6) as Readable;
   let errorMessage = "";
+  let completionMessage = "";
+  completion.on("data", (chunk: Buffer) => {
+    completionMessage += chunk.toString("utf8");
+    if (completionMessage.length > 8192) {
+      failure = new Error("Namespace completion channel exceeded its bound");
+      interrupt();
+      completion.destroy();
+    }
+  });
   status.on("data", (chunk: Buffer) => {
     errorMessage += chunk.toString("utf8");
     if (errorMessage.length > 8192) {
@@ -113,6 +155,29 @@ export function startNamespaceProcess(
   return {
     child,
     interrupt,
+    /** Private guardian classification plus normal monitor exit; never command stdout. */
+    completion(): NamespaceCompletion {
+      if (failure || errorMessage || child.signalCode !== null || child.exitCode === null)
+        throw new NamespaceStopUnprovenError("Namespace completion requires a normal monitor exit");
+      try {
+        const record: unknown = JSON.parse(completionMessage);
+        if (
+          record !== null &&
+          typeof record === "object" &&
+          Object.keys(record).length === 2 &&
+          "code" in record &&
+          record.code === child.exitCode &&
+          "reason" in record &&
+          (record.reason === null || record.reason === "cancelled" || record.reason === "timed_out")
+        )
+          return { code: child.exitCode, reason: record.reason };
+      } catch {
+        // Missing or malformed private output cannot become success from exit code alone.
+      }
+      throw new NamespaceStopUnprovenError(
+        "Namespace completion is missing or differs from its monitor exit",
+      );
+    },
     failure(): Error | undefined {
       if (child.signalCode !== null)
         return new NamespaceStopUnprovenError(

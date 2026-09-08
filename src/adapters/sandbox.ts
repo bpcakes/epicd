@@ -232,11 +232,12 @@ export async function startConfinedCommand(
       cwd: launch.cwd,
       env: launch.env,
       stdio: "pipe",
+      timeoutMs: spec.timeoutMs,
       ...(launch.extraInput === null ? {} : { extraInput: launch.extraInput }),
     });
   const { child } = namespace;
   let terminal = false;
-  let stoppedFor: "cancelled" | "timed_out" | undefined;
+  let stopRequested = false;
   const stdout = new BoundedOutput();
   const stderr = new BoundedOutput();
   child.stdout!.on("data", (chunk: Buffer) => stdout.append(chunk));
@@ -245,25 +246,23 @@ export async function startConfinedCommand(
     terminal = true;
   });
 
-  const stop = (reason: "cancelled" | "timed_out") => {
-    if (terminal || stoppedFor) return;
-    stoppedFor = reason;
+  const abort = () => {
+    if (terminal || stopRequested) return;
+    stopRequested = true;
     namespace.interrupt();
   };
-  const abort = () => stop("cancelled");
   options.signal?.addEventListener("abort", abort, { once: true });
   if (options.signal?.aborted) abort();
-  const deadline = setTimeout(() => stop("timed_out"), spec.timeoutMs);
   const result = new Promise<ConfinedCommandResult>((resolveResult, reject) => {
     child.once("close", (code, signal) => {
-      clearTimeout(deadline);
       options.signal?.removeEventListener("abort", abort);
       void (async () => {
+        let stoppedFor: "cancelled" | "timed_out" | undefined;
         if (durable) {
           const stopped = await durable.result;
           code = stopped.code;
           signal = stopped.signal;
-          stoppedFor ??= stopped.receipt.reason ?? undefined;
+          stoppedFor = stopped.receipt.reason ?? undefined;
           if (stopped.receipt.error)
             throw new Error(`Confined command could not start: ${stopped.receipt.error}`);
           if (stopped.receipt.kind === "not_started") stoppedFor ??= "cancelled";
@@ -273,6 +272,7 @@ export async function startConfinedCommand(
             throw spawnError instanceof NamespaceStopUnprovenError
               ? spawnError
               : new Error(`Confined command could not start: ${spawnError.message}`);
+          stoppedFor = namespace.completion().reason ?? undefined;
         }
         resolveResult({
           status: stoppedFor ?? (code === 0 ? "succeeded" : "failed"),

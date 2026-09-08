@@ -179,7 +179,6 @@ export async function superviseCommand() {
   process.on("SIGINT", stop);
   process.stdout.on("error", stop);
   process.stderr.on("error", stop);
-  let deadline: NodeJS.Timeout | undefined;
   try {
     let data = "";
     for await (const chunk of process.stdin) {
@@ -203,14 +202,11 @@ export async function superviseCommand() {
         });
         return;
       }
-      deadline = setTimeout(() => {
-        reason ??= "timed_out";
-        abort.abort();
-      }, intent.timeoutMs);
       const namespace = startNamespaceProcess(launch.command, launch.args, {
         cwd: launch.cwd,
         env: launch.env,
         stdio: "pipe",
+        timeoutMs: intent.timeoutMs,
         ...(launch.extraInput === null ? {} : { extraInput: launch.extraInput }),
       });
       const interrupt = () => {
@@ -239,17 +235,19 @@ export async function superviseCommand() {
       process.stderr.off("error", interrupt);
       const failure = namespace.failure();
       if (failure instanceof NamespaceStopUnprovenError) throw failure;
+      // A late controller cancellation or delayed supervisor callback cannot
+      // overwrite the guardian's independently observed exit/deadline cause.
+      const completion = failure ? null : namespace.completion();
       await writeStop(directory, intent, {
         kind: "stopped",
         code: failure ? null : code,
-        reason,
+        reason: completion?.reason ?? null,
         error: failure ? redactSensitiveText(failure.message, 4000) : null,
       });
     } finally {
       await directory.close();
     }
   } finally {
-    clearTimeout(deadline);
     control.destroy();
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);
