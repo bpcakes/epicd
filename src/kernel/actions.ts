@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   DispatchConflictError,
   MemoryReferenceError,
@@ -15,7 +15,7 @@ import {
   type ObservationInput,
   type OrchestratorDecision,
 } from "../domain/orchestration.js";
-import { redactSensitiveText } from "../util/redact.js";
+import { redactDiagnosticText, redactSensitiveText } from "../util/redact.js";
 import { assertCurrentDispatch, CapabilityRejected, OperationFailed } from "./guards.js";
 import { actionContextRecord } from "./action-context.js";
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
@@ -47,6 +47,41 @@ export class ActionKernel {
     readonly journal: OrchestrationJournal,
     private readonly beforeDispatch?: (signal: AbortSignal) => Promise<void>,
   ) {
+    this.registerLocal("inspect_action", ({ authority }, action) => {
+      const target = journal.action(authority.runId, action.actionId);
+      if (!target) throw new CapabilityRejected("unknown_action", "No such action in this run");
+      // Read the retained request/result, not the lossy context preview. Redact
+      // before paging so splitting a credential cannot evade the redactor.
+      const retained = redactDiagnosticText(JSON.stringify(target));
+      const digest = createHash("sha256").update(retained).digest("hex");
+      if (action.offset !== 0 && action.expectedDigest === null)
+        throw new CapabilityRejected(
+          "action_view_required",
+          "Continuation pages require the digest returned by offset zero",
+        );
+      if (action.expectedDigest !== null && action.expectedDigest !== digest)
+        throw new CapabilityRejected(
+          "action_view_changed",
+          "The action changed; read offset zero again instead of combining different outcomes",
+        );
+      if (action.offset > retained.length)
+        throw new CapabilityRejected("invalid_action_offset", "Offset exceeds the retained action");
+      const end = Math.min(retained.length, action.offset + action.limit);
+      return {
+        kind: "inspection",
+        text: JSON.stringify({
+          actionId: target.actionId,
+          digest,
+          offset: action.offset,
+          nextOffset: end < retained.length ? end : null,
+          totalCharacters: retained.length,
+          content: retained.slice(action.offset, end),
+          evidenceWarning:
+            "Redacted journal record, not a replay or new authority. Its digest identifies this view, not truth. Agent claims and diagnostic results do not become delivery validation or approval.",
+        }),
+        artifactIds: [],
+      };
+    });
     this.registerLocal("inspect_observation", ({ authority }, action) => {
       const observation = journal.observations(authority.runId, action.observationId - 1, 1)[0];
       if (observation?.id !== action.observationId)
@@ -172,7 +207,10 @@ export class ActionKernel {
           .memory(authority.runId)
           .slice(-20)
           .map((entry) => ({ ...entry, content: redactSensitiveText(entry.content, 500) })),
-        actions: journal.actions(authority.runId).slice(-10).map(actionContextRecord),
+        actions: journal
+          .actions(authority.runId)
+          .slice(-10)
+          .map((record) => actionContextRecord(record, false)),
         omittedActions: 0,
       };
       while (Buffer.byteLength(JSON.stringify(content)) > 64000 && content.actions.length) {

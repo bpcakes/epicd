@@ -7,7 +7,11 @@ import { ActionKernel } from "../src/kernel/actions.js";
 import { buildOrchestratorContext } from "../src/orchestrator/context.js";
 import { OrchestratorLoop, type DecisionSource } from "../src/orchestrator/loop.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
-import type { ControllerAuthority, KernelAction } from "../src/domain/orchestration.js";
+import {
+  KernelActionSchema,
+  type ControllerAuthority,
+  type KernelAction,
+} from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
 
 const roots: string[] = [];
@@ -32,6 +36,25 @@ function fixture(policy = RepositoryPolicySchema.parse({ schemaVersion: 1 })) {
     leaseId: lease.leaseId,
   };
   return { store, path, authority, kernel: new ActionKernel(store.orchestration) };
+}
+
+function inspectAction(
+  setup: ReturnType<typeof fixture>,
+  actionId: string,
+  offset = 0,
+  expectedDigest: string | null = null,
+  limit = 4000,
+) {
+  return setup.kernel.execute(
+    response(ticketFor(setup), {
+      kind: "inspect_action",
+      actionId,
+      offset,
+      expectedDigest,
+      limit,
+    }),
+    setup.authority,
+  );
 }
 
 function appendBacklog(setup: ReturnType<typeof fixture>, count: number) {
@@ -315,6 +338,217 @@ describe("bounded observation context", () => {
     expect(setup.store.orchestration.observations(setup.authority.runId, 0, 1)[0]).toEqual(
       retained,
     );
+  });
+
+  it("recovers a full inspection beyond its preview without rerunning it or clipping archive pages in pressured context", async () => {
+    const setup = fixture();
+    appendBacklog(setup, 101);
+    let executions = 0;
+    setup.kernel.registerLocal("inspect_evidence", () => {
+      executions += 1;
+      return {
+        kind: "inspection",
+        text: "retained primary output ".repeat(2200) + "END-OF-PRIMARY-RECORD",
+        artifactIds: [],
+      };
+    });
+    const original = await setup.kernel.execute(
+      response(ticketFor(setup), {
+        kind: "inspect_evidence",
+        evidenceId: "fixture-evidence",
+      }),
+      setup.authority,
+    );
+    if (original.status !== "succeeded") throw new Error("Expected retained result");
+    const before = setup.store.orchestration.action(setup.authority.runId, original.actionId)!;
+    const previewContext = buildOrchestratorContext(setup.kernel, setup.authority.runId);
+    const preview = (previewContext.latestActionOutcome ?? previewContext.actions.at(-1))!.result;
+    expect(JSON.stringify(preview)).toContain(`inspect_action ${original.actionId}`);
+    expect(JSON.stringify(preview)).not.toContain("END-OF-PRIMARY-RECORD");
+    let offset: number | null = 0,
+      digest: string | null = null,
+      combined = "";
+    while (offset !== null) {
+      const result = await inspectAction(setup, original.actionId, offset, digest);
+      if (result.status !== "succeeded" || result.result.kind !== "inspection")
+        throw new Error("Expected page");
+      const page = JSON.parse(result.result.text);
+      if (digest !== null) expect(page.digest).toBe(digest);
+      expect(page.content.length).toBeLessThanOrEqual(4000);
+      combined += page.content;
+      offset = page.nextOffset;
+      digest = page.digest;
+      const context = buildOrchestratorContext(setup.kernel, setup.authority.runId);
+      expect(Buffer.byteLength(JSON.stringify(context))).toBeLessThanOrEqual(65536);
+      expect((context.latestActionOutcome ?? context.actions.at(-1))!.result).toEqual(result);
+    }
+    expect(JSON.parse(combined)).toEqual(before);
+    expect(executions).toBe(1);
+    expect(setup.store.orchestration.action(setup.authority.runId, original.actionId)).toEqual(
+      before,
+    );
+    expect(
+      setup.store.orchestration.observations(setup.authority.runId, 0, 1000).at(-1)
+        ?.wakesOrchestrator,
+    ).toBe(false);
+  });
+
+  it("reads historical handoff instructions after cold recovery, redacts before paging and replays one read without another action", async () => {
+    const setup = fixture();
+    // Only the recorded request is under test; this stub dispatches no worker.
+    setup.kernel.registerLocal("continue_agent", () => ({
+      kind: "resource",
+      resourceId: "stub",
+      generation: 1,
+    }));
+    const original = await setup.kernel.execute(
+      response(ticketFor(setup), {
+        kind: "continue_agent",
+        agentId: "stub",
+        agentGeneration: 1,
+        instructions:
+          "Historical handoff ".repeat(100) + "bearer private-example-credential END-HANDOFF",
+      }),
+      setup.authority,
+    );
+    if (original.status !== "succeeded") throw new Error("Expected recorded handoff");
+    setup.store.releaseLease(setup.authority.runId, setup.authority.ownerToken);
+    setup.store.close();
+    stores.delete(setup.store);
+    setup.store = new StateStore(setup.path);
+    stores.add(setup.store);
+    const lease = setup.store.acquireLease(setup.authority.runId);
+    setup.authority = {
+      runId: setup.authority.runId,
+      ownerToken: lease.ownerToken,
+      leaseId: lease.leaseId,
+    };
+    setup.kernel = new ActionKernel(setup.store.orchestration);
+    let offset: number | null = 0,
+      digest: string | null = null,
+      combined = "";
+    while (offset !== null) {
+      const decision = response(ticketFor(setup), {
+        kind: "inspect_action",
+        actionId: original.actionId,
+        offset,
+        expectedDigest: digest,
+        limit: 211,
+      });
+      const result = await setup.kernel.execute(decision, setup.authority);
+      if (result.status !== "succeeded" || result.result.kind !== "inspection")
+        throw new Error("Expected page");
+      expect(result.result.text).not.toContain("private-example-credential");
+      const count = setup.store.orchestration.actions(setup.authority.runId).length;
+      expect(await setup.kernel.execute(decision, setup.authority)).toEqual(result);
+      expect(setup.store.orchestration.actions(setup.authority.runId)).toHaveLength(count);
+      const page = JSON.parse(result.result.text);
+      combined += page.content;
+      offset = page.nextOffset;
+      digest = page.digest;
+    }
+    expect(combined).not.toContain("private-example-credential");
+    expect(combined).toContain("[REDACTED]");
+    expect(combined).toContain("END-HANDOFF");
+    expect(JSON.parse(combined).request.action.kind).toBe("continue_agent");
+    expect(
+      setup.store.orchestration.action(setup.authority.runId, original.actionId)?.request.action,
+    ).toMatchObject({
+      instructions: expect.stringContaining("private-example-credential"),
+    });
+  });
+
+  it("rejects unknown and foreign action IDs and requires the unchanged view for continuation pages", async () => {
+    const setup = fixture();
+    const own = await setup.kernel.execute(
+      response(ticketFor(setup), { kind: "inspect_run" }),
+      setup.authority,
+    );
+    if (own.status !== "succeeded") throw new Error("Expected own action");
+    const other = setup.store.create(
+      initialRun("other-run"),
+      RepositoryPolicySchema.parse({ schemaVersion: 1 }),
+    );
+    const lease = setup.store.acquireLease(other.runId);
+    const foreignSetup = {
+      ...setup,
+      authority: { runId: other.runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId },
+    };
+    const foreign = await setup.kernel.execute(
+      response(ticketFor(foreignSetup), { kind: "inspect_run" }),
+      foreignSetup.authority,
+    );
+    if (foreign.status !== "succeeded") throw new Error("Expected foreign action");
+    for (const actionId of [foreign.actionId, "absent"])
+      expect(await inspectAction(setup, actionId)).toMatchObject({
+        status: "rejected",
+        code: "unknown_action",
+      });
+    expect(await inspectAction(setup, own.actionId, 1)).toMatchObject({
+      status: "rejected",
+      code: "action_view_required",
+    });
+    expect(await inspectAction(setup, own.actionId, 0, "0".repeat(64))).toMatchObject({
+      status: "rejected",
+      code: "action_view_changed",
+    });
+    const first = await inspectAction(setup, own.actionId);
+    if (first.status !== "succeeded" || first.result.kind !== "inspection")
+      throw new Error("Expected page");
+    expect(
+      await inspectAction(setup, own.actionId, 999999, JSON.parse(first.result.text).digest),
+    ).toMatchObject({ status: "rejected", code: "invalid_action_offset" });
+    for (const limit of [0, 4001])
+      expect(
+        KernelActionSchema.safeParse({
+          kind: "inspect_action",
+          actionId: own.actionId,
+          offset: 0,
+          expectedDigest: null,
+          limit,
+        }).success,
+      ).toBe(false);
+  });
+
+  it("detects a running action's outcome change instead of splicing two views or rerunning its effect", async () => {
+    const setup = fixture();
+    let finish!: () => void,
+      executions = 0;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    setup.kernel.registerExternal("inspect_evidence", async () => {
+      executions += 1;
+      await gate;
+      return { kind: "inspection", text: "actual terminal outcome", artifactIds: [] };
+    });
+    const original = await setup.kernel.execute(
+      response(ticketFor(setup), { kind: "inspect_evidence", evidenceId: "example" }),
+      setup.authority,
+    );
+    if (original.status !== "running") throw new Error("Expected pending operation");
+    const pending = setup.kernel.operation(original.operationId)!;
+    let digest: string;
+    try {
+      const first = await inspectAction(setup, original.actionId, 0, null, 50);
+      if (first.status !== "succeeded" || first.result.kind !== "inspection")
+        throw new Error("Expected page");
+      digest = JSON.parse(first.result.text).digest;
+    } finally {
+      finish();
+      await pending;
+    }
+    expect(await inspectAction(setup, original.actionId, 50, digest!)).toMatchObject({
+      status: "rejected",
+      code: "action_view_changed",
+    });
+    const fresh = await inspectAction(setup, original.actionId);
+    if (fresh.status !== "succeeded" || fresh.result.kind !== "inspection")
+      throw new Error("Expected refreshed view");
+    expect(JSON.parse(JSON.parse(fresh.result.text).content).result.result.text).toBe(
+      "actual terminal outcome",
+    );
+    expect(executions).toBe(1);
   });
 
   it("rejects foreign, absent and out-of-range observation reads", async () => {

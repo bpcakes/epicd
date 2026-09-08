@@ -76,6 +76,16 @@ export type MemoryInput = z.infer<typeof MemoryInputSchema>;
 export const KernelActionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("inspect_run") }),
   z.strictObject({
+    kind: z.literal("inspect_action"),
+    actionId: Id,
+    offset: Version,
+    limit: z.number().int().positive().max(4000),
+    expectedDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .nullable(),
+  }),
+  z.strictObject({
     kind: z.literal("inspect_observation"),
     observationId: z.number().int().positive(),
     offset: Version,

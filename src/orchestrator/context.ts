@@ -60,7 +60,10 @@ export function buildOrchestratorContext(kernel: ActionKernel, runId: string): O
     observationWindow: { afterCursor: control.observationCursor, hasMore: pending.length > 100 },
     observations,
     memory: kernel.journal.memory(runId).slice(-20),
-    actions: kernel.journal.actions(runId).slice(-20).map(actionContextRecord),
+    actions: kernel.journal
+      .actions(runId)
+      .slice(-20)
+      .map((record, index, records) => actionContextRecord(record, index === records.length - 1)),
     latestActionOutcome: null,
     capabilities: kernel.capabilities(),
     agents: kernel.journal.agents.summaries(runId),

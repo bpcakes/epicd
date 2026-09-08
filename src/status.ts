@@ -27,7 +27,10 @@ export function runStatusView(store: StateStore, runId: string) {
       : null,
     escalation: journal.pendingEscalation(runId),
     agents: journal.agents.summaries(runId),
-    actions: journal.actions(runId).slice(-20).map(actionContextRecord),
+    actions: journal
+      .actions(runId)
+      .slice(-20)
+      .map((record) => actionContextRecord(record, false)),
     delivery: journal.delivery.summaries(runId),
     reviews: journal.reviews.summaries(runId),
     commits: journal.commits.summaries(runId),
