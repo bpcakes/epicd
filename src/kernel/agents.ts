@@ -3,6 +3,8 @@ import { OperationFailed, CapabilityRejected } from "./guards.js";
 import type { AgentIdentity, TurnRecord } from "../domain/agents.js";
 import type { ControllerAuthority, TurnIdentity } from "../domain/orchestration.js";
 import {
+  AGENT_DIAGNOSTIC_OUTPUT_SCHEMA,
+  AgentDiagnosticResultSchema,
   IMPLEMENTATION_OUTPUT_SCHEMA,
   REVIEW_OUTPUT_SCHEMA,
   type AgentRole,
@@ -107,11 +109,9 @@ export function registerAgentCapabilities(
   const run = async (context: ActionContext, agent: AgentIdentity, instructions: string) => {
     const instance = agents.instance(context.authority.runId, agent);
     const assignment = agents.assignment(context.authority.runId, instance.assignmentId);
-    if (["review", "verification", "final_review"].includes(assignment.purpose))
-      throw new CapabilityRejected(
-        "review_capability_required",
-        "Use run_review for candidate-bound independent review or exact-SHA verification, including whole-epic review",
-      );
+    const reviewDiagnostic = ["review", "verification", "final_review"].includes(
+      assignment.purpose,
+    );
     if (instance.role === "orchestrator")
       throw new CapabilityRejected(
         "coordinator_owned",
@@ -124,8 +124,14 @@ export function registerAgentCapabilities(
       agent,
       context.record.operationId,
       instructions,
-      instance.role === "review" ? REVIEW_OUTPUT_SCHEMA : IMPLEMENTATION_OUTPUT_SCHEMA,
+      reviewDiagnostic
+        ? AGENT_DIAGNOSTIC_OUTPUT_SCHEMA
+        : instance.role === "review"
+          ? REVIEW_OUTPUT_SCHEMA
+          : IMPLEMENTATION_OUTPUT_SCHEMA,
       kernel.journal.control(context.authority.runId).controlVersion,
+      undefined,
+      reviewDiagnostic,
     );
     const stopped = await driver.run(context.authority, turn.identity, context.signal);
     if (!stopped.stopEvidence)
@@ -133,6 +139,10 @@ export function registerAgentCapabilities(
     if (stopped.status !== "completed")
       throw new OperationFailed(
         `Agent turn ${turn.identity.turnId} ${stopped.status}; inspect its recorded diagnostics`,
+      );
+    if (reviewDiagnostic && !AgentDiagnosticResultSchema.safeParse(stopped.result).success)
+      throw new OperationFailed(
+        `Reviewer diagnostic turn ${turn.identity.turnId} returned an invalid conversational result; inspect the retained output. It cannot grant approval or change the finding ledger.`,
       );
     return {
       kind: "resource" as const,

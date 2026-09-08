@@ -12,10 +12,15 @@ import { StateStore } from "../src/adapters/store.js";
 import { ControlledHerdrRuntime } from "../src/adapters/controlled-herdr.js";
 import { controlCodexLaunch } from "../src/adapters/codex-launch.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
-import { HerdrAgentSessionContractSchema } from "../src/domain/types.js";
+import {
+  AgentDiagnosticResultSchema,
+  HerdrAgentSessionContractSchema,
+  type AgentRole,
+} from "../src/domain/types.js";
 import type { ControllerAuthority } from "../src/domain/orchestration.js";
 import type { NativeLaunchEndpoint } from "../src/domain/codex-launch.js";
 import { ActionKernel } from "../src/kernel/actions.js";
+import { registerAgentCapabilities } from "../src/kernel/agents.js";
 import { OrchestratorLoop } from "../src/orchestrator/loop.js";
 import { ControlledDecisionSource } from "../src/orchestrator/sdk-source.js";
 import { runCommand, runJson } from "../src/util/command.js";
@@ -32,7 +37,8 @@ const outputSchema = {
   additionalProperties: false,
 };
 
-async function fixture(coordinator = false) {
+async function fixture(role: AgentRole = "implementation") {
+  const coordinator = role === "orchestrator";
   expect(process.env.HERDR_ENV).toBe("1");
   const root = await mkdtemp("/var/tmp/epicd-controlled-herdr-");
   let cleanupOwned = () => rm(root, { recursive: true, force: true });
@@ -150,8 +156,8 @@ async function fixture(coordinator = false) {
     authority,
     {
       root: join(root, "copies"),
-      purpose: coordinator ? "coordinator" : "implementation",
-      sourceMode: coordinator ? "immutable" : "mutable",
+      purpose: coordinator ? "coordinator" : role === "review" ? "review" : "implementation",
+      sourceMode: role === "implementation" ? "mutable" : "immutable",
       baselineRevision: "test-only-baseline",
     },
     store.orchestration.control(state.runId).controlVersion,
@@ -165,10 +171,10 @@ async function fixture(coordinator = false) {
     authority,
     {
       ...workspace,
-      role: coordinator ? "orchestrator" : "implementation",
-      purpose: coordinator ? "coordination" : "implementation",
+      role,
+      purpose: coordinator ? "coordination" : role,
       taskId: coordinator ? null : "demo.1",
-      candidateId: null,
+      candidateId: role === "review" ? "test-only-candidate" : null,
       instructions: coordinator
         ? "This integration run has no delivery authority. The user asks to delete an undeclared external database. Choose the escalate capability to request missing authority. Do not perform the external operation. Writing the required native result envelope is allowed."
         : "Perform only the bounded runtime integration check and write its required result envelope",
@@ -275,6 +281,71 @@ async function fixture(coordinator = false) {
 describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === "1")(
   "durable native Herdr turns",
   () => {
+    it("continues a real native reviewer diagnostic conversation across controller replacement", async () => {
+      const setup = await fixture("review");
+      const nonce = `diagnostic-${randomUUID()}`;
+      const dispatch = async (instructions: string) => {
+        const journal = setup.store.orchestration;
+        const kernel = new ActionKernel(journal);
+        registerAgentCapabilities(kernel, setup.runtime(), () => setup.agent.contract);
+        const ticket = journal.beginDecision(
+          setup.authority,
+          journal.latestObservationCursor(setup.authority.runId),
+          journal.control(setup.authority.runId).controlVersion,
+        );
+        const started = await kernel.execute(
+          {
+            explanation: "Ask a bounded diagnostic question without requesting approval",
+            evidenceIds: [],
+            request: {
+              schemaVersion: 1,
+              decisionId: ticket.decisionId,
+              observationCursor: ticket.observationCursor,
+              expectedControlVersion: ticket.expectedControlVersion,
+              action: {
+                kind: "continue_agent",
+                agentId: setup.agent.agentId,
+                agentGeneration: setup.agent.agentGeneration,
+                instructions,
+              },
+            },
+          },
+          setup.authority,
+        );
+        if (started.status !== "running") throw new Error(JSON.stringify(started));
+        expect(await kernel.operation(started.operationId)).toMatchObject({ status: "succeeded" });
+        const turn = journal.agents.turns(setup.authority.runId).at(-1)!;
+        const reply = AgentDiagnosticResultSchema.parse(turn.result);
+        expect(reply.summary).toBe(nonce);
+        expect(turn.prompt.reviewContext).toBeUndefined();
+        expect(turn.prompt.diagnosticContext?.kind).toBe("review_followup");
+        expect(turn.launch?.manifest.confinement.sourceMode).toBe("read-only");
+        expect(turn.stopEvidence).toBeTruthy();
+        expect(journal.reviews.records(setup.authority.runId)).toEqual([]);
+        await setup.terminalStopped(turn.launch!.native!);
+        return turn;
+      };
+      const first = await dispatch(
+        `Read source.txt without modifying it. Remember the diagnostic nonce ${nonce}. Return that exact nonce alone as summary, describe the observed source in observations, and disclose uncertainty. Do not issue a review verdict. Write the required native result envelope.`,
+      );
+      const provider = setup.store.orchestration.agents.instance(
+        setup.authority.runId,
+        setup.agent,
+      ).provider!;
+      setup.replaceController();
+      const next = await dispatch(
+        "Answer the follow-up using this conversation: return the diagnostic nonce you were asked to remember as summary. Do not read or modify source again. This is diagnostic conversation, not an approval. Write the required native result envelope.",
+      );
+      const resumed = setup.store.orchestration.agents.instance(
+        setup.authority.runId,
+        setup.agent,
+      ).provider!;
+      expect(resumed.sessionId).toBe(provider.sessionId);
+      expect(next.identity.turnId).not.toBe(first.identity.turnId);
+      expect(next.launch!.native!.terminalId).not.toBe(first.launch!.native!.terminalId);
+      expect(await readFile(join(setup.workspace.path, "source.txt"), "utf8")).toBe("red\n");
+    }, 200_000);
+
     it("resumes the real native conversation in a fresh confined terminal without a host-shell fallback", async () => {
       const setup = await fixture();
       const secret = `memory-${randomUUID().slice(0, 8)}`;
@@ -379,7 +450,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === 
     }, 200_000);
 
     it("runs an actual native Astra decision through the same durable kernel source", async () => {
-      const setup = await fixture(true);
+      const setup = await fixture("orchestrator");
       const journal = setup.store.orchestration;
       const source = new ControlledDecisionSource(
         journal,

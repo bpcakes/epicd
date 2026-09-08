@@ -27,7 +27,12 @@ import {
   type ObservationInput,
   type TurnIdentity,
 } from "../domain/orchestration.js";
-import { ORCHESTRATOR_MODEL, type AgentRole, type AgentSessionContract } from "../domain/types.js";
+import {
+  AGENT_DIAGNOSTIC_OUTPUT_SCHEMA,
+  ORCHESTRATOR_MODEL,
+  type AgentRole,
+  type AgentSessionContract,
+} from "../domain/types.js";
 import { digestJson, type RepositoryPolicy } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { WorkspaceOperationSchema, type WorkspaceOperation } from "../domain/workspaces.js";
@@ -860,6 +865,7 @@ export class AgentJournal {
     outputSchema: unknown,
     expectedControlVersion: number,
     reviewContext?: JsonValue,
+    reviewDiagnostic = false,
   ): TurnRecord {
     return this.access.transaction(authority, () => {
       const previous = this.all(
@@ -879,7 +885,8 @@ export class AgentJournal {
               previous.prompt.assignment.purpose === "coordination" ? 98304 : 16000,
             ) ||
           digestJson(previous.outputSchema) !== digestJson(z.json().parse(outputSchema)) ||
-          digestJson(previous.prompt.reviewContext ?? null) !== digestJson(reviewContext ?? null)
+          digestJson(previous.prompt.reviewContext ?? null) !== digestJson(reviewContext ?? null) ||
+          (previous.prompt.diagnosticContext !== undefined) !== reviewDiagnostic
         )
           throw new AgentCoordinationError(
             "turn_replay_mismatch",
@@ -891,6 +898,19 @@ export class AgentJournal {
       const agent = this.instance(authority.runId, identity);
       const workspace = this.workspace(authority.runId, agent);
       const assignment = this.assignment(authority.runId, agent.assignmentId);
+      if (
+        reviewDiagnostic &&
+        (agent.role !== "review" ||
+          !["review", "verification", "final_review"].includes(assignment.purpose) ||
+          agent.confinementProfile !== "epicd-isolated" ||
+          workspace.sourceMode !== "immutable" ||
+          reviewContext !== undefined ||
+          digestJson(outputSchema) !== digestJson(AGENT_DIAGNOSTIC_OUTPUT_SCHEMA))
+      )
+        throw new AgentCoordinationError(
+          "review_diagnostic_contract",
+          "Reviewer conversation requires isolated immutable source and a diagnostic-only result contract, without review approval context",
+        );
       if (assignment.epicRepair)
         this.access.assertEpicRepair(
           authority.runId,
@@ -984,6 +1004,15 @@ export class AgentJournal {
         ...(reviewContext === undefined
           ? {}
           : { reviewContext: JsonValueSchema.parse(reviewContext) }),
+        ...(reviewDiagnostic
+          ? {
+              diagnosticContext: {
+                kind: "review_followup" as const,
+                evidenceWarning:
+                  "This turn answers a diagnostic question, not the assignment's formal review. Preserve source and answer using the diagnostic output schema. Do not issue an approval, resolve findings or claim kernel validation. Explain observations and uncertainty. Only a subsequent run_review can establish fresh approval; this conversation supersedes the prior review turn.",
+              },
+            }
+          : {}),
         ...(assignment.epicRepair
           ? { repairContext: JsonValueSchema.parse(this.access.epicRepairContext(authority.runId)) }
           : {}),
@@ -1613,7 +1642,12 @@ export class AgentJournal {
       turn.prompt.assignment.assignmentId !== turn.identity.assignmentId ||
       terminal(turn) !== ["completed", "failed", "cancelled"].includes(turn.status) ||
       (turn.resultEligible &&
-        (turn.status !== "completed" || turn.result === null || !turn.submissionAcknowledgement))
+        (turn.status !== "completed" || turn.result === null || !turn.submissionAcknowledgement)) ||
+      (turn.prompt.diagnosticContext !== undefined &&
+        (!["review", "verification", "final_review"].includes(turn.prompt.assignment.purpose) ||
+          turn.prompt.reviewContext !== undefined ||
+          digestJson(turn.outputSchema) !== digestJson(AGENT_DIAGNOSTIC_OUTPUT_SCHEMA) ||
+          (turn.launch && turn.launch.manifest.confinement.sourceMode !== "read-only")))
     )
       throw new Error(
         "Persisted turn identity, prompt digest, or terminal evidence is inconsistent",

@@ -123,6 +123,10 @@ export const TurnPromptSchema = z.strictObject({
   // preserves hashes of historical prompts rather than inserting a new default.
   reviewContext: z.json().optional(),
   repairContext: z.json().optional(),
+  // Present only for a kernel-admitted conversational reviewer follow-up.
+  diagnosticContext: z
+    .strictObject({ kind: z.literal("review_followup"), evidenceWarning: Text })
+    .optional(),
 });
 export const TurnRecordSchema = z.strictObject({
   identity: TurnIdentitySchema,

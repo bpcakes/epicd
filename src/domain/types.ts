@@ -87,6 +87,15 @@ export const ImplementationResultSchema = z.object({
 
 export type ImplementationResult = z.infer<typeof ImplementationResultSchema>;
 
+/** A conversational answer cannot grant approval or resolve a review finding. */
+export const AgentDiagnosticResultSchema = z.strictObject({
+  kind: z.literal("diagnostic"),
+  summary: z.string().min(1).max(4000),
+  observations: z.array(z.string().min(1).max(2000)).max(50),
+  uncertainties: z.array(z.string().min(1).max(2000)).max(50),
+});
+export type AgentDiagnosticResult = z.infer<typeof AgentDiagnosticResultSchema>;
+
 export const RuntimeKindSchema = z.enum(["sdk", "herdr"]);
 export type RuntimeKind = z.infer<typeof RuntimeKindSchema>;
 
@@ -345,3 +354,4 @@ export function agentOutputSchema(schema: z.ZodType): Record<string, unknown> {
 
 export const REVIEW_OUTPUT_SCHEMA = agentOutputSchema(ReviewResultSchema);
 export const IMPLEMENTATION_OUTPUT_SCHEMA = agentOutputSchema(ImplementationResultSchema);
+export const AGENT_DIAGNOSTIC_OUTPUT_SCHEMA = agentOutputSchema(AgentDiagnosticResultSchema);
