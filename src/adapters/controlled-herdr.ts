@@ -40,6 +40,25 @@ const AgentSchema = z.object({
 });
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
+/** Publish acknowledgement only after the complete generation is available. */
+export function nativeShellBootstrap(
+  launcherExecutable: string,
+  generation: string,
+  readyPath: string,
+): string {
+  const pending = `${readyPath}.pending`;
+  return [
+    "unset ENV BASH_ENV",
+    `codex() { exec ${quote(launcherExecutable)} "$@"; exit 125; }`,
+    "(",
+    "  umask 077",
+    `  printf '%s\\n' ${quote(generation)} > ${quote(pending)} &&`,
+    `    /usr/bin/mv -- ${quote(pending)} ${quote(readyPath)}`,
+    ")",
+    "",
+  ].join("\n");
+}
+
 /** Real native TUI turns, observed/steered by Herdr, with independent supervisor stop proof. */
 export class ControlledHerdrRuntime {
   readonly kind = "herdr";
@@ -191,12 +210,7 @@ export class ControlledHerdrRuntime {
       const readyPath = join(manifest.controlDirectory, "native-shell-ready");
       await writeFile(
         bootstrap,
-        [
-          "unset ENV BASH_ENV",
-          `codex() { exec ${quote(launcher.executable)} "$@"; exit 125; }`,
-          `printf '%s\\n' ${quote(manifest.generation)} > ${quote(readyPath)}`,
-          "",
-        ].join("\n"),
+        nativeShellBootstrap(launcher.executable, manifest.generation, readyPath),
         { flag: "wx", mode: 0o600 },
       );
       check();
