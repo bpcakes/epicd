@@ -1,6 +1,5 @@
-import { constants } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, open, realpath, type FileHandle } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import type { FileHandle } from "node:fs/promises";
+import { relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
@@ -8,6 +7,13 @@ import { Socket } from "node:net";
 import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { z } from "zod";
+import {
+  preparePrivateIO,
+  openPrivateIO,
+  claimPrivateIO,
+  publishPrivateStop,
+  readPrivateStop,
+} from "./private-io-files.js";
 import type { ControllerAuthority } from "../domain/orchestration.js";
 import {
   RepositoryAdmissionSchema,
@@ -129,47 +135,14 @@ export async function prepareRepositoryIO(record: RepositoryAdmission): Promise<
     within(record.repository.commonDirectory.path, root)
   )
     throw new Error("Repository I/O control storage must be outside the checkout and Git metadata");
-  await mkdir(root, { mode: 0o700 }).catch((error: unknown) => {
-    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
-  });
-  await privateDirectory(root);
-  const stateParent = await open(dirname(root), "r");
-  try {
-    await stateParent.sync();
-  } finally {
-    await stateParent.close();
-  }
-  const path = await mkdtemp(join(root, "operation-"));
-  const stat = await lstat(path, { bigint: true });
-  const identity = { path, device: stat.dev.toString(), inode: stat.ino.toString() };
-  // Persist the directory entry before the journal can authorize a launch.
-  const parent = await open(root, "r");
-  try {
-    await parent.sync();
-  } finally {
-    await parent.close();
-  }
-  return identity;
+  return preparePrivateIO(root);
 }
 
 /** All gate/receipt I/O is relative to the held, journal-bound directory inode. */
 export async function openRepositoryIO(record: RepositoryAdmission) {
   const identity = record.ioDirectory;
   if (!identity) throw new Error("Repository I/O directory is not registered");
-  if (dirname(identity.path) !== `${record.stateFile.path}.repository-io`)
-    throw new Error("Repository I/O directory is outside its private state root");
-  await privateDirectory(dirname(identity.path));
-  await privateDirectory(identity.path);
-  const directory = await open(
-    identity.path,
-    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-  );
-  const stat = await directory.stat({ bigint: true });
-  if (stat.dev.toString() !== identity.device || stat.ino.toString() !== identity.inode) {
-    await directory.close();
-    throw new Error("Repository I/O directory identity changed; stop remains unproven");
-  }
-  return directory;
+  return openPrivateIO(identity, `${record.stateFile.path}.repository-io`);
 }
 
 export async function claimRepositoryIO(
@@ -177,21 +150,7 @@ export async function claimRepositoryIO(
   record: RepositoryAdmission,
   prevented: boolean,
 ) {
-  let file: FileHandle;
-  try {
-    file = await open(`/proc/self/fd/${directory.fd}/started.json`, "wx", 0o600);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "EEXIST") return false;
-    throw error;
-  }
-  try {
-    await file.writeFile(JSON.stringify({ ioId: record.ioId, prevented }));
-    await file.sync();
-  } finally {
-    await file.close();
-  }
-  await directory.sync();
-  return true;
+  return claimPrivateIO(directory, { ioId: record.ioId, prevented });
 }
 
 export async function writeRepositoryIOStop(
@@ -207,17 +166,7 @@ export async function writeRepositoryIOStop(
     stoppedAt: new Date().toISOString(),
     ...outcome,
   });
-  const prefix = `/proc/self/fd/${directory.fd}`;
-  const temporary = await open(`${prefix}/stopped.tmp`, "wx", 0o600);
-  try {
-    await temporary.writeFile(JSON.stringify(receipt));
-    await temporary.sync();
-  } finally {
-    await temporary.close();
-  }
-  // link is an atomic no-replace publication. Retain the staging link as evidence.
-  await link(`${prefix}/stopped.tmp`, `${prefix}/stopped.json`);
-  await directory.sync();
+  await publishPrivateStop(directory, receipt);
   return receipt;
 }
 
@@ -226,36 +175,9 @@ export async function readRepositoryIOStop(
 ): Promise<RepositoryIOStop | null> {
   const directory = await openRepositoryIO(record);
   try {
-    let file: FileHandle;
-    try {
-      file = await open(
-        `/proc/self/fd/${directory.fd}/stopped.json`,
-        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-      );
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-      throw error;
-    }
-    let receipt: RepositoryIOStop;
-    try {
-      const stat = await file.stat();
-      if (
-        !stat.isFile() ||
-        stat.size > 16_384 ||
-        stat.mode & 0o077 ||
-        stat.uid !== process.getuid?.() ||
-        stat.nlink !== 2
-      )
-        throw new Error("Repository stop receipt is not a private bounded retained file");
-      const bytes = Buffer.alloc(16_385);
-      const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-      if (bytesRead > 16_384) throw new Error("Repository stop receipt exceeded its bound");
-      receipt = RepositoryIOStopSchema.parse(
-        JSON.parse(bytes.subarray(0, bytesRead).toString("utf8")),
-      );
-    } finally {
-      await file.close();
-    }
+    const raw = await readPrivateStop(directory);
+    if (raw === null) return null;
+    const receipt = RepositoryIOStopSchema.parse(raw);
     assertRepositoryIOStop(record, receipt);
     return receipt;
   } finally {
@@ -336,15 +258,4 @@ export async function runRepositoryIO(
     signal?.removeEventListener("abort", stop);
     control.destroy();
   }
-}
-
-async function privateDirectory(path: string) {
-  const stat = await lstat(path);
-  if (
-    !stat.isDirectory() ||
-    (await realpath(path)) !== path ||
-    stat.mode & 0o077 ||
-    stat.uid !== process.getuid?.()
-  )
-    throw new Error("Repository I/O directories must be canonical and owner-only");
 }

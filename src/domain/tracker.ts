@@ -196,6 +196,7 @@ export const CompletionResourcesSchema = z.strictObject({
   agentAssignmentIds: z.array(z.string()),
   publicationIds: z.array(z.uuid()),
   fixtureCreationIds: z.array(z.uuid()),
+  fixtureAccessIds: z.array(z.uuid()),
   trackerExportIds: z.array(z.uuid()),
   detail: z.string().min(1).max(4000),
 });

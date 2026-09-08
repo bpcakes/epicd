@@ -790,6 +790,7 @@ export class TrackerJournal {
             agentAssignmentCount: completed.completion!.agentAssignmentIds.length,
             publicationCount: completed.completion!.publicationIds.length,
             fixtureCount: completed.completion!.fixtureCreationIds.length,
+            fixtureAccessCount: completed.completion!.fixtureAccessIds.length,
             trackerExportCount: completed.completion!.trackerExportIds.length,
           }
         : null,

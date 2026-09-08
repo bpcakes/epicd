@@ -7,6 +7,7 @@ import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { PostgreSqlFixtureValidationProvider } from "./fixture-validation-provider.js";
 import type { FixtureBridgeTransport } from "./fixture-bridge.js";
+import { fixtureCommandScope } from "../domain/fixture-validation.js";
 import {
   bindValidationService,
   verifyValidationServices,
@@ -62,7 +63,9 @@ export async function runCandidateValidation(
   let fixtureBridge: FixtureBridgeTransport | undefined;
   const settleFixtures = async () => {
     for (const use of fixtureUses) {
-      fixtureJournal.localStopped(authority, use.accessId);
+      if (fixtureJournal.use(authority.runId, use.accessId).status === "reserved")
+        fixtureJournal.localStopped(authority, use.accessId);
+      else await fixtureJournal.reconcileLocalCommand(authority, use.accessId);
       if (fixtureJournal.use(authority.runId, use.accessId).status !== "dispatched") continue;
       try {
         const observedUse = fixtureJournal.observationUse(authority.runId, use.accessId);
@@ -165,10 +168,24 @@ export async function runCandidateValidation(
       {
         signal: controller.signal,
         ...(fixtureBridge ? { fixtureBridge } : {}),
+        ...(fixtureUses.length
+          ? {
+              durableStop: {
+                runId: authority.runId,
+                operationId: evidence.operationId,
+                controllerLeaseId: authority.leaseId,
+                scopeDigest: fixtureCommandScope(fixtureUses),
+                admit: (intent: import("../domain/command-lifetime.js").CommandLifetime) => {
+                  assertDispatch();
+                  for (const use of fixtureUses)
+                    fixtureJournal.dispatch(authority, use.accessId, intent);
+                },
+              },
+            }
+          : {}),
         beforeSpawn: async () => {
           await verifyValidationServices(services);
           assertDispatch();
-          for (const use of fixtureUses) fixtureJournal.dispatch(authority, use.accessId);
         },
       },
     );

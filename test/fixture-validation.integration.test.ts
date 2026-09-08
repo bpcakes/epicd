@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
@@ -26,6 +26,9 @@ import type { KernelAction } from "../src/domain/orchestration.js";
 import type { OrchestrationJournal } from "../src/adapters/orchestration-journal.js";
 import type { ControllerAuthority } from "../src/domain/orchestration.js";
 import type { JournalRecordTarget } from "../src/domain/journal-records.js";
+import { readCommandStop } from "../src/adapters/command-lifetime.js";
+import * as commandLifetime from "../src/adapters/command-lifetime.js";
+import { NamespaceStopUnprovenError } from "../src/adapters/pid-namespace.js";
 
 const bin = process.env.EPICD_TEST_PG_BINDIR;
 const broker = process.env.EPICD_TEST_PGBOUNCER;
@@ -395,7 +398,7 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         expect(journal.fixtures.validation.eligible(authority.runId, use.accessId)).toBe(false);
         expect(journal.delivery.satisfiesCheck(authority.runId, evidence.evidenceId)).toBe(false);
         expect(() =>
-          journal.fixtures.validation.dispatch(previousAuthority, use.accessId),
+          journal.fixtures.validation.dispatch(previousAuthority, use.accessId, use.localCommand!),
         ).toThrow();
         if (preflight)
           expect(() =>
@@ -1051,6 +1054,10 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         );
         for (const delta of [
           { localStopped: false },
+          { localCommand: null },
+          { localReceipt: null },
+          { localCommand: { ...use.localCommand!, runId: randomUUID() } },
+          { localReceipt: { ...use.localReceipt!, kind: "not_started", code: null } },
           { remoteStopped: false },
           { preflight: null },
           { finalObservation: null },
@@ -1064,17 +1071,20 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         f.cleanup();
       }
     });
-    it("does not repair a lost local-stop acknowledgment from server quiescence or a replacement lease", async () => {
+    it("does not repair missing independent stop evidence from server quiescence or a replacement lease", async () => {
       const f = await setup(),
         db = new Database(f.s.path);
       try {
         const { use, evidence } = await f.validate();
-        // Fault injection: retain dispatched intent while removing the durable local acknowledgment.
+        // Fault injection: lose BOTH the journal acknowledgment and independent physical receipt.
+        // Journal-only loss is now recoverable; server quiescence alone must remain insufficient.
+        unlinkSync(join(use.localCommand!.directory.path, "stopped.json"));
         db.prepare("UPDATE fixture_validation_uses SET record_json=? WHERE access_id=?").run(
           JSON.stringify({
             ...use,
             status: "dispatched",
             localStopped: false,
+            localReceipt: null,
             remoteStopped: false,
             finalObservation: null,
           }),
@@ -1122,6 +1132,142 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         f.cleanup();
       }
     });
+    it.each([false, true])(
+      "cold-recovers independently retained local stop after lost journal settlement (revoked=%s), without changing validation evidence",
+      async (revoked) => {
+        const f = await setup();
+        const fault = vi
+          .spyOn(f.s.journal.fixtures.validation, "reconcileLocalCommand")
+          .mockRejectedValue(new Error("Controller lost local-stop settlement"));
+        let observe: ReturnType<typeof vi.spyOn> | undefined;
+        try {
+          // The command ran, but settlement was lost: the parent must retain uncertainty.
+          expect((await f.s.dispatch(f.action)).status).toBe("indeterminate");
+          fault.mockRestore();
+          const use = f.s.journal.fixtures.validation.uses(f.s.authority.runId).at(-1)!;
+          expect(use).toMatchObject({
+            status: "dispatched",
+            localStopped: false,
+            localReceipt: null,
+          });
+          expect(await readCommandStop(use.localCommand!)).toMatchObject({
+            kind: "stopped",
+            code: 0,
+          });
+          const reopened = f.s.reopen(),
+            authority = f.s.newLease(),
+            journal = reopened.orchestration;
+          const evidence = journal.delivery.evidence(authority.runId, use.evidenceId);
+          const workspace = journal.agents.workspaceOperation(
+            authority.runId,
+            evidence.workspaceOperationId,
+          );
+          const parent = journal.actionForOperation(authority.runId, use.operationId);
+          expect(evidence).toMatchObject({ status: "running", outcome: null });
+          expect(workspace.stopEvidence).toBeNull();
+          if (revoked)
+            journal.fixtures.validation.revoke(
+              authority.runId,
+              journal.control(authority.runId).controlVersion,
+              use.grantId,
+            );
+          const grants = journal.fixtures.validation.grants(authority.runId);
+          observe = vi.spyOn(PostgreSqlFixtureValidationProvider.prototype, "observe");
+          const recovery = accessRecovery(journal, authority);
+          const result = await recovery.dispatch({
+            kind: "reconcile_fixture_access",
+            accessId: use.accessId,
+          });
+          expect(result.status).toBe(revoked ? "rejected" : "succeeded");
+          expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toMatchObject({
+            localStopped: true,
+            remoteStopped: !revoked,
+            localCommand: use.localCommand,
+            localReceipt: { kind: "stopped", code: 0 },
+          });
+          if (revoked) expect(observe).not.toHaveBeenCalled();
+          else expect(observe).toHaveBeenCalledTimes(1);
+          expect(journal.fixtures.validation.grants(authority.runId)).toEqual(grants);
+          expect(journal.delivery.evidence(authority.runId, use.evidenceId)).toEqual(evidence);
+          expect(journal.actionForOperation(authority.runId, use.operationId)).toEqual(parent);
+          expect(
+            journal.agents.workspaceOperation(authority.runId, evidence.workspaceOperationId),
+          ).toEqual(workspace);
+          expect(journal.delivery.satisfiesCheck(authority.runId, use.evidenceId)).toBe(false);
+          expect(f.sql("SELECT count(*) FROM proof", "browser_fixture")).toBe("1");
+        } finally {
+          observe?.mockRestore();
+          fault.mockRestore();
+          f.cleanup();
+        }
+      },
+    );
+    it("seals an admitted but never-started supervisor across lease replacement and fences the delayed old launch", async () => {
+      const f = await setup();
+      const start = commandLifetime.startDurableCommand;
+      const fault = vi.spyOn(commandLifetime, "startDurableCommand").mockImplementation(() => {
+        throw new NamespaceStopUnprovenError(
+          "Controller lost execution after durable dispatch intent",
+        );
+      });
+      let observe: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        expect((await f.s.dispatch(f.action)).status).toBe("indeterminate");
+        const [intent, launch] = fault.mock.calls[0]!;
+        fault.mockRestore();
+        const use = f.s.journal.fixtures.validation.uses(f.s.authority.runId).at(-1)!;
+        expect(use).toMatchObject({
+          status: "dispatched",
+          localCommand: intent,
+          localStopped: false,
+        });
+        expect(await readCommandStop(intent)).toBeNull();
+        const reopened = f.s.reopen(),
+          authority = f.s.newLease(),
+          journal = reopened.orchestration;
+        journal.fixtures.validation.revoke(
+          authority.runId,
+          journal.control(authority.runId).controlVersion,
+          use.grantId,
+        );
+        const evidence = journal.delivery.evidence(authority.runId, use.evidenceId);
+        const workspace = journal.agents.workspaceOperation(
+          authority.runId,
+          evidence.workspaceOperationId,
+        );
+        observe = vi.spyOn(PostgreSqlFixtureValidationProvider.prototype, "observe");
+        expect(
+          (
+            await accessRecovery(journal, authority).dispatch({
+              kind: "reconcile_fixture_access",
+              accessId: use.accessId,
+            })
+          ).status,
+        ).toBe("succeeded");
+        expect(observe).not.toHaveBeenCalled();
+        expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toMatchObject({
+          status: "not_started",
+          localStopped: true,
+          remoteStopped: true,
+          localReceipt: { kind: "not_started" },
+        });
+        const delayed = start(intent, launch);
+        delayed.child.stdout!.resume();
+        delayed.child.stderr!.resume();
+        await expect(delayed.result).rejects.toThrow("supervisor failed");
+        expect(f.sql("SELECT to_regclass('public.proof') IS NULL", "browser_fixture")).toBe("t");
+        expect(journal.delivery.evidence(authority.runId, use.evidenceId)).toEqual(evidence);
+        expect(
+          journal.agents.workspaceOperation(authority.runId, evidence.workspaceOperationId),
+        ).toEqual(workspace);
+        expect(workspace.stopEvidence).toBeNull();
+        expect(journal.delivery.satisfiesCheck(authority.runId, use.evidenceId)).toBe(false);
+      } finally {
+        observe?.mockRestore();
+        fault.mockRestore();
+        f.cleanup();
+      }
+    });
     it("atomically rolls back evidence, workspace exclusion and fixture reservation if recording the use fails", async () => {
       const f = await setup(),
         db = new Database(f.s.path);
@@ -1154,7 +1300,9 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
           authority = f.s.newLease(),
           journal = reopened.orchestration;
         expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toEqual(use);
-        expect(() => journal.fixtures.validation.dispatch(authority, use.accessId)).toThrow();
+        expect(() =>
+          journal.fixtures.validation.dispatch(authority, use.accessId, use.localCommand!),
+        ).toThrow();
         const kernel = new ActionKernel(journal);
         registerFixtureCapabilities(
           kernel,

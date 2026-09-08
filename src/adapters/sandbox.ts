@@ -3,6 +3,12 @@ import { isAbsolute, join, resolve } from "node:path";
 import { redactSensitiveText } from "../util/redact.js";
 import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
 import {
+  prepareCommandLifetime,
+  startDurableCommand,
+  type CommandLaunch,
+} from "./command-lifetime.js";
+import type { CommandLifetime } from "../domain/command-lifetime.js";
+import {
   fixtureBridgeArguments,
   fixtureBridgeEnvironment,
   fixtureBridgeTransport,
@@ -61,6 +67,14 @@ export async function startConfinedCommand(
     beforeSpawn?: () => void | Promise<void>;
     /** Controller-only transport. Does not confer fixture authority or remote stop proof. */
     fixtureBridge?: FixtureBridgeTransport;
+    /** Kernel-only durable local-stop protocol; admission persists the exact launch before dispatch. */
+    durableStop?: {
+      runId: string;
+      operationId: string;
+      controllerLeaseId: string;
+      scopeDigest: string;
+      admit(intent: CommandLifetime): void | Promise<void>;
+    };
   } = {},
 ): Promise<ConfinedCommandHandle> {
   if (process.platform !== "linux") throw new Error("Adaptive command confinement requires Linux");
@@ -186,19 +200,40 @@ export async function startConfinedCommand(
   options.signal?.throwIfAborted();
 
   const startedAt = new Date().toISOString();
-  // The trusted caller rechecks its lease/action after asynchronous filesystem admission.
-  if (options.beforeSpawn) await options.beforeSpawn();
-  options.signal?.throwIfAborted();
-  const namespace = startNamespaceProcess(options.bwrapPath ?? "bwrap", args, {
+  const launch: CommandLaunch = {
+    command: options.bwrapPath ?? "bwrap",
+    args,
     cwd: workspace,
     env: { PATH: "/usr/bin:/bin" },
-    stdio: "pipe",
-    ...(spec.syntheticUser
-      ? {
-          extraInput: `epicd:x:${process.getuid!()}:${process.getgid!()}::/tmp/epicd-home:/bin/sh\n`,
-        }
-      : {}),
-  });
+    extraInput: spec.syntheticUser
+      ? `epicd:x:${process.getuid!()}:${process.getgid!()}::/tmp/epicd-home:/bin/sh\n`
+      : null,
+  };
+  const lifetime = options.durableStop
+    ? await prepareCommandLifetime(
+        {
+          runId: options.durableStop.runId,
+          operationId: options.durableStop.operationId,
+          controllerLeaseId: options.durableStop.controllerLeaseId,
+          scopeDigest: options.durableStop.scopeDigest,
+          timeoutMs: spec.timeoutMs,
+        },
+        launch,
+      )
+    : null;
+  // The trusted caller rechecks its lease/action after asynchronous filesystem admission.
+  if (options.beforeSpawn) await options.beforeSpawn();
+  if (lifetime) await options.durableStop!.admit(lifetime);
+  options.signal?.throwIfAborted();
+  const durable = lifetime ? startDurableCommand(lifetime, launch) : null;
+  const namespace =
+    durable ??
+    startNamespaceProcess(launch.command, launch.args, {
+      cwd: launch.cwd,
+      env: launch.env,
+      stdio: "pipe",
+      ...(launch.extraInput === null ? {} : { extraInput: launch.extraInput }),
+    });
   const { child } = namespace;
   let terminal = false;
   let stoppedFor: "cancelled" | "timed_out" | undefined;
@@ -223,28 +258,38 @@ export async function startConfinedCommand(
     child.once("close", (code, signal) => {
       clearTimeout(deadline);
       options.signal?.removeEventListener("abort", abort);
-      const spawnError = namespace.failure();
-      if (spawnError) {
-        reject(
-          spawnError instanceof NamespaceStopUnprovenError
-            ? spawnError
-            : new Error(`Confined command could not start: ${spawnError.message}`),
-        );
-        return;
-      }
-      resolveResult({
-        status: stoppedFor ?? (code === 0 ? "succeeded" : "failed"),
-        exitCode: code,
-        signal,
-        stdout: stdout.text(),
-        stderr: stderr.text(),
-        outputTruncated: stdout.truncated || stderr.truncated,
-        startedAt,
-        endedAt: new Date().toISOString(),
-        processTreeStopped: true,
-      });
+      void (async () => {
+        if (durable) {
+          const stopped = await durable.result;
+          code = stopped.code;
+          signal = stopped.signal;
+          stoppedFor ??= stopped.receipt.reason ?? undefined;
+          if (stopped.receipt.error)
+            throw new Error(`Confined command could not start: ${stopped.receipt.error}`);
+          if (stopped.receipt.kind === "not_started") stoppedFor ??= "cancelled";
+        } else if ("failure" in namespace) {
+          const spawnError = namespace.failure();
+          if (spawnError)
+            throw spawnError instanceof NamespaceStopUnprovenError
+              ? spawnError
+              : new Error(`Confined command could not start: ${spawnError.message}`);
+        }
+        resolveResult({
+          status: stoppedFor ?? (code === 0 ? "succeeded" : "failed"),
+          exitCode: code,
+          signal,
+          stdout: stdout.text(),
+          stderr: stderr.text(),
+          outputTruncated: stdout.truncated || stderr.truncated,
+          startedAt,
+          endedAt: new Date().toISOString(),
+          processTreeStopped: true,
+        });
+      })().catch(reject);
     });
   });
+  // The durable promise may reject before the close listener above resumes.
+  void durable?.result.catch(() => {});
   return { result, interrupt: abort };
 }
 

@@ -41,6 +41,14 @@ export function registerFixtureCapabilities(
           );
         use = fixtures.noDispatch(authority, use.accessId);
       }
+      if (!use.localStopped && use.localCommand) {
+        if (kernel.operation(use.operationId))
+          throw new CapabilityRejected(
+            "fixture_access_action_live",
+            "The original validation is still executing; interrupt and await its exact operation before reconciling",
+          );
+        use = await fixtures.reconcileLocalCommand(authority, use.accessId);
+      }
       if (!use.localStopped)
         throw new CapabilityRejected(
           "fixture_access_local_unknown",

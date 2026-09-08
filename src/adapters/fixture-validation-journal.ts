@@ -9,6 +9,7 @@ import {
   FixtureValidationGrantSchema,
   FixtureValidationObservationSchema,
   FixtureValidationUseSchema,
+  commandOwnsFixtureUses,
   type FixtureValidationGrant,
   type FixtureValidationObservation,
   type FixtureValidationUse,
@@ -18,6 +19,8 @@ import type { ActionRecord, ControllerAuthority, ControlState } from "../domain/
 import { FixtureAuthorityError } from "./fixture-journal.js";
 import { ValidationEvidenceSchema } from "../domain/delivery.js";
 import { redactSensitiveText } from "../util/redact.js";
+import { CommandLifetimeSchema, type CommandLifetime } from "../domain/command-lifetime.js";
+import { recoverCommandStop } from "./command-lifetime.js";
 
 export const FIXTURE_VALIDATION_TABLES = [
   "fixture_validation_grants",
@@ -294,6 +297,8 @@ export class FixtureValidationJournal {
         preflight: null,
         finalObservation: null,
         localStopped: false,
+        localCommand: null,
+        localReceipt: null,
         remoteStopped: false,
         detail: null,
         createdAt: new Date().toISOString(),
@@ -347,12 +352,18 @@ export class FixtureValidationJournal {
       this.save({ ...use, preflight: observation });
     });
   }
-  dispatch(authority: ControllerAuthority, accessId: string): void {
+  dispatch(authority: ControllerAuthority, accessId: string, input: CommandLifetime): void {
     this.access.transaction(authority, () => {
       const use = this.assertDispatch(authority, accessId);
       if (use.status !== "reserved" || !use.preflight)
         fail("fixture_access_used", "Fixture dispatch requires one unused admitted preflight");
-      this.save({ ...use, status: "dispatched" });
+      const intent = CommandLifetimeSchema.parse(input);
+      if (!commandOwnsFixtureUses(intent, this.commandUses(use)))
+        fail(
+          "fixture_access_command_mismatch",
+          "Command intent differs from the admitted fixture uses",
+        );
+      this.save({ ...use, status: "dispatched", localCommand: intent });
       this.access.note(
         use.runId,
         "fixture.validation_dispatched",
@@ -426,18 +437,86 @@ export class FixtureValidationJournal {
           "fixture_access_old_owner",
           "A replacement controller cannot infer its predecessor's process stop",
         );
-      this.save(
-        use.status === "reserved"
-          ? {
-              ...use,
-              status: "not_started",
-              localStopped: true,
-              remoteStopped: true,
-              detail: "No repository SQL transport was dispatched",
-            }
-          : { ...use, localStopped: true },
-      );
+      if (use.status !== "reserved")
+        fail(
+          "fixture_access_local_unknown",
+          "Dispatched fixture transport requires an independent command-stop receipt",
+        );
+      this.save({
+        ...use,
+        status: "not_started",
+        localStopped: true,
+        remoteStopped: true,
+        detail: "No repository SQL transport was dispatched",
+      });
     });
+  }
+  /** Physical local proof only. This never settles validation/workspace I/O or authorizes SQL. */
+  async reconcileLocalCommand(
+    authority: ControllerAuthority,
+    accessId: string,
+  ): Promise<FixtureValidationUse> {
+    const before = this.access.transaction(authority, () => {
+      const use = this.use(authority.runId, accessId);
+      if (
+        use.localCommand &&
+        (!commandOwnsFixtureUses(use.localCommand, this.commandUses(use)) ||
+          !this.provenanceMatches(use))
+      )
+        fail(
+          "fixture_access_provenance_changed",
+          "Command stop must match the original validation and fixture provenance",
+        );
+      return use;
+    });
+    if (!before.localCommand)
+      return fail(
+        "fixture_access_local_unknown",
+        "Fixture command has no registered local-stop intent",
+      );
+    const receipt = await recoverCommandStop(before.localCommand);
+    if (!receipt)
+      return fail(
+        "fixture_access_local_unknown",
+        "The original command has no independent local-stop receipt; preserve exclusion",
+      );
+    return this.access.transaction(authority, () => {
+      const use = this.use(authority.runId, accessId);
+      if (
+        digestJson(use.localCommand) !== digestJson(before.localCommand) ||
+        !use.localCommand ||
+        !commandOwnsFixtureUses(use.localCommand, this.commandUses(use)) ||
+        !this.provenanceMatches(use)
+      )
+        fail(
+          "fixture_access_provenance_changed",
+          "Command stop must match the original validation and fixture provenance",
+        );
+      const stopped = FixtureValidationUseSchema.parse({
+        ...use,
+        localReceipt: receipt,
+        localStopped: true,
+        ...(receipt.kind === "not_started"
+          ? {
+              status: "not_started",
+              remoteStopped: true,
+              finalObservation: null,
+              detail:
+                "Independent dispatch gate proves no local fixture command started; validation and workspace I/O remain separate",
+            }
+          : {}),
+      });
+      this.save(stopped);
+      this.access.note(
+        use.runId,
+        "fixture.validation_local_stopped",
+        `${accessId}: exact independent ${receipt.kind} receipt retained`,
+      );
+      return stopped;
+    });
+  }
+  private commandUses(use: FixtureValidationUse): FixtureValidationUse[] {
+    return this.uses(use.runId).filter((entry) => entry.evidenceId === use.evidenceId);
   }
   observationUse(runId: string, accessId: string, expectedGrantId?: string) {
     const use = this.use(runId, accessId),
@@ -504,6 +583,8 @@ export class FixtureValidationJournal {
       use.status === "stopped" &&
       use.localStopped &&
       use.remoteStopped &&
+      !!use.localCommand &&
+      commandOwnsFixtureUses(use.localCommand, this.commandUses(use)) &&
       this.provenanceMatches(use) &&
       use.policyDigest === this.access.control(runId).policyDigest &&
       use.definitionDigest === this.digest(runId, use.fixtureId) &&

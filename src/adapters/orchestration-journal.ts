@@ -73,7 +73,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 35;
+export const ORCHESTRATION_SCHEMA_VERSION = 36;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -566,13 +566,17 @@ export class OrchestrationJournal {
         .filter((fixture) => fixture.status === "owned")
         .map((fixture) => fixture.creationId)
         .sort(),
+      fixtureAccessIds: this.fixtures.validation
+        .uses(runId)
+        .map((use) => use.accessId)
+        .sort(),
       trackerExportIds: this.tracker
         .operations(runId)
         .filter((entry) => entry.kind === "export")
         .map((entry) => entry.trackerOperationId)
         .sort(),
       detail:
-        "All recorded work is stopped. Managed workspaces, agent sessions, publication artifacts, tracker export copies and owned fixtures are retained for inspection; no resource deletion or pane closure was performed.",
+        "All recorded work is stopped. Managed workspaces, agent sessions, publication artifacts, tracker export copies, owned fixtures and fixture-command control/stop evidence are retained for inspection; no resource deletion or pane closure was performed.",
     };
   }
 

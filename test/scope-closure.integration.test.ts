@@ -118,7 +118,11 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
       kind: "complete",
       outcome: "completed",
       mutationDispatched: false,
-      completion: { disposition: "retained_for_inspection", fixtureCreationIds: [] },
+      completion: {
+        disposition: "retained_for_inspection",
+        fixtureCreationIds: [],
+        fixtureAccessIds: [],
+      },
     });
     expect(runStatusView(s.store, run)).toMatchObject({
       control: { status: "complete" },

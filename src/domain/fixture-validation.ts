@@ -1,5 +1,12 @@
 import { z } from "zod";
 import { FixtureExecutableSchema, FixtureProviderBindingSchema } from "./fixtures.js";
+import {
+  CommandLifetimeSchema,
+  CommandStopSchema,
+  type CommandLifetime,
+  assertCommandStop,
+} from "./command-lifetime.js";
+import { digestJson } from "./repository-policy.js";
 
 const Id = z.string().min(1).max(256);
 const Oid = z.string().regex(/^\d{1,10}$/);
@@ -71,11 +78,41 @@ export const FixtureValidationUseSchema = z
     preflight: FixtureValidationObservationSchema.nullable(),
     finalObservation: FixtureValidationObservationSchema.nullable(),
     localStopped: z.boolean(),
+    localCommand: CommandLifetimeSchema.nullable(),
+    localReceipt: CommandStopSchema.nullable(),
     remoteStopped: z.boolean(),
     detail: z.string().max(4000).nullable(),
     createdAt: z.iso.datetime(),
   })
   .superRefine((use, context) => {
+    if (
+      (["dispatched", "stopped"].includes(use.status) && !use.localCommand) ||
+      (use.status === "reserved" && use.localCommand !== null) ||
+      (use.localReceipt !== null && (!use.localCommand || !use.localStopped)) ||
+      (use.localCommand && use.localStopped && !use.localReceipt) ||
+      (use.localReceipt?.kind === "not_started" && use.status !== "not_started") ||
+      (use.localCommand &&
+        use.status === "not_started" &&
+        use.localReceipt?.kind !== "not_started") ||
+      (use.localCommand &&
+        (use.localCommand.runId !== use.runId ||
+          use.localCommand.operationId !== use.operationId ||
+          use.localCommand.controllerLeaseId !== use.controllerLeaseId))
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Fixture command lifetime and local stop proof disagree",
+      });
+    if (use.localReceipt && use.localCommand) {
+      try {
+        assertCommandStop(use.localCommand, use.localReceipt);
+      } catch {
+        context.addIssue({
+          code: "custom",
+          message: "Fixture stop receipt differs from its command intent",
+        });
+      }
+    }
     const valid =
       use.status === "reserved"
         ? !use.localStopped && !use.remoteStopped && use.finalObservation === null
@@ -96,3 +133,44 @@ export const FixtureValidationUseSchema = z
       });
   });
 export type FixtureValidationUse = z.infer<typeof FixtureValidationUseSchema>;
+
+/** Immutable SQL provenance only; admission/settlement never changes the command's scope. */
+export function fixtureCommandScope(uses: readonly FixtureValidationUse[]): string {
+  return digestJson(
+    uses
+      .map((use) => ({
+        accessId: use.accessId,
+        runId: use.runId,
+        evidenceId: use.evidenceId,
+        operationId: use.operationId,
+        controllerLeaseId: use.controllerLeaseId,
+        fixtureId: use.fixtureId,
+        creationId: use.creationId,
+        generation: use.generation,
+        databaseOid: use.databaseOid,
+        marker: use.marker,
+        grantId: use.grantId,
+        policyDigest: use.policyDigest,
+        definitionDigest: use.definitionDigest,
+        binding: use.binding,
+        pgbouncer: use.pgbouncer,
+      }))
+      .sort((a, b) => a.accessId.localeCompare(b.accessId)),
+  );
+}
+
+export function commandOwnsFixtureUses(
+  intent: CommandLifetime,
+  uses: readonly FixtureValidationUse[],
+) {
+  return (
+    uses.length > 0 &&
+    uses.every(
+      (use) =>
+        use.runId === intent.runId &&
+        use.operationId === intent.operationId &&
+        use.controllerLeaseId === intent.controllerLeaseId,
+    ) &&
+    intent.scopeDigest === fixtureCommandScope(uses)
+  );
+}
