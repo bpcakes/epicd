@@ -1,9 +1,22 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
-import { createRun, discoverHerdr, sdkNativeExecutable } from "../src/bootstrap.js";
+import {
+  createRun,
+  discoverHerdr,
+  sdkNativeExecutable,
+  selectedCodexExecutable,
+} from "../src/bootstrap.js";
 import { resolveAgentRoleSettings } from "../src/domain/types.js";
 
 const cleanup: (() => void)[] = [];
@@ -139,6 +152,50 @@ describe.runIf(process.platform === "linux")("fresh run bootstrap", () => {
     const executable = await sdkNativeExecutable();
     expect(readFileSync(executable).subarray(0, 4)).toEqual(Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
     expect(execFileSync(executable, ["--version"], { encoding: "utf8" })).toContain("codex-cli");
+  });
+  it.each(["sdk", "herdr"] as const)(
+    "resolves a selected npm installation for %s without executing its shim or selecting another package",
+    async (runtime) => {
+      const f = fixture();
+      const pkg = join(f.root, "node_modules/@openai/codex");
+      const nativePkg = join(pkg, "node_modules/@openai/codex-linux-x64");
+      const native = join(nativePkg, "vendor/x86_64-unknown-linux-musl/bin/codex");
+      mkdirSync(join(pkg, "bin"), { recursive: true });
+      mkdirSync(join(nativePkg, "vendor/x86_64-unknown-linux-musl/bin"), { recursive: true });
+      writeFileSync(
+        join(pkg, "package.json"),
+        JSON.stringify({ name: "@openai/codex", bin: { codex: "bin/codex.js" } }),
+      );
+      writeFileSync(
+        join(pkg, "bin/codex.js"),
+        "#!/usr/bin/env node\nthrow new Error('Do not execute this shim')\n",
+        { mode: 0o700 },
+      );
+      writeFileSync(join(nativePkg, "package.json"), JSON.stringify({ name: "@openai/codex" }));
+      copyFileSync("/usr/bin/true", native);
+      const alias = join(f.root, "selected-codex");
+      symlinkSync(join(pkg, "bin/codex.js"), alias);
+      expect(await selectedCodexExecutable(runtime, alias)).toBe(native);
+      expect(await selectedCodexExecutable(runtime, native)).toBe(native);
+      if (runtime === "sdk") {
+        const run = await createRun(f.store, { ...f.options, codexPath: alias });
+        expect(run.runtimeConfiguration?.executable).toBe(native);
+      }
+    },
+  );
+  it("refuses an incomplete selected npm installation instead of falling back to the SDK bundle", async () => {
+    const f = fixture(),
+      pkg = join(f.root, "node_modules/@openai/codex");
+    mkdirSync(join(pkg, "bin"), { recursive: true });
+    writeFileSync(
+      join(pkg, "package.json"),
+      JSON.stringify({ name: "@openai/codex", bin: { codex: "bin/codex.js" } }),
+    );
+    writeFileSync(join(pkg, "bin/codex.js"), "#!/bin/false\n", { mode: 0o700 });
+    await expect(selectedCodexExecutable("herdr", join(pkg, "bin/codex.js"))).rejects.toThrow(
+      "no installation fallback",
+    );
+    expect(f.store.list()).toEqual([]);
   });
   it("rejects state storage reached through an outside symlink into the delivery repository", async () => {
     const f = fixture();

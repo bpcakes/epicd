@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { discoverHerdr, resolveExecutable, sdkNativeExecutable } from "./bootstrap.js";
+import { discoverHerdr, resolveExecutable, selectedCodexExecutable } from "./bootstrap.js";
 import { verifyCodexExecutable } from "./adapters/codex-settings.js";
 import { ORCHESTRATOR_MODEL, type RuntimeKind } from "./domain/types.js";
 
@@ -10,11 +10,7 @@ export async function runDoctor(options: {
   codexPath?: string;
 }) {
   const cwd = resolve(options.repoPath);
-  const executable = options.codexPath
-    ? await resolveExecutable(options.codexPath)
-    : options.runtime === "sdk"
-      ? await sdkNativeExecutable()
-      : await resolveExecutable("codex");
+  const executable = await selectedCodexExecutable(options.runtime, options.codexPath);
   const version = await verifyCodexExecutable(cwd, { executablePath: executable, args: [] });
   const herdr =
     options.runtime === "herdr" ? await discoverHerdr(await resolveExecutable("herdr"), cwd) : null;
@@ -27,6 +23,6 @@ export async function runDoctor(options: {
     fallback: false,
     herdr,
     warning:
-      "Executable/endpoint checks only. Authentication, confinement and model result admission are verified by the controlled launch; final epic completion remains unavailable.",
+      "Executable/endpoint checks only. These checks do not prove authentication, confinement, model result admission or epic delivery.",
   };
 }

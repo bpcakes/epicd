@@ -12,9 +12,16 @@ export type OrchestratorContext = {
   objective: ReturnType<ActionKernel["journal"]["runObjective"]>;
   control: ControlState;
   observationCursor: number;
+  observationWindow: { afterCursor: number; hasMore: boolean };
   observations: Observation[];
   memory: MemoryEntry[];
   actions: ActionRecord[];
+  latestActionOutcome:
+    | (Pick<ActionRecord, "actionId" | "operationId" | "status" | "result"> & {
+        kind: ActionRecord["request"]["action"]["kind"];
+        requestArgumentsOmitted: true;
+      })
+    | null;
   capabilities: ReturnType<ActionKernel["capabilities"]>;
   agents: ReturnType<ActionKernel["journal"]["agents"]["summaries"]>;
   delivery: ReturnType<ActionKernel["journal"]["delivery"]["summaries"]>;
@@ -42,15 +49,18 @@ export type OrchestratorContext = {
 /** No lease tokens or private provider reasoning enter the bounded working context. */
 export function buildOrchestratorContext(kernel: ActionKernel, runId: string): OrchestratorContext {
   const control = kernel.journal.control(runId);
-  const observations = kernel.journal.observations(runId, control.observationCursor, 100);
+  const pending = kernel.journal.observations(runId, control.observationCursor, 101);
+  const observations = pending.slice(0, 100);
   const policy = kernel.journal.policy(runId);
   const context: OrchestratorContext = {
     objective: kernel.journal.runObjective(runId),
     control,
     observationCursor: observations.at(-1)?.id ?? control.observationCursor,
+    observationWindow: { afterCursor: control.observationCursor, hasMore: pending.length > 100 },
     observations,
     memory: kernel.journal.memory(runId).slice(-20),
     actions: kernel.journal.actions(runId).slice(-20).map(actionContextRecord),
+    latestActionOutcome: null,
     capabilities: kernel.capabilities(),
     agents: kernel.journal.agents.summaries(runId),
     delivery: kernel.journal.delivery.summaries(runId),
@@ -85,13 +95,34 @@ export function buildOrchestratorContext(kernel: ActionKernel, runId: string): O
     ],
   };
   const size = () => Buffer.byteLength(JSON.stringify(context));
-  // Preserve the full delivered observation window and its cursor. Shorten old diagnostics first.
+  // Shorten previews, never their durable originals or identity/provenance fields.
   for (const observation of context.observations) {
     if (size() <= 64 * 1024) break;
-    observation.summary = `${observation.summary.slice(0, 128)} [retrieve full observation by ID]`;
+    if (observation.summary.length > 256)
+      observation.summary = `${observation.summary.slice(0, 128)} [shortened; use inspect_observation ${observation.id}]`;
   }
-  while (size() > 64 * 1024 && context.actions.length) context.actions.shift();
+  // A legal request can itself exceed this snapshot's budget. Omit its arguments
+  // if necessary, not its latest outcome (including requested observation pages).
+  while (size() > 64 * 1024 && context.actions.length) {
+    const omitted = context.actions.shift()!;
+    if (!context.actions.length)
+      context.latestActionOutcome = {
+        actionId: omitted.actionId,
+        operationId: omitted.operationId,
+        kind: omitted.request.action.kind,
+        status: omitted.status,
+        result: omitted.result,
+        requestArgumentsOmitted: true,
+      };
+  }
   while (size() > 64 * 1024 && context.memory.length) context.memory.shift();
+  // Metadata can exceed the budget even after shortening every summary. Deliver a
+  // prefix and acknowledge only that prefix; the omitted suffix is still pending.
+  while (size() > 64 * 1024 && context.observations.length > 1) {
+    context.observations.pop();
+    context.observationCursor = context.observations.at(-1)!.id;
+    context.observationWindow.hasMore = true;
+  }
   if (size() > 64 * 1024)
     throw new Error("Mandatory orchestration context exceeds the bounded context budget");
   return context;

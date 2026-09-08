@@ -74,6 +74,12 @@ export type MemoryInput = z.infer<typeof MemoryInputSchema>;
 /** Each admitted action has a narrow schema; none conveys controller authority. */
 export const KernelActionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("inspect_run") }),
+  z.strictObject({
+    kind: z.literal("inspect_observation"),
+    observationId: z.number().int().positive(),
+    offset: Version,
+    limit: z.number().int().positive().max(4000),
+  }),
   z.strictObject({ kind: z.literal("inspect_candidate"), ...CandidateTarget }),
   z.strictObject({ kind: z.literal("inspect_validation_plan"), validationPlanId: Id }),
   z.strictObject({ kind: z.literal("inspect_evidence"), evidenceId: Id }),

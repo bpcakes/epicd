@@ -101,6 +101,9 @@ export class DecisionJournal {
       if (
         context.control?.runId !== authority.runId ||
         context.observationCursor !== ticket.observationCursor ||
+        typeof context.observationWindow?.hasMore !== "boolean" ||
+        context.observationWindow?.afterCursor !==
+          this.access.control(authority.runId).observationCursor ||
         context.control?.controlVersion !== ticket.expectedControlVersion ||
         context.control?.policyDigest !== ticket.policyDigest
       )

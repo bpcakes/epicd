@@ -72,7 +72,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 28;
+export const ORCHESTRATION_SCHEMA_VERSION = 29;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -975,6 +975,7 @@ export class OrchestrationJournal {
           "wait_for_events",
           "record_memory",
           "inspect_run",
+          "inspect_observation",
           "inspect_repo",
           "inspect_agent",
           "inspect_artifact",

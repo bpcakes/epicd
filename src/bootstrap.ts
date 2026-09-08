@@ -54,6 +54,42 @@ export async function sdkNativeExecutable(): Promise<string> {
   return resolveExecutable(join(dirname(manifest), "vendor/x86_64-unknown-linux-musl/bin/codex"));
 }
 
+/** Resolve the selected installation's current npm launcher to its native payload.
+ * Never execute the JavaScript shim inside confinement or substitute the SDK's
+ * installation when the selected installation is incomplete.
+ */
+export async function selectedCodexExecutable(
+  runtime: RuntimeKind,
+  override?: string,
+): Promise<string> {
+  if (!override && runtime === "sdk") return sdkNativeExecutable();
+  const entry = await resolveExecutable(override ?? "codex");
+  if (basename(entry) !== "codex.js") return entry;
+  if (process.platform !== "linux" || process.arch !== "x64")
+    throw new Error("Controlled runtime admission currently requires Linux x64");
+  const manifestPath = join(dirname(entry), "..", "package.json");
+  const manifest = z
+    .object({
+      name: z.literal("@openai/codex"),
+      bin: z.object({ codex: z.literal("bin/codex.js") }),
+    })
+    .safeParse(JSON.parse(await readFile(manifestPath, "utf8")));
+  if (!manifest.success || dirname(entry).split("/").at(-1) !== "bin")
+    throw new Error("Select a native Codex binary or its supported npm entrypoint");
+  let nativeManifest: string;
+  try {
+    nativeManifest = createRequire(entry).resolve("@openai/codex-linux-x64/package.json");
+  } catch (error) {
+    throw new Error(
+      "The selected Codex installation has no native Linux x64 dependency; no installation fallback was attempted",
+      { cause: error },
+    );
+  }
+  return resolveExecutable(
+    join(dirname(nativeManifest), "vendor/x86_64-unknown-linux-musl/bin/codex"),
+  );
+}
+
 /** Read-only caller discovery. Never infer a workspace from focus or create a session here. */
 export async function discoverHerdr(executable: string, cwd: string) {
   if (process.env.HERDR_ENV !== "1")
@@ -113,11 +149,7 @@ export async function handoffRuntime(
     const state = store.get(runId)!;
     if (!state.runtimeConfiguration) throw new Error("Run has no runtime configuration");
     signal?.throwIfAborted();
-    const executable = options.codexPath
-      ? await resolveExecutable(options.codexPath)
-      : options.runtime === "sdk"
-        ? await sdkNativeExecutable()
-        : await resolveExecutable("codex");
+    const executable = await selectedCodexExecutable(options.runtime, options.codexPath);
     await verifyCodexExecutable(state.repoPath, { executablePath: executable, args: [] });
     const herdr =
       options.runtime === "herdr"
@@ -171,11 +203,7 @@ export async function createRun(
   // Explicitly selected repository declaration, frozen once. Missing policy never means unrestricted execution.
   const policyPath = join(repoPath, ".epicd", "policy.json");
   const policy = RepositoryPolicySchema.parse(JSON.parse(await readFile(policyPath, "utf8")));
-  const executable = options.codexPath
-    ? await resolveExecutable(options.codexPath)
-    : options.runtime === "sdk"
-      ? await sdkNativeExecutable()
-      : await resolveExecutable("codex");
+  const executable = await selectedCodexExecutable(options.runtime, options.codexPath);
   await verifyCodexExecutable(repoPath, { executablePath: executable, args: [] });
   const trackerExecutable = await resolveExecutable(options.trackerPath ?? "br");
   const tracker = new KernelBeads(trackerExecutable);

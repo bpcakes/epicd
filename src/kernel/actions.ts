@@ -47,6 +47,31 @@ export class ActionKernel {
     readonly journal: OrchestrationJournal,
     private readonly beforeDispatch?: (signal: AbortSignal) => Promise<void>,
   ) {
+    this.registerLocal("inspect_observation", ({ authority }, action) => {
+      const observation = journal.observations(authority.runId, action.observationId - 1, 1)[0];
+      if (observation?.id !== action.observationId)
+        throw new CapabilityRejected("unknown_observation", "No such observation in this run");
+      // Page the immutable, already-redacted record. Even maximum-size metadata
+      // must not turn a read-only diagnostic into an unbounded model response.
+      const retained = JSON.stringify(observation);
+      if (action.offset > retained.length)
+        throw new CapabilityRejected(
+          "invalid_observation_offset",
+          "Offset exceeds the retained observation",
+        );
+      const end = Math.min(retained.length, action.offset + action.limit);
+      return {
+        kind: "inspection",
+        text: JSON.stringify({
+          observationId: observation.id,
+          offset: action.offset,
+          nextOffset: end < retained.length ? end : null,
+          totalCharacters: retained.length,
+          content: retained.slice(action.offset, end),
+        }),
+        artifactIds: [],
+      };
+    });
     this.registerLocal("inspect_artifact", ({ authority }, action) => {
       try {
         const page = journal.diagnostics.read(
@@ -160,13 +185,23 @@ export class ActionKernel {
       kind: "memory",
       memoryId: journal.recordMemory(authority, action.entry).memoryId,
     }));
-    this.registerLocal("wait_for_events", ({ record }, action) => {
+    this.registerLocal("wait_for_events", ({ authority, record }, action) => {
       if (action.afterCursor !== record.request.observationCursor)
         throw new CapabilityRejected(
           "wrong_wait_cursor",
           "Wait must begin at the observed cursor, not skip unseen events",
         );
-      return { kind: "wait", afterCursor: action.afterCursor, deadline: action.deadline };
+      // Only the frozen page can identify a pre-existing non-waking backlog.
+      // New coordinator bookkeeping must not self-wake an ordinary wait.
+      // Persist the immediate deadline so cold restart also drains the suffix.
+      const execution = journal.decisionSource.execution(authority.runId, record.decisionId);
+      const hasPending =
+        execution !== null && JSON.parse(execution.contextJson).observationWindow.hasMore;
+      return {
+        kind: "wait",
+        afterCursor: action.afterCursor,
+        deadline: hasPending ? new Date().toISOString() : action.deadline,
+      };
     });
     this.registerLocal("escalate", ({ authority }, action) => ({
       kind: "escalation",

@@ -6,6 +6,11 @@ import { StateStore } from "../dist/adapters/store.js";
 import { createRun, resolveExecutable } from "../dist/bootstrap.js";
 import { OrchestratorController } from "../dist/controller.js";
 
+const runtime = process.env.EPICD_LIVE_DELIVERY_RUNTIME ?? "sdk";
+if (runtime !== "sdk" && runtime !== "herdr")
+  throw new Error("Select sdk or herdr for live delivery");
+const deadlineMinutes = runtime === "herdr" ? 40 : 20;
+
 /** Opt-in model acceptance, not a scripted strategy or a substitute for kernel regressions. */
 describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY === "1")(
   "model-led epic delivery",
@@ -13,6 +18,11 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
     it(
       "delivers a real one-task Beads epic with Astra and independent exact-revision review",
       async () => {
+        if (runtime === "herdr") {
+          expect(process.env.HERDR_ENV).toBe("1");
+          expect(process.env.EPICD_EXPECT_HERDR_SESSION).toMatch(/^epicd-delivery-[a-f0-9]{8}$/);
+          expect(process.env.EPICD_EXPECT_HERDR_WORKSPACE).toBeTruthy();
+        }
         const root = mkdtempSync("/var/tmp/epicd-live-delivery-");
         // Always retain this run's state and private resources for inspecting model decisions.
         // Never erase uncertain processes, receipts or a failed live evaluation in teardown.
@@ -91,7 +101,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
         const abort = new AbortController();
         const timeout = setTimeout(
           () => abort.abort(new Error("Live delivery deadline exceeded")),
-          20 * 60_000,
+          deadlineMinutes * 60_000,
         );
         let progress: ReturnType<typeof setInterval> | undefined;
         try {
@@ -100,7 +110,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
             {
               repoPath: source,
               epicId: epic.id,
-              runtime: "sdk",
+              runtime,
               trackerPath: trackerExecutable,
               model: "gpt-6-astra",
               reasoningEffort: "high",
@@ -108,6 +118,15 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
             },
             abort.signal,
           );
+          if (runtime === "herdr") {
+            // Reject a discovery mismatch before creating any agent in that workspace.
+            expect(run.runtimeConfiguration?.herdr?.sessionName).toBe(
+              process.env.EPICD_EXPECT_HERDR_SESSION,
+            );
+            expect(run.runtimeConfiguration?.herdr?.workspaceId).toBe(
+              process.env.EPICD_EXPECT_HERDR_WORKSPACE,
+            );
+          }
           process.stderr.write(`Live delivery run: ${run.runId}\n`);
           progress = setInterval(() => {
             const control = store.orchestration.control(run.runId);
@@ -136,6 +155,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
             }),
           ).toBe(policyBytes);
           expect(git("rev-parse", "HEAD")).toBe(baseline);
+          expect(git("show", `${revision}:README.md`)).toBe(git("show", `${baseline}:README.md`));
           expect(readFileSync(join(source, ".git/index"))).toEqual(index);
           expect(readFileSync(join(source, "source.txt"), "utf8")).toBe(
             "operator-owned concurrent work\n",
@@ -146,6 +166,23 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
             );
           const journal = store.orchestration;
           const turns = journal.agents.turns(run.runId);
+          const agents = journal.agents.instances(run.runId);
+          expect(agents.every((agent) => agent.contract.runtime === runtime)).toBe(true);
+          if (runtime === "herdr") {
+            expect(run.runtimeConfiguration?.herdr?.sessionName).toBe(
+              process.env.EPICD_EXPECT_HERDR_SESSION,
+            );
+            expect(run.runtimeConfiguration?.herdr?.workspaceId).toBe(
+              process.env.EPICD_EXPECT_HERDR_WORKSPACE,
+            );
+            expect(
+              turns
+                .filter((turn) => turn.resultEligible)
+                .every((turn) => turn.launch?.native !== null && turn.launch?.native !== undefined),
+            ).toBe(true);
+            expect(turns.every((turn) => turn.sdkUsage === null)).toBe(true);
+            expect(agents.every((agent) => agent.provider?.runtime === "herdr")).toBe(true);
+          }
           expect(
             turns.some(
               (turn) =>
@@ -179,7 +216,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
           store.close();
         }
       },
-      21 * 60_000,
+      (deadlineMinutes + 1) * 60_000,
     );
   },
 );

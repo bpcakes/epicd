@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 28. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 29. Use a fresh state path; unsupported existing data is left intact.
 
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
@@ -28,6 +28,8 @@ node dist/cli.js doctor --repo /path/to/repository --runtime sdk
 `doctor` checks executable/endpoint availability without starting a model turn. It does not certify authentication, model access, confinement, or successful delivery.
 
 SDK mode uses the SDK-pinned native Codex binary through the supervised SDK transport. Herdr mode launches a real native Codex TUI in run-owned, unfocused tabs; it does not wrap SDK workers in decorative panes. The selected runtime, executable paths, private storage roots, and Herdr endpoint are persisted at creation. Resume does not silently switch runtimes.
+
+When the selected `codex` is the current npm JavaScript entrypoint, bootstrap resolves that installation's native payload before confinement and freezes the resulting executable path. An incomplete selected installation is an error, not permission to substitute another installation or launch the shim inside the sandbox.
 
 Confined validation, Codex, Beads and fixture commands use an independent PID-namespace lifetime supervisor outside Bubblewrap's command mounts. Cancellation remains effective during sandbox startup. A killed supervisor is an unknown stop, not permission to release a workspace, accept tracker completion or attest fixture-client termination. There is no unconfined fallback when this boundary cannot start.
 
@@ -152,6 +154,8 @@ During a run, the orchestrator can invoke `change_agent_settings` within frozen 
 
 ## Bounded coordinator conversations
 
+Each decision snapshot stays within 64 KiB. Observations are delivered as an ordered prefix with an explicit backlog flag; admission acknowledges only the delivered cursor. Large event metadata causes another page, not skipped events or an increased limit. Shortened observations remain in SQLite and can be retrieved with the read-only, run-scoped `inspect_observation` capability. Its pages contain retained JSON text with UTF-16 offsets and `nextOffset`; reading every retained character does not turn diagnostic claims into verification evidence. Current authority/evidence summaries and the latest action outcome remain in context. When request arguments are too large, `latestActionOutcome` retains the action identity and result while explicitly omitting those arguments from the preview; the journaled request is unchanged. A mandatory snapshot that cannot fit still fails explicitly.
+
 The run outlives any one Astra conversation. Between decisions, the controller retires a confirmed-stopped coordinator when its recorded history reaches 12 turns, 512 KiB of serialized prompts/schemas/results, or 196,608 reported SDK input tokens. These are conservative rollover thresholds, not exact context occupancy or monetary limits. SDK usage is retained against the exact acknowledged launch; native Herdr uses the same byte/turn guards without inventing token counts from terminal text.
 
 Rollover starts a fresh `gpt-6-astra` conversation in the selected runtime with unchanged settings and current journal context. Memory, assignments, evidence, findings, policy and consumed budgets remain intact. Pending instructions and unknown stop states prevent retirement; a frozen decision is reconciled before its conversation can be retired. Old workspaces and provider records are retained, not deleted or copied into the new conversation. Unexpected runtime failures still require diagnosis; this does not introduce a generic retry or model fallback.
@@ -275,7 +279,17 @@ The unscripted SDK delivery acceptance uses the existing Codex authentication ca
 EPICD_LIVE_DELIVERY=1 npm test -- test/model-led-delivery.integration.test.ts
 ```
 
-It allows up to 20 minutes of actual Astra work and always retains its printed private `/var/tmp/epicd-live-delivery-*` directory for diagnosis. It does not use the project's tracker or modify the user's checkout. The 2026-09-08 run passed complete SDK delivery, including nine context rollovers, three independent reviews, task/epic closure, final tracker publication, repository ownership release and preservation of the original checkout/index. This is one bounded acceptance case, not full release certification. Native Herdr whole-epic delivery and the receipt/browser recovery scenarios remain separate open checks.
+It allows up to 20 minutes of actual Astra work and always retains its printed private `/var/tmp/epicd-live-delivery-*` directory for diagnosis. It does not use the project's tracker or modify the user's checkout. The 2026-09-08 run passed complete SDK delivery, including nine context rollovers, three independent reviews, task/epic closure, final tracker publication, repository ownership release and preservation of the original checkout/index. This is one bounded acceptance case, not full release certification.
+
+From a Herdr-managed caller, the native equivalent creates its own named server, private session registry and caller pane, then runs the same model-led acceptance through real native Codex TUIs:
+
+```bash
+EPICD_LIVE_HERDR_DELIVERY=1 npm test -- test/model-led-herdr-delivery.integration.test.ts
+```
+
+The native run allows 40 minutes. The harness retains its printed `/var/tmp/epicd-native-delivery-*` logs and child report as well as the run artifacts. It stops only its owned server after the child actually exits; an unknown child outcome retains the session for inspection. Neither terminal idle state nor a passed native-startup check proves whole-epic delivery.
+
+The 2026-09-08 native acceptance passed in 26½ minutes: 72 decisions, ten Astra/high conversations, three approved independent reviews, task/epic closure and final tracker publication. All 60 turns had stop evidence; 58 had actual native endpoints and two were cancelled with never-started receipts. The run exercised two byte-bounded observation pages and preserved the original checkout, index, README and concurrent source edits. This live run preceded the subsequent large-action preview hardening; its exact evidence and follow-up verification are recorded in the plan. Receipt/browser recovery scenarios and the remaining resource/authority release audit are still open.
 
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 
