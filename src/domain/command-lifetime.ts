@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { StateFileIdentitySchema } from "./repository-admission.js";
+import { StateFileIdentitySchema } from "./state-file-identity.js";
 import { digestJson } from "./repository-policy.js";
 
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);

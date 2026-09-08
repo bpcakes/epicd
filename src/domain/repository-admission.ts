@@ -3,11 +3,7 @@ import { createHash } from "node:crypto";
 import { PublicationRepositorySchema } from "./publication.js";
 import { digestJson } from "./repository-policy.js";
 
-export const StateFileIdentitySchema = z.strictObject({
-  path: z.string().startsWith("/").max(2048),
-  device: z.string().regex(/^\d+$/),
-  inode: z.string().regex(/^\d+$/),
-});
+import { StateFileIdentitySchema } from "./state-file-identity.js";
 export const RepositoryIOStopSchema = z.strictObject({
   ioId: z.uuid(),
   controllerLeaseId: z.string().min(1),
@@ -83,7 +79,6 @@ export const RepositoryAdmissionSchema = z
         message: "Repository stop receipt differs from its intent",
       });
   });
-export type StateFileIdentity = z.infer<typeof StateFileIdentitySchema>;
 export type RepositoryAdmission = z.infer<typeof RepositoryAdmissionSchema>;
 
 export function repositoryIOBinding(record: {

@@ -55,8 +55,8 @@ async function history(f: Fixture, count = 1) {
 
 function readJournal(f: Fixture, verbose?: (message: unknown) => void) {
   const db = new Database(f.path, verbose ? { verbose } : {});
-  // A real separate connection; storage-path replacement is outside this read-scope unit.
-  const journal = new OrchestrationJournal(db, () => {});
+  // A real separate connection, with the owning store checking the current physical identity.
+  const journal = new OrchestrationJournal(db, () => f.store.storageIdentity());
   return { db, journal };
 }
 

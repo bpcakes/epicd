@@ -8,6 +8,7 @@ import { redactSensitiveText } from "../util/redact.js";
 import { PostgreSqlFixtureValidationProvider } from "./fixture-validation-provider.js";
 import type { FixtureBridgeTransport } from "./fixture-bridge.js";
 import { fixtureCommandScope } from "../domain/fixture-validation.js";
+import { runValidationIO } from "./validation-io.js";
 import {
   bindValidationService,
   verifyValidationServices,
@@ -17,6 +18,17 @@ import {
 
 /** Executes a persisted check. There is no shell on the host, synthetic pass, or agent-report input. */
 export async function runCandidateValidation(
+  journal: OrchestrationJournal,
+  workspaces: WorkspaceManager,
+  authority: ControllerAuthority,
+  evidence: ValidationEvidence,
+  signal: AbortSignal,
+): Promise<ValidationEvidence> {
+  return runValidationIO(journal, workspaces, authority, evidence, signal);
+}
+
+/** Fixed trusted worker only. Its complete lifetime is supervised by validation-io. */
+export async function executeCandidateValidation(
   journal: OrchestrationJournal,
   workspaces: WorkspaceManager,
   authority: ControllerAuthority,

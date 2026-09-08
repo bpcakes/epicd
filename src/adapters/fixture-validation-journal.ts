@@ -21,6 +21,7 @@ import { ValidationEvidenceSchema } from "../domain/delivery.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { CommandLifetimeSchema, type CommandLifetime } from "../domain/command-lifetime.js";
 import { recoverCommandStop } from "./command-lifetime.js";
+import { WorkspaceOperationSchema } from "../domain/workspaces.js";
 
 export const FIXTURE_VALIDATION_TABLES = [
   "fixture_validation_grants",
@@ -299,6 +300,7 @@ export class FixtureValidationJournal {
         localStopped: false,
         localCommand: null,
         localReceipt: null,
+        localWorkerStop: null,
         remoteStopped: false,
         detail: null,
         createdAt: new Date().toISOString(),
@@ -475,7 +477,8 @@ export class FixtureValidationJournal {
         "Fixture command has no registered local-stop intent",
       );
     const receipt = await recoverCommandStop(before.localCommand);
-    if (!receipt)
+    const workerStop = receipt ? null : this.completeWorkerStop(before);
+    if (!receipt && !workerStop)
       return fail(
         "fixture_access_local_unknown",
         "The original command has no independent local-stop receipt; preserve exclusion",
@@ -486,7 +489,8 @@ export class FixtureValidationJournal {
         digestJson(use.localCommand) !== digestJson(before.localCommand) ||
         !use.localCommand ||
         !commandOwnsFixtureUses(use.localCommand, this.commandUses(use)) ||
-        !this.provenanceMatches(use)
+        !this.provenanceMatches(use) ||
+        (workerStop && digestJson(workerStop) !== digestJson(this.completeWorkerStop(use)))
       )
         fail(
           "fixture_access_provenance_changed",
@@ -495,8 +499,9 @@ export class FixtureValidationJournal {
       const stopped = FixtureValidationUseSchema.parse({
         ...use,
         localReceipt: receipt,
+        localWorkerStop: workerStop,
         localStopped: true,
-        ...(receipt.kind === "not_started"
+        ...(receipt?.kind === "not_started"
           ? {
               status: "not_started",
               remoteStopped: true,
@@ -510,13 +515,46 @@ export class FixtureValidationJournal {
       this.access.note(
         use.runId,
         "fixture.validation_local_stopped",
-        `${accessId}: exact independent ${receipt.kind} receipt retained`,
+        `${accessId}: exact independent ${receipt?.kind ?? "complete-worker stopped"} receipt retained; remote SQL stop remains separate`,
       );
       return stopped;
     });
   }
   private commandUses(use: FixtureValidationUse): FixtureValidationUse[] {
     return this.uses(use.runId).filter((entry) => entry.evidenceId === use.evidenceId);
+  }
+  /** A stopped enclosing worker proves local descendants only, never database quiescence. */
+  private completeWorkerStop(use: FixtureValidationUse) {
+    const row = this.db
+      .prepare("SELECT record_json FROM validation_evidence WHERE run_id=? AND evidence_id=?")
+      .get(use.runId, use.evidenceId) as { record_json: string } | undefined;
+    const evidence = ValidationEvidenceSchema.parse(row ? JSON.parse(row.record_json) : null);
+    const retained = this.db
+      .prepare("SELECT record_json FROM workspace_operations WHERE run_id=? AND operation_id=?")
+      .get(use.runId, evidence.workspaceOperationId) as { record_json: string } | undefined;
+    const operation = WorkspaceOperationSchema.parse(
+      retained ? JSON.parse(retained.record_json) : null,
+    );
+    if (
+      evidence.runId !== use.runId ||
+      evidence.operationId !== use.operationId ||
+      evidence.controllerLeaseId !== use.controllerLeaseId ||
+      !evidence.fixtureAccessIds.includes(use.accessId) ||
+      operation.runId !== use.runId ||
+      operation.operationId !== evidence.workspaceOperationId ||
+      operation.kind !== "validation" ||
+      operation.workspaceId !== evidence.workspaceId ||
+      operation.workspaceGeneration !== evidence.workspaceGeneration ||
+      operation.controllerLeaseId !== use.controllerLeaseId ||
+      !operation.execution ||
+      operation.executionStop?.kind !== "stopped"
+    )
+      return null;
+    return {
+      operationId: operation.operationId,
+      execution: operation.execution,
+      receipt: operation.executionStop,
+    };
   }
   observationUse(runId: string, accessId: string, expectedGrantId?: string) {
     const use = this.use(runId, accessId),
@@ -604,6 +642,8 @@ export class FixtureValidationJournal {
     return (
       !!grant &&
       !!creation &&
+      (!use.localWorkerStop ||
+        digestJson(use.localWorkerStop) === digestJson(this.completeWorkerStop(use))) &&
       grant.fixtureId === use.fixtureId &&
       grant.policyDigest === use.policyDigest &&
       grant.definitionDigest === use.definitionDigest &&

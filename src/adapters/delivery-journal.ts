@@ -805,6 +805,15 @@ export class DeliveryJournal {
           "validation_owner_changed",
           "Old validation requires independent process reconciliation",
         );
+      const operation = this.access.agents.workspaceOperation(
+        authority.runId,
+        evidence.workspaceOperationId,
+      );
+      if (!operation.execution || operation.executionStop || evidence.status === "interrupted")
+        throw new DeliveryError(
+          "validation_execution_changed",
+          "Only the bound running worker may retain its observed check outcome",
+        );
       const parsed = ValidationOutcomeSchema.parse(input);
       const verifiedEnvironment =
         (evidence.environmentGenerations.length === 0 && evidence.fixtureAccessIds.length === 0) ||
@@ -839,19 +848,92 @@ export class DeliveryJournal {
           "UPDATE validation_evidence SET record_json = ? WHERE run_id = ? AND evidence_id = ?",
         )
         .run(JSON.stringify(ValidationEvidenceSchema.parse(evidence)), authority.runId, evidenceId);
-      this.access.agents.finishWorkspaceOperation(
-        authority,
-        evidence.workspaceOperationId,
-        outcome.status === "succeeded" && sourceUnchanged && verifiedEnvironment
-          ? "succeeded"
-          : "failed",
-        outcome.status === "not_started"
-          ? "Validation failed before a repository command started; all admission I/O and any failed supervisor spawn settled"
-          : "Trusted validation adapter settled admission I/O and confirmed closure of every process handle it created",
-      );
+      // The check is observed, but its complete kernel worker is still alive.
+      // Only finishValidationIO can release exclusion after independent stop proof.
       this.changed(authority, `validation.${outcome.status}`, evidence.evidenceId);
       return evidence;
     });
+  }
+
+  /** Shared live/cold settlement. Stop-only proof cannot create a command outcome. */
+  finishValidationIO(authority: ControllerAuthority, evidenceId: string): ValidationEvidence {
+    return this.access.transaction(authority, () => {
+      const evidence = this.evidence(authority.runId, evidenceId);
+      const operation = this.access.agents.workspaceOperation(
+        authority.runId,
+        evidence.workspaceOperationId,
+      );
+      if (
+        operation.kind !== "validation" ||
+        operation.workspaceId !== evidence.workspaceId ||
+        operation.workspaceGeneration !== evidence.workspaceGeneration ||
+        operation.controllerLeaseId !== evidence.controllerLeaseId ||
+        (operation.execution !== null && operation.executionStop === null)
+      )
+        throw new DeliveryError(
+          "validation_io_unsettled",
+          "Validation lacks its complete workspace-worker stop proof",
+        );
+      if (operation.stopEvidence) return evidence;
+      if (evidence.outcome && !operation.execution)
+        throw new DeliveryError(
+          "validation_execution_missing",
+          "A check outcome has no bound worker",
+        );
+      if (evidence.status === "running") {
+        evidence.status = "interrupted";
+        this.db
+          .prepare("UPDATE validation_evidence SET record_json=? WHERE run_id=? AND evidence_id=?")
+          .run(
+            JSON.stringify(ValidationEvidenceSchema.parse(evidence)),
+            authority.runId,
+            evidenceId,
+          );
+      }
+      const receipt = operation.executionStop;
+      const complete =
+        receipt?.kind === "stopped" &&
+        receipt.code === 0 &&
+        receipt.reason === null &&
+        receipt.error === null;
+      this.access.agents.finishWorkspaceOperation(
+        authority,
+        operation.operationId,
+        complete &&
+          evidence.outcome?.status === "succeeded" &&
+          evidence.sourceUnchanged &&
+          evidence.environmentVerified
+          ? "succeeded"
+          : "failed",
+        operation.execution
+          ? "Independent complete-validation worker stop receipt retained; check outcome and remote fixture stop remain separate"
+          : "Validation interrupted before any fixed worker was admitted; later binding and launch are forbidden",
+      );
+      this.changed(authority, "validation.io_settled", evidenceId);
+      return evidence;
+    });
+  }
+
+  /** Read-only public lifecycle view. Stop is not a command result or approval. */
+  validationIO(runId: string, evidenceId: string) {
+    const evidence = this.evidence(runId, evidenceId);
+    const operation = this.access.agents.workspaceOperation(runId, evidence.workspaceOperationId);
+    const receipt = operation.executionStop;
+    return {
+      workspaceOperationId: operation.operationId,
+      status: operation.status,
+      settled: evidence.status !== "running" && operation.stopEvidence !== null,
+      stop: receipt
+        ? {
+            kind: receipt.kind,
+            code: receipt.code,
+            reason: receipt.reason,
+            error: receipt.error,
+            stoppedAt: receipt.stoppedAt,
+          }
+        : null,
+      detail: operation.stopEvidence,
+    };
   }
 
   plan(runId: string, planId: string): ValidationPlan {
@@ -917,6 +999,14 @@ export class DeliveryJournal {
   }
   validationForOperation(runId: string, operationId: string): ValidationEvidence | null {
     return this.byOperation(ValidationEvidenceSchema, "validation_evidence", runId, operationId);
+  }
+  validationForWorkspaceOperation(runId: string, operationId: string): ValidationEvidence | null {
+    const records = this.all(
+      ValidationEvidenceSchema,
+      "SELECT record_json FROM validation_evidence WHERE run_id=? AND workspace_operation_id=?",
+      [runId, operationId],
+    );
+    return records[0] ?? null;
   }
   reviewCopyForOperation(runId: string, operationId: string): CandidateWorkspace | null {
     return this.byOperation(CandidateWorkspaceSchema, "candidate_workspaces", runId, operationId);
@@ -1010,6 +1100,17 @@ export class DeliveryJournal {
   satisfiesCheck(runId: string, evidenceId: string, activeTrackerOperationId?: string): boolean {
     const evidence = this.evidence(runId, evidenceId);
     if (evidence.purpose !== "delivery") return false;
+    const io = this.access.agents.workspaceOperation(runId, evidence.workspaceOperationId);
+    if (
+      evidence.status !== "finished" ||
+      !io.stopEvidence ||
+      !io.execution ||
+      io.executionStop?.kind !== "stopped" ||
+      io.executionStop.code !== 0 ||
+      io.executionStop.reason !== null ||
+      io.executionStop.error !== null
+    )
+      return false;
     const candidate = this.candidate(runId, evidence);
     const check = this.plan(runId, evidence.validationPlanId).checks.find(
       (item) => item.id === evidence.checkId,
@@ -1107,7 +1208,7 @@ export class DeliveryJournal {
         candidateId: evidence.candidateId,
         checkId: evidence.checkId,
         purpose: evidence.purpose,
-        status: evidence.outcome?.status ?? "running",
+        status: evidence.outcome?.status ?? evidence.status,
         phase: evidence.phase,
         satisfiesCheck: this.satisfiesCheck(runId, evidence.evidenceId),
       })),

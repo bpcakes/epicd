@@ -53,6 +53,7 @@ export function registerDeliveryCapabilities(
     );
     const content = {
       ...evidence,
+      io: journal.delivery.validationIO(authority.runId, action.evidenceId),
       evidenceWarning:
         evidence.purpose === "diagnostic"
           ? "Kernel-observed diagnostic command on this snapshot. Never satisfies a required delivery check or independent approval."
@@ -158,10 +159,14 @@ export function registerDeliveryCapabilities(
       throw error;
     }
     const evidence = await runCandidateValidation(journal, workspaces, authority, intent, signal);
+    if (!evidence.outcome)
+      throw new OperationFailed(
+        "Validation worker stopped without a retained check outcome; no pass inferred",
+      );
     return {
       kind: "validation" as const,
       evidenceId: evidence.evidenceId,
-      outcome: evidence.outcome!.status,
+      outcome: evidence.outcome.status,
       satisfiesCheck: journal.delivery.satisfiesCheck(authority.runId, evidence.evidenceId),
     };
   };

@@ -7,8 +7,8 @@ import {
   repositoryIOBinding,
   type RepositoryAdmission,
   type RepositoryIOStop,
-  type StateFileIdentity,
 } from "../domain/repository-admission.js";
+import type { StateFileIdentity } from "../domain/state-file-identity.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { RunStateSchema } from "../domain/types.js";

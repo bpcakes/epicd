@@ -101,6 +101,7 @@ export async function fixture(
   policyInput: Partial<RepositoryPolicy> = {},
 ) {
   const root = mkdtempSync("/var/tmp/epicd-review-");
+  let preserveArtifacts = false;
   const source = join(root, "source");
   mkdirSync(source);
   git(source, "init", "--quiet", `--object-format=${format}`);
@@ -351,10 +352,13 @@ export async function fixture(
       }
     store.close();
     if (!settled) throw new Error(`Preserved uncertain review processes at ${root}`);
-    rmSync(root, { recursive: true, force: true });
+    if (!preserveArtifacts) rmSync(root, { recursive: true, force: true });
   });
   return {
     root,
+    preserveArtifacts: () => {
+      preserveArtifacts = true;
+    },
     taskId: trackedTask.taskId,
     path,
     source,

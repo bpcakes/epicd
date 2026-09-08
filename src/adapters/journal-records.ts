@@ -45,8 +45,9 @@ export function journalRecordView(
           throw new JournalRecordError("unknown_record", "Record is absent from this run");
         throw error;
       }
-      record = evidence;
-      settled = evidence.status === "finished";
+      const io = journal.delivery.validationIO(runId, id);
+      record = { ...evidence, io };
+      settled = io.settled;
       break;
     }
     case "review": {

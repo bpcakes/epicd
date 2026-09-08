@@ -8,6 +8,7 @@ import type { ControlledAgentDriver } from "./agents.js";
 import { reconcileCommit } from "./commits.js";
 import { reconcileReview } from "./reviews.js";
 import { CapabilityRejected } from "./guards.js";
+import { reconcileValidationIO } from "../adapters/validation-io.js";
 import { settleRecoveryObservation, type RecoveryObservation } from "./reconcile.js";
 
 const supported = new Set<ActionRecord["request"]["action"]["kind"]>([
@@ -157,8 +158,13 @@ export async function reconcileDeliveryAction(
           );
     }
     if (action.kind === "run_validation" || action.kind === "run_diagnostic_check") {
-      const evidence = journal.delivery.validationForOperation(run, record.operationId);
-      if (!evidence) return failed("No validation intent exists; no check command was admitted");
+      const admitted = journal.delivery.validationForOperation(run, record.operationId);
+      if (!admitted) return failed("No validation intent exists; no check command was admitted");
+      const evidence = await reconcileValidationIO(journal, authority, admitted.evidenceId);
+      if (evidence.status === "interrupted" && evidence.outcome === null)
+        return failed(
+          "Complete validation worker stopped without a retained check outcome; no replay or pass inferred",
+        );
       const operation = journal.agents.workspaceOperation(run, evidence.workspaceOperationId);
       if (
         operation.kind !== "validation" ||

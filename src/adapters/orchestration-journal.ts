@@ -73,7 +73,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 36;
+export const ORCHESTRATION_SCHEMA_VERSION = 37;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -230,7 +230,7 @@ export class OrchestrationJournal {
 
   constructor(
     private readonly db: Database.Database,
-    private readonly assertStorage: () => void,
+    private readonly assertStorage: () => import("../domain/state-file-identity.js").StateFileIdentity,
   ) {
     this.fixtures = new FixtureJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -293,6 +293,10 @@ export class OrchestrationJournal {
       turn: (runId, identity) => this.agents.turn(runId, identity),
     });
     this.agents = new AgentJournal(db, {
+      validationInterruptedBeforeLaunch: (runId, operationId) => {
+        const evidence = this.delivery.validationForWorkspaceOperation(runId, operationId);
+        return evidence?.status === "interrupted" && evidence.outcome === null;
+      },
       transaction: (authority, body) => this.transaction(authority, body),
       control: (runId) => this.control(runId),
       policy: (runId) => this.policy(runId),
@@ -557,6 +561,13 @@ export class OrchestrationJournal {
     return {
       disposition: "retained_for_inspection",
       workspaceIds: workspaces.map((workspace) => workspace.workspace_id),
+      workspaceOperationIds: (
+        this.db
+          .prepare(
+            "SELECT operation_id FROM workspace_operations WHERE run_id=? ORDER BY operation_id",
+          )
+          .all(runId) as { operation_id: string }[]
+      ).map((entry) => entry.operation_id),
       agentAssignmentIds: agents.map((agent) => agent.assignmentId).sort(),
       publicationIds: this.publications
         .records(runId)
@@ -576,7 +587,7 @@ export class OrchestrationJournal {
         .map((entry) => entry.trackerOperationId)
         .sort(),
       detail:
-        "All recorded work is stopped. Managed workspaces, agent sessions, publication artifacts, tracker export copies, owned fixtures and fixture-command control/stop evidence are retained for inspection; no resource deletion or pane closure was performed.",
+        "All recorded work is stopped. Managed workspaces and their operation/complete-worker stop records, agent sessions, publication artifacts, tracker export copies, owned fixtures and fixture-command control/stop evidence are retained for inspection; no resource deletion or pane closure was performed.",
     };
   }
 
@@ -627,6 +638,11 @@ export class OrchestrationJournal {
     } finally {
       this.db.pragma(previous === 1 ? "query_only = ON" : "query_only = OFF");
     }
+  }
+
+  /** A fixed trusted worker attaches this exact existing file; it cannot initialize or adopt state. */
+  storageIdentity() {
+    return this.assertStorage();
   }
 
   control(runId: string): ControlState {
@@ -1182,14 +1198,14 @@ export class OrchestrationJournal {
           throw new MemoryReferenceError("Memory cites an observation outside this run");
       for (const id of entry.evidenceIds) {
         try {
-          let evidence;
+          let settled;
           try {
-            evidence = this.delivery.evidence(authority.runId, id);
+            settled = this.delivery.validationIO(authority.runId, id).settled;
           } catch (error) {
             if (!(error instanceof DeliveryError)) throw error;
-            evidence = this.reviews.evidence(authority.runId, id);
+            settled = this.reviews.evidence(authority.runId, id).status === "finished";
           }
-          if (entry.confidence === "observed" && evidence.status !== "finished")
+          if (entry.confidence === "observed" && !settled)
             throw new MemoryReferenceError(
               "Observed memory cannot cite an unfinished evidence intent as an outcome",
             );

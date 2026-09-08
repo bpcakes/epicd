@@ -126,7 +126,7 @@ export const ValidationEvidenceSchema = WorkspaceIdentitySchema.extend({
   environmentGenerations: z.array(ValidationEnvironmentSchema).max(4),
   fixtureAccessIds: z.array(z.uuid()).max(1),
   environmentVerified: z.boolean(),
-  status: z.enum(["running", "finished"]),
+  status: z.enum(["running", "finished", "interrupted"]),
   outcome: ValidationOutcomeSchema.nullable(),
   sourceUnchanged: z.boolean(),
   createdAt: At,

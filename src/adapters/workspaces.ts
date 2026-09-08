@@ -56,6 +56,11 @@ export class WorkspaceManager {
     if (!isAbsolute(root)) throw new Error("Managed workspace storage must be absolute");
   }
 
+  /** Configuration for fixed trusted worker attachment; callers never reconstruct storage layout. */
+  storageRoot(): string {
+    return this.root;
+  }
+
   /** Reads only the selected repository's committed baseline; never its index or dirty files. */
   async create(
     authority: ControllerAuthority,

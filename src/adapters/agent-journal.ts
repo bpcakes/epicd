@@ -35,7 +35,18 @@ import {
 } from "../domain/types.js";
 import { digestJson, type RepositoryPolicy } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
-import { WorkspaceOperationSchema, type WorkspaceOperation } from "../domain/workspaces.js";
+import {
+  WorkspaceOperationSchema,
+  workspaceExecutionScope,
+  type WorkspaceOperation,
+} from "../domain/workspaces.js";
+import {
+  CommandLifetimeSchema,
+  CommandStopSchema,
+  assertCommandStop,
+  type CommandLifetime,
+  type CommandStop,
+} from "../domain/command-lifetime.js";
 import {
   CodexLaunchSchema,
   CodexLaunchStopSchema,
@@ -129,6 +140,7 @@ export function createAgentsSchema(db: Database.Database): void {
 }
 
 type Access = {
+  validationInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   transaction<T>(authority: ControllerAuthority, body: () => T): T;
   control(runId: string): ControlState;
   policy(runId: string): RepositoryPolicy;
@@ -407,6 +419,8 @@ export class AgentJournal {
         kind,
         status: "running",
         stopEvidence: null,
+        execution: null,
+        executionStop: null,
         createdAt: at,
         updatedAt: at,
       });
@@ -454,7 +468,21 @@ export class AgentJournal {
   ): WorkspaceOperation {
     return this.access.transaction(authority, () => {
       const operation = this.workspaceOperation(authority.runId, operationId);
-      if (operation.controllerLeaseId !== authority.leaseId)
+      const independentlyStopped = operation.execution !== null && operation.executionStop !== null;
+      const unlaunchedValidation =
+        operation.kind === "validation" &&
+        operation.execution === null &&
+        this.access.validationInterruptedBeforeLaunch(authority.runId, operationId);
+      if (operation.execution && !operation.executionStop)
+        throw new AgentCoordinationError(
+          "workspace_execution_unsettled",
+          "The complete workspace worker has no independent stop receipt",
+        );
+      if (
+        operation.controllerLeaseId !== authority.leaseId &&
+        !independentlyStopped &&
+        !unlaunchedValidation
+      )
         throw new AgentCoordinationError(
           "workspace_operation_uncertain",
           "Previous controller's I/O requires independent stop reconciliation",
@@ -480,6 +508,80 @@ export class AgentJournal {
           operationId,
         );
       this.changed(authority, "workspace.operation_stopped", operation.operationId);
+      return operation;
+    });
+  }
+
+  /** Bind once before the fixed validation worker may execute any repository or service I/O. */
+  bindWorkspaceExecution(
+    authority: ControllerAuthority,
+    operationId: string,
+    input: CommandLifetime,
+  ) {
+    return this.access.transaction(authority, () => {
+      this.active(authority);
+      const operation = this.workspaceOperation(authority.runId, operationId);
+      const execution = CommandLifetimeSchema.parse(input);
+      if (
+        operation.kind !== "validation" ||
+        operation.controllerLeaseId !== authority.leaseId ||
+        operation.stopEvidence ||
+        operation.execution ||
+        this.access.validationInterruptedBeforeLaunch(authority.runId, operationId) ||
+        execution.runId !== authority.runId ||
+        execution.operationId !== operationId ||
+        execution.controllerLeaseId !== operation.controllerLeaseId ||
+        execution.scopeDigest !== workspaceExecutionScope(operation)
+      )
+        throw new AgentCoordinationError(
+          "workspace_execution_conflict",
+          "Workspace execution requires its original unused validation operation",
+        );
+      operation.execution = execution;
+      this.db
+        .prepare("UPDATE workspace_operations SET record_json=? WHERE run_id=? AND operation_id=?")
+        .run(
+          JSON.stringify(WorkspaceOperationSchema.parse(operation)),
+          authority.runId,
+          operationId,
+        );
+      this.changed(authority, "workspace.execution_bound", operationId);
+      return operation;
+    });
+  }
+
+  /** Receipt bytes come only from the kernel's private I/O reader, never an action payload. */
+  recordWorkspaceExecutionStop(
+    authority: ControllerAuthority,
+    operationId: string,
+    input: CommandStop,
+  ) {
+    return this.access.transaction(authority, () => {
+      const operation = this.workspaceOperation(authority.runId, operationId);
+      if (!operation.execution)
+        throw new AgentCoordinationError(
+          "workspace_execution_missing",
+          "Workspace has no bound execution",
+        );
+      const receipt = CommandStopSchema.parse(input);
+      assertCommandStop(operation.execution, receipt);
+      if (operation.executionStop) {
+        if (digestJson(operation.executionStop) !== digestJson(receipt))
+          throw new AgentCoordinationError(
+            "workspace_execution_conflict",
+            "Workspace already retained a different stop receipt",
+          );
+        return operation;
+      }
+      operation.executionStop = receipt;
+      this.db
+        .prepare("UPDATE workspace_operations SET record_json=? WHERE run_id=? AND operation_id=?")
+        .run(
+          JSON.stringify(WorkspaceOperationSchema.parse(operation)),
+          authority.runId,
+          operationId,
+        );
+      this.changed(authority, "workspace.execution_stopped", operationId);
       return operation;
     });
   }

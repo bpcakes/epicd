@@ -23,7 +23,7 @@ import {
   ORCHESTRATION_SCHEMA_VERSION,
 } from "./orchestration-journal.js";
 import { RepositoryPolicySchema, type RepositoryPolicy } from "../domain/repository-policy.js";
-import type { StateFileIdentity } from "../domain/repository-admission.js";
+import type { StateFileIdentity } from "../domain/state-file-identity.js";
 
 type RunRow = {
   run_id: string;
@@ -251,9 +251,7 @@ export class StateStore {
         throw new Error("State file differs from the trusted worker's recorded identity");
     } else mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new Database(path, { timeout: 5_000, fileMustExist: expectedFile !== undefined });
-    this.orchestration = new OrchestrationJournal(this.db, () => {
-      this.storageIdentity();
-    });
+    this.orchestration = new OrchestrationJournal(this.db, () => this.storageIdentity());
     try {
       this.fileIdentity = this.currentStorageIdentity();
       if (expectedFile && JSON.stringify(this.fileIdentity) !== JSON.stringify(expectedFile))

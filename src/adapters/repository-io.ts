@@ -21,8 +21,8 @@ import {
   repositoryIOBinding,
   type RepositoryAdmission,
   type RepositoryIOStop,
-  type StateFileIdentity,
 } from "../domain/repository-admission.js";
+import type { StateFileIdentity } from "../domain/state-file-identity.js";
 
 export const RepositoryIORequestSchema = z
   .strictObject({

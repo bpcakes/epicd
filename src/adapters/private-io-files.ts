@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { link, lstat, mkdir, mkdtemp, open, realpath, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { StateFileIdentity } from "../domain/repository-admission.js";
+import type { StateFileIdentity } from "../domain/state-file-identity.js";
 
 /** Trusted-controller file protocol only. Domain callers must validate receipt bindings. */
 export async function preparePrivateIO(root: string): Promise<StateFileIdentity> {

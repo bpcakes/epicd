@@ -193,6 +193,7 @@ export type TrackerClosure = z.infer<typeof TrackerClosureSchema>;
 export const CompletionResourcesSchema = z.strictObject({
   disposition: z.literal("retained_for_inspection"),
   workspaceIds: z.array(z.string()),
+  workspaceOperationIds: z.array(z.uuid()),
   agentAssignmentIds: z.array(z.string()),
   publicationIds: z.array(z.uuid()),
   fixtureCreationIds: z.array(z.uuid()),

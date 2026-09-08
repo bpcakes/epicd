@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
 import { ActionKernel } from "../src/kernel/actions.js";
 import {
   registerDeliveryRecoveryCapabilities,
@@ -547,22 +548,33 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     const s = await fixture(),
       run = s.authority.runId;
     const action = await request(s, "run_validation");
-    vi.spyOn(s.journal.delivery, "finishValidation").mockImplementation(() => {
-      throw new Error("Validation outcome not durable");
-    });
-    const lost = await s.dispatch(action);
-    expect(lost.status).toBe("indeterminate");
+    const db = new Database(s.path);
+    let lost;
+    try {
+      db.exec(
+        "CREATE TRIGGER deny_validation_outcome BEFORE UPDATE ON validation_evidence WHEN json_extract(NEW.record_json,'$.outcome') IS NOT NULL BEGIN SELECT RAISE(ABORT,'Validation outcome not durable'); END",
+      );
+      lost = await s.dispatch(action);
+    } finally {
+      db.close();
+    }
+    expect(lost.status).toBe("failed");
     const parent = s.journal.action(run, lost.actionId)!;
     const evidence = s.journal.delivery.validationForOperation(run, parent.operationId)!;
     const recovered = cold(s);
     expect(
       inspection(await recovered.dispatch({ kind: "reconcile_action", actionId: lost.actionId }))
         .status,
-    ).toBe("indeterminate");
+    ).toBe("failed");
     expect(recovered.journal.delivery.evidence(run, evidence.evidenceId).outcome).toBeNull();
-    expect(recovered.journal.agents.activeWorkspaceOperation(run, evidence)?.operationId).toBe(
-      evidence.workspaceOperationId,
+    expect(recovered.journal.delivery.evidence(run, evidence.evidenceId).status).toBe(
+      "interrupted",
     );
+    expect(recovered.journal.delivery.satisfiesCheck(run, evidence.evidenceId)).toBe(false);
+    expect(
+      recovered.journal.agents.workspaceOperation(run, evidence.workspaceOperationId).executionStop,
+    ).toMatchObject({ kind: "stopped", code: 1 });
+    expect(recovered.journal.agents.activeWorkspaceOperation(run, evidence)).toBeNull();
   });
 
   it("rejects live and unknown action targets without stopping the current review", async () => {

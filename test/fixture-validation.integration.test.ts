@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
@@ -12,7 +12,10 @@ import {
 import { PostgreSqlFixtureCreator } from "../src/adapters/fixture-creation.js";
 import { PostgreSqlFixtureValidationProvider } from "../src/adapters/fixture-validation-provider.js";
 import { assertRuntimeHandoffReady } from "../src/adapters/runtime-handoff.js";
-import { FixtureValidationUseSchema } from "../src/domain/fixture-validation.js";
+import {
+  FixtureValidationUseSchema,
+  fixtureCommandScope,
+} from "../src/domain/fixture-validation.js";
 import { registerFixtureCapabilities } from "../src/kernel/fixtures.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import {
@@ -29,6 +32,7 @@ import type { JournalRecordTarget } from "../src/domain/journal-records.js";
 import { readCommandStop } from "../src/adapters/command-lifetime.js";
 import * as commandLifetime from "../src/adapters/command-lifetime.js";
 import { NamespaceStopUnprovenError } from "../src/adapters/pid-namespace.js";
+import { startConfinedCommand } from "../src/adapters/sandbox.js";
 
 const bin = process.env.EPICD_TEST_PG_BINDIR;
 const broker = process.env.EPICD_TEST_PGBOUNCER;
@@ -528,13 +532,13 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         release = resolve;
       });
       let entered = false;
-      const verify = f.s.manager.verifyValidationWorkspace.bind(f.s.manager);
+      const prepare = commandLifetime.prepareCommandLifetime;
       const held = vi
-        .spyOn(f.s.manager, "verifyValidationWorkspace")
+        .spyOn(commandLifetime, "prepareCommandLifetime")
         .mockImplementation(async (...args) => {
           entered = true;
           await gate;
-          return verify(...args);
+          return prepare(...args);
         });
       let settled: Promise<unknown> | undefined;
       try {
@@ -1076,9 +1080,26 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         db = new Database(f.s.path);
       try {
         const { use, evidence } = await f.validate();
-        // Fault injection: lose BOTH the journal acknowledgment and independent physical receipt.
-        // Journal-only loss is now recoverable; server quiescence alone must remain insufficient.
-        unlinkSync(join(use.localCommand!.directory.path, "stopped.json"));
+        // Lose the journal acknowledgment and published physical receipts for BOTH
+        // enclosing and inner workers. Server quiescence alone is still insufficient.
+        const workspaceOperation = f.s.journal.agents.workspaceOperation(
+          f.s.authority.runId,
+          evidence.workspaceOperationId,
+        );
+        for (const intent of [use.localCommand!, workspaceOperation.execution!])
+          renameSync(
+            join(intent.directory.path, "stopped.json"),
+            join(intent.directory.path, "retained-original-stop.json"),
+          );
+        db.prepare("UPDATE workspace_operations SET record_json=? WHERE operation_id=?").run(
+          JSON.stringify({
+            ...workspaceOperation,
+            status: "indeterminate",
+            stopEvidence: null,
+            executionStop: null,
+          }),
+          workspaceOperation.operationId,
+        );
         db.prepare("UPDATE fixture_validation_uses SET record_json=? WHERE access_id=?").run(
           JSON.stringify({
             ...use,
@@ -1132,18 +1153,25 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         f.cleanup();
       }
     });
-    it.each([false, true])(
-      "cold-recovers independently retained local stop after lost journal settlement (revoked=%s), without changing validation evidence",
-      async (revoked) => {
+    it.each([
+      { revoked: false, missingInnerReceipt: false },
+      { revoked: true, missingInnerReceipt: false },
+      { revoked: false, missingInnerReceipt: true },
+      { revoked: true, missingInnerReceipt: true },
+    ])(
+      "cold-recovers local stop after lost settlement (revoked=$revoked, missing inner receipt=$missingInnerReceipt), without changing validation evidence",
+      async ({ revoked, missingInnerReceipt }) => {
         const f = await setup();
-        const fault = vi
-          .spyOn(f.s.journal.fixtures.validation, "reconcileLocalCommand")
-          .mockRejectedValue(new Error("Controller lost local-stop settlement"));
+        const db = new Database(f.s.path);
+        db.exec(
+          "CREATE TRIGGER deny_fixture_local_stop BEFORE UPDATE ON fixture_validation_uses WHEN json_extract(NEW.record_json,'$.localStopped')=1 AND json_extract(NEW.record_json,'$.localCommand') IS NOT NULL BEGIN SELECT RAISE(ABORT,'Controller lost local-stop settlement'); END",
+        );
         let observe: ReturnType<typeof vi.spyOn> | undefined;
         try {
-          // The command ran, but settlement was lost: the parent must retain uncertainty.
-          expect((await f.s.dispatch(f.action)).status).toBe("indeterminate");
-          fault.mockRestore();
+          // The real worker cannot persist local settlement. Its enclosing stop
+          // proves I/O closure, not a command result or remote SQL quiescence.
+          expect((await f.s.dispatch(f.action)).status).toBe("failed");
+          db.exec("DROP TRIGGER deny_fixture_local_stop");
           const use = f.s.journal.fixtures.validation.uses(f.s.authority.runId).at(-1)!;
           expect(use).toMatchObject({
             status: "dispatched",
@@ -1154,6 +1182,15 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
             kind: "stopped",
             code: 0,
           });
+          if (missingInnerReceipt) {
+            // Retain original receipt bytes, but make the inner monitor's published
+            // receipt unavailable. Only the real enclosing worker receipt remains.
+            renameSync(
+              join(use.localCommand!.directory.path, "stopped.json"),
+              join(use.localCommand!.directory.path, "retained-original-stop.json"),
+            );
+            expect(await readCommandStop(use.localCommand!)).toBeNull();
+          }
           const reopened = f.s.reopen(),
             authority = f.s.newLease(),
             journal = reopened.orchestration;
@@ -1163,8 +1200,9 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
             evidence.workspaceOperationId,
           );
           const parent = journal.actionForOperation(authority.runId, use.operationId);
-          expect(evidence).toMatchObject({ status: "running", outcome: null });
-          expect(workspace.stopEvidence).toBeNull();
+          expect(evidence).toMatchObject({ status: "interrupted", outcome: null });
+          expect(workspace.executionStop).toMatchObject({ kind: "stopped", code: 1 });
+          expect(workspace.stopEvidence).not.toBeNull();
           if (revoked)
             journal.fixtures.validation.revoke(
               authority.runId,
@@ -1183,7 +1221,14 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
             localStopped: true,
             remoteStopped: !revoked,
             localCommand: use.localCommand,
-            localReceipt: { kind: "stopped", code: 0 },
+            localReceipt: missingInnerReceipt ? null : { kind: "stopped", code: 0 },
+            localWorkerStop: missingInnerReceipt
+              ? {
+                  operationId: workspace.operationId,
+                  execution: workspace.execution,
+                  receipt: workspace.executionStop,
+                }
+              : null,
           });
           if (revoked) expect(observe).not.toHaveBeenCalled();
           else expect(observe).toHaveBeenCalledTimes(1);
@@ -1197,7 +1242,7 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
           expect(f.sql("SELECT count(*) FROM proof", "browser_fixture")).toBe("1");
         } finally {
           observe?.mockRestore();
-          fault.mockRestore();
+          db.close();
           f.cleanup();
         }
       },
@@ -1212,7 +1257,50 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
       });
       let observe: ReturnType<typeof vi.spyOn> | undefined;
       try {
-        expect((await f.s.dispatch(f.action)).status).toBe("indeterminate");
+        // Exercise the confined fixture-command boundary directly: the enclosing
+        // worker is covered separately by validation-io's real process-loss test.
+        const { evidence: admitted, use: reserved } = reserveOnly(f);
+        const observation = await new PostgreSqlFixtureValidationProvider().observe(
+          f.definition,
+          f.validation,
+          reserved,
+          () => f.s.journal.assertAuthority(f.s.authority),
+          AbortSignal.timeout(10_000),
+        );
+        f.s.journal.fixtures.validation.admit(f.s.authority, reserved.accessId, observation);
+        const workspace = f.s.journal.agents.workspace(f.s.authority.runId, admitted);
+        await expect(
+          startConfinedCommand(
+            {
+              workspace: workspace.path,
+              sourceMode: "read-only",
+              ...admitted.check,
+            },
+            {
+              fixtureBridge: {
+                definition: f.definition,
+                binding: reserved.binding,
+                pgbouncer: reserved.pgbouncer,
+                validationRole: f.validation.validationRole,
+                listenPort: f.validation.listenPort,
+                connectionVariable: f.validation.connectionVariable,
+              },
+              durableStop: {
+                runId: reserved.runId,
+                operationId: reserved.operationId,
+                controllerLeaseId: reserved.controllerLeaseId,
+                scopeDigest: fixtureCommandScope([reserved]),
+                admit: (intent) =>
+                  f.s.journal.fixtures.validation.dispatch(
+                    f.s.authority,
+                    reserved.accessId,
+                    intent,
+                  ),
+              },
+            },
+          ),
+        ).rejects.toThrow("Controller lost execution");
+        f.s.journal.markInterruptedActions(f.s.authority);
         const [intent, launch] = fault.mock.calls[0]!;
         fault.mockRestore();
         const use = f.s.journal.fixtures.validation.uses(f.s.authority.runId).at(-1)!;
@@ -1231,7 +1319,7 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
           use.grantId,
         );
         const evidence = journal.delivery.evidence(authority.runId, use.evidenceId);
-        const workspace = journal.agents.workspaceOperation(
+        const workspaceOperation = journal.agents.workspaceOperation(
           authority.runId,
           evidence.workspaceOperationId,
         );
@@ -1259,8 +1347,8 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
         expect(journal.delivery.evidence(authority.runId, use.evidenceId)).toEqual(evidence);
         expect(
           journal.agents.workspaceOperation(authority.runId, evidence.workspaceOperationId),
-        ).toEqual(workspace);
-        expect(workspace.stopEvidence).toBeNull();
+        ).toEqual(workspaceOperation);
+        expect(workspaceOperation.stopEvidence).toBeNull();
         expect(journal.delivery.satisfiesCheck(authority.runId, use.evidenceId)).toBe(false);
       } finally {
         observe?.mockRestore();

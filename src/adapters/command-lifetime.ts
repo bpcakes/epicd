@@ -24,7 +24,7 @@ import {
   readPrivateStop,
 } from "./private-io-files.js";
 
-/** This is assembled by sandbox.ts, never accepted from an orchestrator action. */
+/** Assembled by trusted kernel adapters, never accepted from an orchestrator action. */
 const LaunchSchema = z.strictObject({
   command: z.string().min(1),
   args: z.array(z.string()),

@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import * as sandbox from "../src/adapters/sandbox.js";
+import * as commandLifetime from "../src/adapters/command-lifetime.js";
 import { NamespaceStopUnprovenError } from "../src/adapters/pid-namespace.js";
 import { StateStore } from "../src/adapters/store.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
@@ -26,6 +26,8 @@ import type {
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
 import type { ValidationEvidence } from "../src/domain/delivery.js";
+import { journalRecordView } from "../src/adapters/journal-records.js";
+import { reconcileValidationIO } from "../src/adapters/validation-io.js";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
@@ -199,15 +201,17 @@ function validation(result: ActionResult) {
 describe.skipIf(process.platform !== "linux")("candidate and validation capabilities", () => {
   it("keeps validation and workspace exclusion indeterminate when its monitor cannot prove stop", async () => {
     const setup = await fixture();
+    writeFileSync(join(setup.workspace.path, "app.txt"), "green\n");
     const planId = await setup.define(),
       candidate = await setup.capture(planId),
       copy = await setup.review(candidate);
-    // This injects only the transport's unknown-stop outcome; the action, evidence,
-    // snapshot admission and SQLite exclusion are real. No fake command success.
-    const launch = vi.spyOn(sandbox, "startConfinedCommand").mockImplementationOnce(async () => ({
-      result: Promise.reject(new NamespaceStopUnprovenError("Fixture monitor was killed")),
-      interrupt() {},
-    }));
+    // The real check records success, but the controller cannot read its complete
+    // worker's stop receipt. A genuine command result alone cannot release exclusion.
+    const launch = vi
+      .spyOn(commandLifetime, "recoverCommandStop")
+      .mockRejectedValue(
+        new NamespaceStopUnprovenError("Fixture monitor stop receipt is unavailable"),
+      );
     try {
       const result = await setup.dispatch({
         kind: "run_validation",
@@ -226,9 +230,8 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
         expect(rows).toHaveLength(1);
         const evidence = JSON.parse(rows[0]!.record_json);
         expect(evidence).toMatchObject({
-          status: "running",
-          outcome: null,
-          environmentVerified: false,
+          status: "finished",
+          outcome: expect.objectContaining({ status: "succeeded" }),
         });
         expect(
           setup.journal.delivery.satisfiesCheck(setup.authority.runId, evidence.evidenceId),
@@ -236,6 +239,34 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
         expect(
           setup.journal.agents.activeWorkspaceOperation(setup.authority.runId, copy),
         ).not.toBeNull();
+        const reference = { recordKind: "validation" as const, recordId: evidence.evidenceId };
+        expect(journalRecordView(setup.journal, setup.authority.runId, reference).settled).toBe(
+          false,
+        );
+        const memory = {
+          kind: "fact" as const,
+          content: "A real check result was retained",
+          scope: "run" as const,
+          taskId: null,
+          confidence: "observed" as const,
+          observationIds: [],
+          evidenceIds: [evidence.evidenceId],
+          revision: null,
+          environmentGeneration: null,
+          supersedes: null,
+        };
+        expect(() => setup.journal.recordMemory(setup.authority, memory)).toThrow("unfinished");
+        launch.mockRestore();
+        // Same actual check; only recover its original missing stop acknowledgment.
+        await reconcileValidationIO(setup.journal, setup.authority, evidence.evidenceId);
+        expect(journalRecordView(setup.journal, setup.authority.runId, reference).settled).toBe(
+          true,
+        );
+        expect(setup.journal.recordMemory(setup.authority, memory).memoryId).toBeTruthy();
+        expect(
+          setup.journal.delivery.satisfiesCheck(setup.authority.runId, evidence.evidenceId),
+        ).toBe(true);
+        expect(setup.journal.delivery.summaries(setup.authority.runId).validation).toHaveLength(1);
       } finally {
         db.close();
       }
@@ -530,7 +561,10 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
     setup.kernel.interruptAll();
     expect(await pending).toMatchObject({ status: "cancelled" });
     const evidence = setup.journal.delivery.summaries(setup.authority.runId).validation[0]!;
-    expect(evidence).toMatchObject({ status: "cancelled", satisfiesCheck: false });
+    expect(evidence).toMatchObject({ status: "interrupted", satisfiesCheck: false });
+    expect(
+      setup.journal.delivery.evidence(setup.authority.runId, evidence.evidenceId).outcome,
+    ).toBeNull();
     expect(setup.journal.agents.activeWorkspaceOperation(setup.authority.runId, copy)).toBeNull();
     const stoppedBytes = readFileSync(join(copy.path, "scratch", "heartbeat"));
     await delay(150);
@@ -604,7 +638,7 @@ describe.skipIf(process.platform !== "linux")("candidate and validation capabili
       );
       expect(setup.journal.delivery.summaries(setup.authority.runId).validation).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ status: "cancelled", satisfiesCheck: false }),
+          expect.objectContaining({ status: "interrupted", satisfiesCheck: false }),
         ]),
       );
       expect(setup.journal.control(setup.authority.runId).status).toBe("active");

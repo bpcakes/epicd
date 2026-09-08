@@ -80,6 +80,13 @@ export const FixtureValidationUseSchema = z
     localStopped: z.boolean(),
     localCommand: CommandLifetimeSchema.nullable(),
     localReceipt: CommandStopSchema.nullable(),
+    localWorkerStop: z
+      .strictObject({
+        operationId: z.uuid(),
+        execution: CommandLifetimeSchema,
+        receipt: CommandStopSchema,
+      })
+      .nullable(),
     remoteStopped: z.boolean(),
     detail: z.string().max(4000).nullable(),
     createdAt: z.iso.datetime(),
@@ -89,7 +96,14 @@ export const FixtureValidationUseSchema = z
       (["dispatched", "stopped"].includes(use.status) && !use.localCommand) ||
       (use.status === "reserved" && use.localCommand !== null) ||
       (use.localReceipt !== null && (!use.localCommand || !use.localStopped)) ||
-      (use.localCommand && use.localStopped && !use.localReceipt) ||
+      (use.localCommand && use.localStopped && !use.localReceipt && !use.localWorkerStop) ||
+      (use.localWorkerStop !== null &&
+        (!use.localCommand ||
+          !use.localStopped ||
+          use.localWorkerStop.execution.runId !== use.runId ||
+          use.localWorkerStop.execution.operationId !== use.localWorkerStop.operationId ||
+          use.localWorkerStop.execution.controllerLeaseId !== use.controllerLeaseId ||
+          use.localWorkerStop.receipt.kind !== "stopped")) ||
       (use.localReceipt?.kind === "not_started" && use.status !== "not_started") ||
       (use.localCommand &&
         use.status === "not_started" &&
@@ -110,6 +124,16 @@ export const FixtureValidationUseSchema = z
         context.addIssue({
           code: "custom",
           message: "Fixture stop receipt differs from its command intent",
+        });
+      }
+    }
+    if (use.localWorkerStop) {
+      try {
+        assertCommandStop(use.localWorkerStop.execution, use.localWorkerStop.receipt);
+      } catch {
+        context.addIssue({
+          code: "custom",
+          message: "Enclosing validation worker stop differs from its launch intent",
         });
       }
     }
