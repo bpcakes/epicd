@@ -4,6 +4,8 @@ Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra 
 
 This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 37. Use a fresh state path; unsupported existing data is left intact.
 
+Persisted ownership fields must be explicit: missing workspace creation bindings, turn launches, native endpoint bindings or decision-attempt turn identities are invalid, not implicitly `null`. Reading incomplete records does not repair them or release their resources.
+
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Restricted validation access to run-created PostgreSQL fixtures is implemented under separate operator grants. Host-fixture reset/cleanup, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
 ## Requirements

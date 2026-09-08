@@ -52,7 +52,7 @@ export type DecisionSourceOutcome = z.infer<typeof DecisionSourceOutcomeSchema>;
 export const DecisionSourceAttemptSchema = z.strictObject({
   attemptId: z.string().uuid(),
   controllerLeaseId: z.string().min(1),
-  turnIdentity: TurnIdentitySchema.nullable().default(null),
+  turnIdentity: TurnIdentitySchema.nullable(),
   startedAt: z.iso.datetime(),
   finishedAt: z.iso.datetime().nullable(),
   outcome: DecisionSourceOutcomeSchema.nullable(),

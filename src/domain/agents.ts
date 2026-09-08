@@ -31,7 +31,7 @@ export const WorkspaceRecordSchema = WorkspaceIdentitySchema.extend({
   sourceMode: z.enum(["mutable", "immutable"]),
   baselineRevision: z.string().min(1).max(256),
   baselineFingerprint: z.string().min(1).max(256).nullable(),
-  creationOperationId: Id.nullable().default(null),
+  creationOperationId: Id.nullable(),
   status: z.enum(["reserved", "ready", "quarantined", "disposed"]),
   activeTurnId: Id.nullable(),
   createdAt: At,
@@ -119,8 +119,8 @@ export const TurnPromptSchema = z.strictObject({
   // retain their smaller limit in AgentJournal, including during replay.
   instructions: z.string().min(1).max(98304),
   messages: z.array(z.strictObject({ messageId: Id, content: Text })).max(100),
-  // Kernel-supplied review facts, covered by the complete prompt digest. Optional
-  // preserves hashes of historical prompts rather than inserting a new default.
+  // Kernel-supplied formal review facts, covered by the complete prompt digest.
+  // Absent for turns that do not carry a formal review context.
   reviewContext: z.json().optional(),
   repairContext: z.json().optional(),
   // Present only for a kernel-admitted conversational reviewer follow-up.
@@ -130,7 +130,7 @@ export const TurnPromptSchema = z.strictObject({
 });
 export const TurnRecordSchema = z.strictObject({
   identity: TurnIdentitySchema,
-  launch: TurnLaunchSchema.nullable().default(null),
+  launch: TurnLaunchSchema.nullable(),
   status: z.enum([
     "prepared",
     "submitting",

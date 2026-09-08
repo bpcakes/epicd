@@ -312,6 +312,66 @@ describe("coordinator conversation accounting", () => {
 });
 
 describe("durable agent coordination", () => {
+  it("rejects a missing workspace creation binding without normalizing persisted data", () => {
+    const setup = fixture();
+    const workspace = setup.workspace();
+    expect(workspace.creationOperationId).toBeNull();
+    setup.db
+      .prepare(
+        "UPDATE workspaces SET record_json = json_remove(record_json, '$.creationOperationId') WHERE workspace_id = ?",
+      )
+      .run(workspace.workspaceId);
+    const raw = () =>
+      setup.db
+        .prepare("SELECT record_json FROM workspaces WHERE workspace_id = ?")
+        .get(workspace.workspaceId);
+    const before = raw();
+    const control = setup.journal.control(setup.authority.runId);
+    expect(() => setup.agents.workspace(setup.authority.runId, workspace)).toThrow();
+    expect(() => setup.agents.workspaces(setup.authority.runId)).toThrow();
+    expect(raw()).toEqual(before);
+    expect(setup.journal.control(setup.authority.runId)).toEqual(control);
+  });
+
+  it.each([
+    ["sdk", "$.launch"],
+    ["sdk", "$.launch.native"],
+    ["herdr", "$.launch"],
+    ["herdr", "$.launch.native"],
+  ] as const)(
+    "rejects an incomplete %s turn (%s) without forgetting its launch",
+    (runtime, field) => {
+      const setup = fixture();
+      const agent = runtime === "herdr" ? setup.native() : setup.ready();
+      const prepared = setup.prepare(agent);
+      const { turn } = setup.launches.reserve(setup.journal, setup.authority, prepared.identity);
+      const endpoint = nativeEndpoint(setup.root);
+      if (runtime === "herdr")
+        setup.agents.bindNativeLaunch(setup.authority, turn.identity, endpoint);
+      const complete = setup.agents.turn(setup.authority.runId, turn.identity);
+      expect(complete.launch).not.toBeNull();
+      if (runtime === "herdr") expect(complete.launch?.native).toEqual(endpoint);
+      else expect(complete.launch?.native).toBeNull();
+      setup.db
+        .prepare(
+          "UPDATE agent_turns SET record_json = json_remove(record_json, ?) WHERE turn_id = ?",
+        )
+        .run(field, turn.identity.turnId);
+      const raw = () =>
+        setup.db
+          .prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?")
+          .get(turn.identity.turnId);
+      const before = raw();
+      const control = setup.journal.control(setup.authority.runId);
+      const workspace = setup.agents.workspace(setup.authority.runId, turn.identity);
+      expect(() => setup.agents.turn(setup.authority.runId, turn.identity)).toThrow();
+      expect(() => setup.agents.turns(setup.authority.runId)).toThrow();
+      expect(raw()).toEqual(before);
+      expect(setup.journal.control(setup.authority.runId)).toEqual(control);
+      expect(setup.agents.workspace(setup.authority.runId, turn.identity)).toEqual(workspace);
+    },
+  );
+
   it("binds a native terminal once before accepting provider identity and never reuses it for a later turn", () => {
     const setup = fixture();
     const agent = setup.native();

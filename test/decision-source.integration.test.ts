@@ -92,6 +92,30 @@ function advance(ms: number) {
 }
 
 describe("durable coordinator transport attempts", () => {
+  it("rejects a missing decision turn binding without normalizing an unsettled attempt", () => {
+    const setup = fixture();
+    const { ticket } = request(setup);
+    const attempt = setup.journal.decisionSource.start(setup.authority, ticket.decisionId);
+    expect(attempt.turnIdentity).toBeNull();
+    const db = new Database(setup.path);
+    databases.push(db);
+    db.prepare(
+      "UPDATE decision_source_attempts SET record_json = json_remove(record_json, '$.turnIdentity') WHERE attempt_id = ?",
+    ).run(attempt.attemptId);
+    const raw = () =>
+      db
+        .prepare("SELECT record_json FROM decision_source_attempts WHERE attempt_id = ?")
+        .get(attempt.attemptId);
+    const before = raw();
+    const control = setup.journal.control(setup.authority.runId);
+    expect(() => setup.journal.decisionSource.unsettled(setup.authority.runId)).toThrow();
+    expect(() =>
+      setup.journal.decisionSource.execution(setup.authority.runId, ticket.decisionId),
+    ).toThrow();
+    expect(raw()).toEqual(before);
+    expect(setup.journal.control(setup.authority.runId)).toEqual(control);
+  });
+
   it.each(["active", "paused"] as const)(
     "rechecks a delayed repository preflight (%s) before recording a source attempt",
     async (status) => {

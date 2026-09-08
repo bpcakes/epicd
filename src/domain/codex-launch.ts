@@ -63,6 +63,6 @@ export const TurnLaunchSchema = z.strictObject({
   manifest: CodexLaunchSchema,
   manifestDigest: z.string().length(64),
   stop: CodexLaunchStopSchema.nullable(),
-  native: NativeLaunchEndpointSchema.nullable().default(null),
+  native: NativeLaunchEndpointSchema.nullable(),
 });
 export type TurnLaunch = z.infer<typeof TurnLaunchSchema>;

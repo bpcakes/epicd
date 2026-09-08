@@ -1157,6 +1157,7 @@ export class AgentJournal {
         );
       const turn = TurnRecordSchema.parse({
         identity: turnIdentity,
+        launch: null,
         status: "prepared",
         prompt,
         promptDigest: digestJson(prompt),
