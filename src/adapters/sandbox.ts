@@ -2,6 +2,13 @@ import { lstat, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { redactSensitiveText } from "../util/redact.js";
 import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
+import {
+  fixtureBridgeArguments,
+  fixtureBridgeEnvironment,
+  fixtureBridgeTransport,
+  verifyFixtureBridgeTransport,
+  type FixtureBridgeTransport,
+} from "./fixture-bridge.js";
 
 const OUTPUT_LIMIT = 64 * 1024;
 const PROTECTED_PATHS = [".git", ".beads", ".epicd", ".codex", "AGENTS.md"];
@@ -30,7 +37,7 @@ export type ConfinedCommandResult = {
   outputTruncated: boolean;
   startedAt: string;
   endedAt: string;
-  /** Valid only for this admitted PID-namespace process, not an arbitrary saved PID. */
+  /** This admitted PID namespace only; never proves stop of an external database backend. */
   processTreeStopped: true;
 };
 
@@ -41,7 +48,9 @@ export type ConfinedCommandHandle = {
 
 /**
  * Linux outer sandbox for repository commands, independent of model cooperation.
- * No home, state, service sockets, network, host /proc, or writable system mount is exposed.
+ * No home, state, host network, host /proc, or writable system mount is exposed.
+ * An optional controller-supplied fixture bridge exposes only its private TCP endpoint,
+ * never the raw service socket or broker's mounts/processes.
  * Callers supply a registered private workspace and frozen policy, never an agent path.
  */
 export async function startConfinedCommand(
@@ -50,6 +59,8 @@ export async function startConfinedCommand(
     signal?: AbortSignal;
     bwrapPath?: string;
     beforeSpawn?: () => void | Promise<void>;
+    /** Controller-only transport. Does not confer fixture authority or remote stop proof. */
+    fixtureBridge?: FixtureBridgeTransport;
   } = {},
 ): Promise<ConfinedCommandHandle> {
   if (process.platform !== "linux") throw new Error("Adaptive command confinement requires Linux");
@@ -60,6 +71,15 @@ export async function startConfinedCommand(
   if (!request.command || request.command.includes("\0")) throw new Error("Invalid command");
   // Own inputs before filesystem admission yields to caller code.
   const spec = structuredClone(request);
+  const bridge = options.fixtureBridge && fixtureBridgeTransport(options.fixtureBridge);
+  if (bridge) {
+    if (spec.sourceMode !== "read-only")
+      throw new Error("Fixture bridges require read-only validation source");
+    if (spec.env && bridge.connectionVariable in spec.env)
+      throw new Error("Fixture bridge connection variable collides with command environment");
+    spec.syntheticUser = true;
+    await verifyFixtureBridgeTransport(bridge);
+  }
   if (spec.syntheticUser && (!process.getuid || !process.getgid || process.getuid() === 0))
     throw new Error("Check-local PostgreSQL requires a non-root validation user");
   const workspace = resolve(spec.workspace);
@@ -75,7 +95,7 @@ export async function startConfinedCommand(
   const cwd = spec.cwd === undefined || spec.cwd === "." ? "" : relativePath(spec.cwd);
   if (cwd) await canonicalDirectory(join(workspace, cwd));
 
-  const args = [
+  const systemArgs = [
     "--unshare-all",
     "--die-with-parent",
     "--new-session",
@@ -87,31 +107,24 @@ export async function startConfinedCommand(
   ];
   // Preserve the host's loader layout, including non-usrmerged distributions.
   for (const path of ["/bin", "/sbin", "/lib", "/lib64"]) {
-    if (await exists(path)) args.push("--ro-bind", path, path);
+    if (await exists(path)) systemArgs.push("--ro-bind", path, path);
   }
   for (const path of ["/etc/ld.so.cache", "/etc/localtime"]) {
-    if (await exists(path)) args.push("--ro-bind", path, path);
+    if (await exists(path)) systemArgs.push("--ro-bind", path, path);
   }
-  args.push(
-    "--proc",
-    "/proc",
-    "--dev",
-    "/dev",
-    "--tmpfs",
-    "/tmp",
-    "--dir",
-    "/tmp/epicd-home",
-    spec.sourceMode === "read-only" ? "--ro-bind" : "--bind",
-    workspace,
-    "/workspace",
-  );
-  if (spec.syntheticUser) args.push("--ro-bind-data", "3", "/etc/passwd");
+  const mounts = [
+    {
+      flag: spec.sourceMode === "read-only" ? "--ro-bind" : "--bind",
+      source: workspace,
+      target: "/workspace",
+    },
+  ];
   for (const path of PROTECTED_PATHS) {
     const source = join(workspace, path);
     if (await exists(source)) {
       if ((await realpath(source)) !== source)
         throw new Error(`Protected path is a symlink: ${path}`);
-      args.push("--ro-bind", source, `/workspace/${path}`);
+      mounts.push({ flag: "--ro-bind", source, target: `/workspace/${path}` });
     }
   }
   for (const path of spec.writablePaths ?? []) {
@@ -129,14 +142,29 @@ export async function startConfinedCommand(
     }
     const source = join(workspace, relative);
     await canonicalDirectory(source);
-    args.push("--bind", source, `/workspace/${relative}`);
+    mounts.push({ flag: "--bind", source, target: `/workspace/${relative}` });
   }
+  let args = [
+    ...systemArgs,
+    ...(bridge ? ["--share-net"] : []),
+    "--proc",
+    "/proc",
+    "--dev",
+    "/dev",
+    "--tmpfs",
+    "/tmp",
+    "--dir",
+    "/tmp/epicd-home",
+    ...mounts.flatMap(({ flag, source, target }) => [flag, bridge ? target : source, target]),
+  ];
+  if (spec.syntheticUser) args.push("--ro-bind-data", "3", "/etc/passwd");
   const env = {
     PATH: "/usr/bin:/bin",
     HOME: "/tmp/epicd-home",
     TMPDIR: "/tmp",
     LANG: "C.UTF-8",
     ...spec.env,
+    ...(bridge ? fixtureBridgeEnvironment(bridge) : {}),
   };
   args.push("--clearenv");
   for (const [key, value] of Object.entries(env)) {
@@ -146,6 +174,15 @@ export async function startConfinedCommand(
     args.push("--setenv", key, value);
   }
   args.push("--chdir", cwd ? `/workspace/${cwd}` : "/workspace", "--", spec.command, ...spec.args);
+  if (bridge) {
+    args = fixtureBridgeArguments(
+      bridge,
+      systemArgs,
+      mounts.flatMap(({ flag, source, target }) => [flag, source, target]),
+      args,
+    );
+    await verifyFixtureBridgeTransport(bridge);
+  }
   options.signal?.throwIfAborted();
 
   const startedAt = new Date().toISOString();
