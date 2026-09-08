@@ -109,9 +109,16 @@ export class OrchestratorLoop {
           return "awaiting_user";
         }
         if (!execution) {
-          // Rotation changes control facts, so do it before freezing context and
-          // issuing the next ticket, never in the middle of a provider attempt.
-          if (this.options.beforeDecision) await this.options.beforeDecision(signal);
+          // Rotation changes control facts. Let previous actions finish their
+          // bounded admission checks first; workers themselves remain concurrent.
+          // Prepare before freezing context, never during a provider attempt.
+          if (this.options.beforeDecision) {
+            await this.kernel.awaitPendingDispatches(signal);
+            signal?.throwIfAborted();
+            control = journal.control(authority.runId);
+            if (control.status !== "active") return control.status;
+            await this.options.beforeDecision(signal);
+          }
           signal?.throwIfAborted();
           control = journal.control(authority.runId);
           if (control.status !== "active") return control.status;

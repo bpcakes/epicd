@@ -35,7 +35,7 @@ function fixture(beforeDispatch?: (signal: AbortSignal) => Promise<void>) {
     leaseId: lease.leaseId,
   };
   const kernel = new ActionKernel(store.orchestration, beforeDispatch);
-  return { store, kernel, authority };
+  return { root, store, kernel, authority };
 }
 
 function response(input: Parameters<DecisionSource["decide"]>[0], action: KernelAction) {
@@ -316,6 +316,125 @@ describe("always engaged action loop", () => {
       await kernel.drain();
     }
   });
+
+  it.each(["continue", "pause", "cancel"] as const)(
+    "orders coordinator preparation after pending dispatch admission (%s)",
+    async (mode) => {
+      let releaseGuard!: () => void, enteredGuard!: () => void, finishWorker!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseGuard = resolve;
+      });
+      const entered = new Promise<void>((resolve) => {
+        enteredGuard = resolve;
+      });
+      const worker = new Promise<void>((resolve) => {
+        finishWorker = resolve;
+      });
+      let guardCalls = 0;
+      const { root, kernel, authority } = fixture(async () => {
+        if (++guardCalls === 1) {
+          enteredGuard();
+          await gate;
+        }
+      });
+      const journal = kernel.journal;
+      let workerStarted = false,
+        workerFinished = false;
+      kernel.registerExternal("start_agent", async () => {
+        workerStarted = true;
+        await worker;
+        workerFinished = true;
+        return { kind: "resource", resourceId: "worker-result", generation: 1 };
+      });
+      let calls = 0,
+        preparationCalls = 0;
+      const source: DecisionSource = {
+        async decide(input) {
+          calls += 1;
+          return response(
+            input,
+            calls === 1
+              ? {
+                  kind: "start_agent",
+                  role: "implementation",
+                  purpose: "implementation",
+                  taskId: "demo.1",
+                  workspaceId: "copy",
+                  workspaceGeneration: 1,
+                  candidateId: null,
+                  instructions: "Implement while the coordinator remains engaged",
+                }
+              : question,
+          );
+        },
+      };
+      const cancellation = new AbortController();
+      const execution = new OrchestratorLoop(kernel, source, {
+        beforeDecision: async () => {
+          preparationCalls += 1;
+          if (preparationCalls !== 2) return;
+          // Real coordinator housekeeping changes journal authority facts. It
+          // must not invalidate the previous action's pending admission check.
+          journal.agents.reserveWorkspace(
+            authority,
+            {
+              root: join(root, "managed"),
+              purpose: "coordinator",
+              sourceMode: "immutable",
+              baselineRevision: "base",
+            },
+            journal.control(authority.runId).controlVersion,
+          );
+        },
+      }).run(authority, cancellation.signal);
+      void execution.catch(() => undefined);
+      try {
+        await entered;
+        // Let the loop reach the maintenance boundary while the check is held.
+        await delay(0);
+        expect(preparationCalls).toBe(1);
+        expect(calls).toBe(1);
+        expect(workerStarted).toBe(false);
+        if (mode === "cancel") {
+          cancellation.abort(new Error("Operator cancelled pending admission"));
+          await expect(execution).rejects.toThrow("Operator cancelled pending admission");
+          expect(preparationCalls).toBe(1);
+          expect(workerStarted).toBe(false);
+        } else {
+          if (mode === "pause")
+            journal.operatorControl(
+              authority.runId,
+              journal.control(authority.runId).controlVersion,
+              {
+                kind: "pause",
+              },
+            );
+          releaseGuard();
+          expect(await execution).toBe(mode === "pause" ? "paused" : "awaiting_user");
+          expect(preparationCalls).toBe(mode === "pause" ? 1 : 2);
+          expect(calls).toBe(mode === "pause" ? 1 : 2);
+          expect(workerStarted).toBe(mode === "continue");
+          // The coordinator can decide again without waiting for worker completion.
+          expect(workerFinished).toBe(false);
+          expect(journal.actions(authority.runId)[0]).toMatchObject(
+            mode === "pause"
+              ? {
+                  status: "rejected",
+                  result: { status: "rejected", code: "stale_dispatch" },
+                }
+              : { status: "running" },
+          );
+        }
+      } finally {
+        cancellation.abort();
+        kernel.interruptAll();
+        releaseGuard();
+        finishWorker();
+        await execution.catch(() => undefined);
+        expect(await kernel.drain()).toBe(true);
+      }
+    },
+  );
 
   it("rechecks an operator pause after an asynchronous guard and never starts the external handler", async () => {
     let releaseGuard!: () => void, enteredGuard!: () => void;

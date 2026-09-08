@@ -39,7 +39,7 @@ export class ActionKernel {
   private readonly handlers = new Map<ActionKind, Handler>();
   private readonly operations = new Map<
     string,
-    { controller: AbortController; result: Promise<ActionResult> }
+    { controller: AbortController; dispatchSettled: Promise<void>; result: Promise<ActionResult> }
   >();
   private integrityError: Error | null = null;
 
@@ -323,15 +323,25 @@ export class ActionKernel {
       throw error;
     }
 
+    let settleDispatch!: () => void;
+    const dispatchSettled = new Promise<void>((resolve) => {
+      settleDispatch = resolve;
+    });
     const result = Promise.resolve().then(async (): Promise<ActionResult> => {
       let outcome: ActionResult;
       try {
-        assertCurrentDispatch(this.journal, authority, record);
-        controller.signal.throwIfAborted();
-        if (this.beforeDispatch) {
-          await this.beforeDispatch(controller.signal);
+        try {
           assertCurrentDispatch(this.journal, authority, record);
           controller.signal.throwIfAborted();
+          if (this.beforeDispatch) {
+            await this.beforeDispatch(controller.signal);
+            assertCurrentDispatch(this.journal, authority, record);
+            controller.signal.throwIfAborted();
+          }
+        } finally {
+          // A live dispatch barrier, not worker stop evidence. Maintenance may
+          // resume once admission has succeeded or failed, before worker I/O ends.
+          settleDispatch();
         }
         const payload = ActionPayloadSchema.parse(
           await handler.run(context, record.request.action),
@@ -381,7 +391,7 @@ export class ActionKernel {
       }
       return this.journal.settleAction(authority, record.actionId, "running", outcome).result!;
     });
-    this.operations.set(record.operationId, { controller, result });
+    this.operations.set(record.operationId, { controller, dispatchSettled, result });
     void result.then(
       () => {
         this.operations.delete(record.operationId);
@@ -401,6 +411,31 @@ export class ActionKernel {
   }
   operation(operationId: string): Promise<ActionResult> | null {
     return this.operations.get(operationId)?.result ?? null;
+  }
+
+  /** Order control-changing maintenance after pending admission, not after worker completion. */
+  async awaitPendingDispatches(signal?: AbortSignal): Promise<void> {
+    this.assertHealthy();
+    signal?.throwIfAborted();
+    const pending = Promise.all(
+      [...this.operations.values()].map((operation) => operation.dispatchSettled),
+    );
+    let onAbort: (() => void) | undefined;
+    try {
+      if (signal) {
+        await Promise.race([
+          pending,
+          new Promise<never>((_resolve, reject) => {
+            onAbort = () => reject(signal.reason);
+            signal.addEventListener("abort", onAbort, { once: true });
+          }),
+        ]);
+        signal.throwIfAborted();
+      } else await pending;
+      this.assertHealthy();
+    } finally {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   /** Settle dispatched handlers before releasing their controller lease. */
