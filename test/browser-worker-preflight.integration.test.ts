@@ -3,7 +3,10 @@ import { join, dirname } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { sdkNativeExecutable } from "../dist/bootstrap.js";
 import { runCommand } from "../src/util/command.js";
-import { probeBrowserWorker, requireBrowserWorker } from "./fixtures/browser-worker-preflight.js";
+import {
+  probeBrowserExecution,
+  requireBrowserExecution,
+} from "./fixtures/browser-worker-preflight.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -46,18 +49,37 @@ describe("browser helper temporary storage", () => {
 describe.runIf(process.platform === "linux" && process.env.EPICD_CODEX_CONFINEMENT === "1")(
   "browser worker prerequisite under the installed Codex permission profile",
   () => {
-    it("reports private scratch success and rejects the unreachable local-server incident before model work", async () => {
-      const result = await probeBrowserWorker(await sdkNativeExecutable());
+    it("keeps ordinary worker listeners denied while admitting the kernel's private local-server environment", async () => {
+      const result = await probeBrowserExecution(await sdkNativeExecutable());
       roots.push(result.root);
-      expect(result).toMatchObject({
+      expect(result.worker).toMatchObject({
         scratchAvailable: true,
         localServerAvailable: false,
         error: "EPERM",
       });
-      expect(() => requireBrowserWorker(result)).toThrow("No authenticated run was started");
+      expect(result.kernel).toEqual({
+        scratchAvailable: true,
+        localServerAvailable: true,
+        error: null,
+        succeeded: true,
+        processTreeStopped: true,
+      });
+      expect(() => requireBrowserExecution(result)).not.toThrow();
+      for (const changed of [
+        { ...result, worker: { ...result.worker, localServerAvailable: true, error: null } },
+        { ...result, worker: { ...result.worker, scratchAvailable: false } },
+        { ...result, kernel: { ...result.kernel, localServerAvailable: false } },
+        { ...result, kernel: { ...result.kernel, succeeded: false } },
+      ])
+        expect(() => requireBrowserExecution(changed)).toThrow("No authenticated run was started");
       expect(await readFile(join(result.root, "artifacts/result.json"), "utf8")).toContain(
         '"localServer":false',
       );
+      const outcome = JSON.parse(
+        await readFile(join(result.root, "artifacts/kernel-result.json"), "utf8"),
+      );
+      expect(outcome).toMatchObject({ status: "succeeded", exitCode: 0, processTreeStopped: true });
+      expect(JSON.parse(outcome.stdout)).toMatchObject({ localServer: true, error: null });
     }, 30000);
   },
 );

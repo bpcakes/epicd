@@ -7,7 +7,10 @@ import { createRun, resolveExecutable, selectedCodexExecutable } from "../dist/b
 import { OrchestratorController, controlledDriver } from "../dist/controller.js";
 import { receiptProject, receiptFaultDriver, RECEIPT_FILES } from "./fixtures/receipt-incident.js";
 import { buildBrowserBundle, browserProject } from "./fixtures/browser-incident.js";
-import { probeBrowserWorker, requireBrowserWorker } from "./fixtures/browser-worker-preflight.js";
+import {
+  probeBrowserExecution,
+  requireBrowserExecution,
+} from "./fixtures/browser-worker-preflight.js";
 import { startFixturePostgreSql } from "./fixtures/postgresql-fixture.js";
 import { FixtureDefinitionSchema } from "../dist/domain/repository-policy.js";
 import { ImplementationResultSchema } from "../dist/domain/types.js";
@@ -36,7 +39,9 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
       `delivers a real one-task Beads epic with Astra and independent exact-revision review (${scenario})`,
       async () => {
         if (scenario === "browser")
-          requireBrowserWorker(await probeBrowserWorker(await selectedCodexExecutable(runtime)));
+          requireBrowserExecution(
+            await probeBrowserExecution(await selectedCodexExecutable(runtime)),
+          );
         if (runtime === "herdr") {
           expect(process.env.HERDR_ENV).toBe("1");
           expect(process.env.EPICD_EXPECT_HERDR_SESSION).toMatch(/^epicd-delivery-[a-f0-9]{8}$/);
@@ -193,7 +198,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
           "--description",
           "Change only source.txt to the exact bytes green followed by one newline. Preserve expected.txt, README.md and .epicd/policy.json. Use independent review and every declared check." +
             (scenario === "browser"
-              ? " Run both documented checks in the ordinary implementation turn and report their actual outcomes. This acceptance scenario deliberately exercises a code-completion claim alongside validation failure: the implementer should report status completed after the requested source edit is finished, while accurately retaining any failed browser test in its tests list. That is not delivery approval; the engineering lead must diagnose the failure and obtain real kernel browser evidence before review. Preserve BROWSER.md, all tools, Playwright configuration, E2E tests and vendor files."
+              ? " Run the comparison in the ordinary implementation turn and request kernel execution for the browser check as documented in BROWSER.md. The first browser execution must reproduce the failure before any fixture is changed. This acceptance scenario deliberately exercises a code-completion claim alongside validation failure: after receiving the actual kernel result, the implementer should report status completed for the finished source edit while accurately retaining the failed browser test in its tests list, identifying the kernel as its executor and citing its evidence ID. That is not delivery approval; the engineering lead must diagnose the failure and obtain real kernel browser evidence before review. Preserve BROWSER.md, all tools, Playwright configuration, E2E tests and vendor files."
               : ""),
           "--acceptance-criteria",
           "source.txt is exactly green followed by one newline; /usr/bin/cmp source.txt expected.txt exits zero; expected.txt and validation policy are unchanged." +
@@ -377,21 +382,73 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
               "A real implementer must report completed with a failed browser check; no report is injected",
             ).toBeDefined();
             if (!failedTurn) throw new Error("The browser incident did not occur");
-            const observations = [];
-            let cursor = 0;
-            for (;;) {
-              const page = journal.observations(run.runId, cursor, 1000);
-              if (!page.length) break;
-              observations.push(...page);
-              cursor = page.at(-1)!.id;
-            }
-            const artifacts = observations
-              .filter((event) => event.identity?.turnId === failedTurn.identity.turnId)
-              .flatMap((event) => event.artifactIds)
-              .map((id) => journal.diagnostics.read(run.runId, id, 0, 65536).text)
-              .join("\n");
-            expect(artifacts).toContain("Browser fixture authentication failed");
-            expect(artifacts).toContain("1 failed");
+            // The worker is not the browser executor. Require a real kernel result,
+            // its stopped source assignment, and the exact evidence ID supplied to
+            // and truthfully cited by the provider's subsequent completed-code report.
+            const incident = actions
+              .filter((record) => record.request.action.kind === "run_diagnostic_check")
+              .map((record) =>
+                journal.delivery.validationForOperation(run.runId, record.operationId),
+              )
+              .find((evidence) => {
+                if (!evidence || evidence.outcome?.status !== "failed") return false;
+                const candidate = journal.delivery.candidate(run.runId, evidence);
+                return (
+                  candidate.source.kind === "implementation" &&
+                  candidate.source.assignmentId === failedTurn.identity.assignmentId &&
+                  candidate.workspaceId === failedTurn.identity.workspaceId &&
+                  candidate.workspaceGeneration === failedTurn.identity.workspaceGeneration &&
+                  evidence.outcome.endedAt <= failedTurn.createdAt &&
+                  JSON.stringify(failedTurn.prompt).includes(evidence.evidenceId) &&
+                  ImplementationResultSchema.parse(failedTurn.result).tests.some(
+                    (check) =>
+                      check.outcome === "failed" &&
+                      check.detail.includes(evidence.evidenceId) &&
+                      /kernel/i.test(check.detail),
+                  )
+                );
+              });
+            expect(
+              incident,
+              "The actual failed kernel execution must be handed back to its implementer",
+            ).toBeDefined();
+            if (!incident) throw new Error("Missing kernel-to-worker browser evidence handoff");
+            expect(incident).toMatchObject({
+              purpose: "diagnostic",
+              check: {
+                command: "/bin/sh",
+                args: ["tools/browser-check.sh"],
+                cwd: ".",
+                environmentBindings: [],
+              },
+              sourceUnchanged: true,
+              environmentVerified: true,
+              fixtureAccessIds: [],
+              outcome: { status: "failed", processTreeStopped: true },
+            });
+            expect(incident.outcome!.stderr).toContain("Browser fixture authentication failed");
+            expect(incident.outcome!.stderr).toContain("database URL is unavailable");
+            expect(incident.outcome!.stdout).toContain("1 failed");
+            expect(journal.delivery.satisfiesCheck(run.runId, incident.evidenceId)).toBe(false);
+            const incidentSource = journal.delivery.candidate(run.runId, incident);
+            if (incidentSource.source.kind !== "implementation")
+              throw new Error("Expected implementation candidate");
+            const sourceTurnId = incidentSource.source.turnId;
+            const sourceTurn = turns.find((turn) => turn.identity.turnId === sourceTurnId);
+            expect(sourceTurn?.stopEvidence).toBeTruthy();
+            expect(sourceTurn!.updatedAt <= incident.createdAt).toBe(true);
+            expect(
+              execFileSync(
+                "git",
+                [
+                  "-C",
+                  journal.agents.workspace(run.runId, incident).path,
+                  "show",
+                  `${incident.revision}:source.txt`,
+                ],
+                { encoding: "utf8", timeout: 10000 },
+              ),
+            ).toBe("green\n");
             expect(
               actions.some(
                 (record) =>
