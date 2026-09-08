@@ -91,9 +91,13 @@ export async function reconcileCommitIO(
   journal.assertAuthority(authority);
   const record = recordFor(journal, authority.runId, target);
   let operation = journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId);
-  // An unbound/unknown operation still needs its own independent stop proof. In
-  // particular, a missing ref or a lost lease cannot release an old exclusion.
-  if (!operation.execution || operation.stopEvidence) return;
+  if (operation.stopEvidence) return;
+  if (!operation.execution) {
+    // Current-format application writers cannot start I/O before this binding.
+    // Fence that exact unused reservation; Git state and lease loss are not proof.
+    if (target.kind === "application") journal.commits.cancelUnbound(authority, target.commitId);
+    return;
+  }
   if (!operation.executionStop) {
     const receipt = await recoverCommandStop(operation.execution);
     if (!receipt)

@@ -4,12 +4,23 @@ import { WorkspaceManager } from "../../dist/adapters/workspaces.js";
 import { ActionKernel } from "../../dist/kernel/actions.js";
 import { registerCommitCapabilities } from "../../dist/kernel/commits.js";
 
-// Crash the real kernel caller at the durable-receipt / journal-acknowledgement
-// boundary. The original supervisor has already exited; no receipt is fabricated.
+// Crash the real kernel caller before binding its prepared worker, or at the
+// durable-receipt / journal-acknowledgement boundary. No receipt is fabricated.
 const input = JSON.parse(readFileSync(0, "utf8"));
 const store = new StateStore(input.stateFile.path, input.stateFile);
 try {
   const journal = store.orchestration;
+  const bind = journal.agents.bindWorkspaceExecution.bind(journal.agents);
+  journal.agents.bindWorkspaceExecution = (authority, operationId, intent) => {
+    if (
+      input.crashPoint === "before_bind" &&
+      journal.agents.workspaceOperation(authority.runId, operationId).kind === "commit"
+    ) {
+      process.kill(process.pid, "SIGKILL");
+      throw new Error("SIGKILL did not terminate the caller");
+    }
+    return bind(authority, operationId, intent);
+  };
   const recordStop = journal.agents.recordWorkspaceExecutionStop.bind(journal.agents);
   journal.agents.recordWorkspaceExecutionStop = (authority, operationId, receipt) => {
     if (journal.agents.workspaceOperation(authority.runId, operationId).kind === "commit") {

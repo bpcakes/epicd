@@ -14,6 +14,7 @@ import { DeliveryError, type DeliveryJournal } from "./delivery-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { RunStateSchema } from "../domain/types.js";
 import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
+import { WorkspaceOperationSchema } from "../domain/workspaces.js";
 
 export const COMMIT_TABLES = ["delivery_commits"] as const;
 export function createCommitsSchema(db: Database.Database) {
@@ -198,6 +199,50 @@ export class CommitJournal {
       this.save(record);
       this.changed(authority, "commit.writing", commitId);
       return record;
+    });
+  }
+  /** Fence only this exact never-bound writer, atomically with its failed commitment. */
+  cancelUnbound(authority: ControllerAuthority, commitId: string) {
+    return this.access.transaction(authority, () => {
+      const record = this.record(authority.runId, commitId);
+      const operation = this.access.agents.workspaceOperation(
+        authority.runId,
+        record.workspaceOperationId,
+      );
+      if (
+        record.status !== "preparing" ||
+        record.revision !== null ||
+        operation.kind !== "commit" ||
+        operation.workspaceId !== record.workspaceId ||
+        operation.workspaceGeneration !== record.workspaceGeneration ||
+        operation.controllerLeaseId !== record.controllerLeaseId ||
+        operation.execution !== null ||
+        operation.executionStop !== null ||
+        operation.stopEvidence !== null
+      )
+        throw new DeliveryError(
+          "commit_not_unbound",
+          "Only an exact never-bound application writer can be cancelled without a stop receipt",
+        );
+      // No preflight or Git write can begin before binding the fixed worker.
+      // This durable stop also rejects a delayed bind under the original lease.
+      const stopped = WorkspaceOperationSchema.parse({
+        ...operation,
+        status: "failed",
+        stopEvidence:
+          "Kernel atomically fenced the exact application commit worker that was never bound",
+        updatedAt: at(),
+      });
+      this.db
+        .prepare("UPDATE workspace_operations SET record_json=? WHERE run_id=? AND operation_id=?")
+        .run(JSON.stringify(stopped), authority.runId, operation.operationId);
+      return this.finish(
+        authority,
+        commitId,
+        false,
+        false,
+        "Application commit worker was never bound",
+      );
     });
   }
   /** Physical outcome, not publication authority. Preserve stale-but-created objects as facts. */

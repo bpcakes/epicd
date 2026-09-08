@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as lifetime from "../src/adapters/command-lifetime.js";
 import { StateStore } from "../src/adapters/store.js";
 import { reconcileCommit } from "../src/kernel/commits.js";
 import type { CandidateIdentity } from "../src/domain/delivery.js";
@@ -288,22 +289,37 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
     const s = await fixture();
     const { candidate } = await approved(s);
     const run = s.authority.runId;
-    s.manager.writeCandidateCommit = async () => {
-      throw new Error("Injected lost controller before I/O settlement");
-    };
-    expect(
-      (await s.dispatch({ kind: "request_commit", ...candidate, subject: "Uncertain operation" }))
-        .status,
-    ).toBe("indeterminate");
-    const pending = s.journal.commits.records(run)[0]!;
-    s.newLease();
-    await expect(
-      reconcileCommit(s.journal, s.manager, s.authority, pending.commitId),
-    ).rejects.toThrow("Git state alone");
-    expect(s.journal.agents.activeWorkspaceOperation(run, pending)?.operationId).toBe(
-      pending.workspaceOperationId,
-    );
-    expect(s.journal.commits.record(run, pending.commitId).status).toBe("preparing");
+    // The actual worker rejects changed source during preflight. Hide its genuine
+    // receipt: an absent commit ref still cannot release this bound I/O exclusion.
+    writeFileSync(join(s.workspace.path, "app.txt"), "post-approval source bytes\n");
+    const receipt = vi.spyOn(lifetime, "recoverCommandStop").mockResolvedValue(null);
+    try {
+      expect(
+        (await s.dispatch({ kind: "request_commit", ...candidate, subject: "Uncertain operation" }))
+          .status,
+      ).toBe("indeterminate");
+      const pending = s.journal.commits.records(run)[0]!;
+      const operation = s.journal.agents.workspaceOperation(run, pending.workspaceOperationId);
+      expect(operation.execution).not.toBeNull();
+      expect(await lifetime.readCommandStop(operation.execution!)).toMatchObject({
+        kind: "stopped",
+        code: 1,
+      });
+      expect(git(s.workspace.path, "for-each-ref", "refs/epicd/commits/")).toBe("");
+      s.newLease();
+      await expect(
+        reconcileCommit(s.journal, s.manager, s.authority, pending.commitId),
+      ).rejects.toThrow("no independent stop receipt");
+      expect(s.journal.agents.activeWorkspaceOperation(run, pending)?.operationId).toBe(
+        pending.workspaceOperationId,
+      );
+      expect(s.journal.commits.record(run, pending.commitId).status).toBe("preparing");
+      expect(readFileSync(join(s.workspace.path, "app.txt"), "utf8")).toBe(
+        "post-approval source bytes\n",
+      );
+    } finally {
+      receipt.mockRestore();
+    }
   });
 
   it("requires fresh validation citations and a different reviewer for actual-SHA verification", async () => {

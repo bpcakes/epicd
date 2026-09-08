@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
+import * as lifetime from "../src/adapters/command-lifetime.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import {
   registerDeliveryRecoveryCapabilities,
@@ -417,19 +418,33 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     const s = await fixture(),
       run = s.authority.runId;
     const action = await request(s, "request_commit");
-    vi.spyOn(s.manager, "writeCandidateCommit").mockRejectedValue(new Error("Unknown old Git I/O"));
-    const lost = await s.dispatch(action);
-    expect(lost.status).toBe("indeterminate");
-    const intent = s.journal.commits.records(run)[0]!;
-    const recovered = cold(s);
-    expect(
-      inspection(await recovered.dispatch({ kind: "reconcile_action", actionId: lost.actionId }))
-        .status,
-    ).toBe("indeterminate");
-    expect(recovered.journal.agents.activeWorkspaceOperation(run, intent)?.operationId).toBe(
-      intent.workspaceOperationId,
-    );
-    expect(recovered.journal.commits.record(run, intent.commitId).status).toBe("preparing");
+    // Bind a real one-use worker gate, but hide its stop proof. A failure before
+    // binding is now provably unused, not a simulation of unknown old Git I/O.
+    const launch = vi.spyOn(lifetime, "startDurableCommand").mockImplementation(() => {
+      throw new Error("Lost caller after binding its worker");
+    });
+    const receipt = vi.spyOn(lifetime, "recoverCommandStop").mockResolvedValue(null);
+    try {
+      const lost = await s.dispatch(action);
+      expect(lost.status).toBe("indeterminate");
+      const intent = s.journal.commits.records(run)[0]!;
+      expect(
+        s.journal.agents.workspaceOperation(run, intent.workspaceOperationId).execution,
+      ).not.toBeNull();
+      expect(git(s.workspace.path, "for-each-ref", "refs/epicd/commits/")).toBe("");
+      const recovered = cold(s);
+      expect(
+        inspection(await recovered.dispatch({ kind: "reconcile_action", actionId: lost.actionId }))
+          .status,
+      ).toBe("indeterminate");
+      expect(recovered.journal.agents.activeWorkspaceOperation(run, intent)?.operationId).toBe(
+        intent.workspaceOperationId,
+      );
+      expect(recovered.journal.commits.record(run, intent.commitId).status).toBe("preparing");
+    } finally {
+      launch.mockRestore();
+      receipt.mockRestore();
+    }
   });
 
   it("requires another review when only a stopped turn, not a complete review verdict, survived", async () => {

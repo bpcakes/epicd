@@ -91,9 +91,11 @@ export async function reconcileCommit(
   signal?: AbortSignal,
 ) {
   journal.assertAuthority(authority);
-  const record = journal.commits.record(authority.runId, commitId);
+  let record = journal.commits.record(authority.runId, commitId);
   if (["created", "failed"].includes(record.status)) return record;
   await reconcileCommitIO(journal, authority, { kind: "application", commitId });
+  record = journal.commits.record(authority.runId, commitId);
+  if (["created", "failed"].includes(record.status)) return record;
   const observed = await workspaces.inspectCandidateCommit(authority, record, signal);
   return journal.commits.finish(
     authority,
