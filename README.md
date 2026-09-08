@@ -364,6 +364,18 @@ EPICD_TEST_PGBOUNCER=/absolute/path/to/pgbouncer \
 
 These tests create their own roles and peer mappings only in owned temporary clusters. They cover actual SQL, privilege rejection, grant revocation, journal rollback, remote-stop exclusion and cold reconciliation; they do not configure the operator's PostgreSQL service.
 
+The real browser fixture needs a local npm project containing `@playwright/test` and its matching Playwright headless Chromium directory. It bundles those dependencies and the current native Node executable into the temporary test repository; it does not expose a host browser/cache directory to agents or validation. The mechanical browser contract is:
+
+```bash
+EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin \
+EPICD_TEST_PGBOUNCER=/absolute/path/to/pgbouncer \
+EPICD_TEST_PLAYWRIGHT_ROOT=/absolute/path/to/playwright-project \
+EPICD_TEST_BROWSER_DIRECTORY=/absolute/path/to/chrome-headless-shell-linux64 \
+  npm test -- test/browser-fixture.integration.test.ts
+```
+
+With the same four variables, set `EPICD_LIVE_DELIVERY_SCENARIO=browser` before either live delivery command. This scenario asks the actual implementer to report its source edit as completed while accurately retaining the real failed browser check. That faulty completion claim is a deliberate scenario instruction, not an injected report. The harness requires diagnostic follow-up, repository/configuration inspection, observed database absence, authorized creation, green kernel browser evidence before review, verified delivery and preservation of the test/oracle/dependency files. SDK browser work has a 30-minute controller deadline; native Herdr has 60 minutes. The test stops only its owned PostgreSQL server and retains its data and run artifacts. The mechanical contract has passed; authenticated browser-recovery acceptance is not yet established.
+
 The original dispatcher and its dedicated tests have been removed. Their history remains in Git; old state, user repositories, and user-owned Herdr resources are not deleted by this hard cut.
 
 ## License

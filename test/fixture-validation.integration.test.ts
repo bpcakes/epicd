@@ -1,7 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { userInfo } from "node:os";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
@@ -21,11 +20,11 @@ import {
   ValidationServiceSchema,
 } from "../src/domain/repository-policy.js";
 import { fixture, success, target } from "./fixtures/review.js";
+import { startFixturePostgreSql } from "./fixtures/postgresql-fixture.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
 
 const bin = process.env.EPICD_TEST_PG_BINDIR;
 const broker = process.env.EPICD_TEST_PGBOUNCER;
-const quote = (s: string) => '"' + s.replaceAll('"', '""') + '"';
 async function setup(
   options: {
     create?: boolean;
@@ -35,82 +34,8 @@ async function setup(
     localService?: boolean;
   } = {},
 ) {
-  const root = mkdtempSync("/var/tmp/epicd-fixture-validation-"),
-    data = join(root, "cluster"),
-    sockets = join(root, "sockets");
-  mkdirSync(sockets);
-  const manager = userInfo().username,
-    role = "epicd_fixture_role",
-    admin = "epicd_fixture_bootstrap";
-  const run = (name: string, args: string[]) =>
-    execFileSync(join(bin!, name), args, {
-      encoding: "utf8",
-      timeout: 15000,
-      stdio: ["ignore", "pipe", "pipe"],
-    }).trim();
-  const sql = (query: string, database = "postgres") =>
-    run("psql", [
-      "-X",
-      "-w",
-      "-qAt",
-      "-v",
-      "ON_ERROR_STOP=1",
-      "-h",
-      sockets,
-      "-p",
-      "55432",
-      "-U",
-      admin,
-      "-d",
-      database,
-      "-c",
-      query,
-    ]);
-  let started = false;
-  const cleanup = () => {
-    if (started) {
-      try {
-        run("pg_ctl", ["-D", data, "-m", "immediate", "-w", "stop"]);
-      } catch (cause) {
-        throw new Error(`Preserved uncertain owned PostgreSQL fixture at ${root}`, { cause });
-      }
-    }
-    rmSync(root, { recursive: true, force: true });
-  };
+  const { root, sockets, manager, role, admin, sql, cleanup } = startFixturePostgreSql(bin!);
   try {
-    run("initdb", [
-      "-D",
-      data,
-      "--auth-local=peer",
-      "--auth-host=reject",
-      "--no-sync",
-      "--locale=C.UTF-8",
-      "-U",
-      admin,
-    ]);
-    // This cluster is created by this test. Never edit or connect to the operator's database service.
-    writeFileSync(
-      join(data, "pg_hba.conf"),
-      `local all ${admin} trust\nlocal all all peer map=epicd_fixture_test\n`,
-    );
-    writeFileSync(
-      join(data, "pg_ident.conf"),
-      `epicd_fixture_test ${quote(manager)} ${quote(manager)}\nepicd_fixture_test ${quote(manager)} ${role}\n`,
-    );
-    started = true;
-    run("pg_ctl", [
-      "-D",
-      data,
-      "-l",
-      join(root, "postgres.log"),
-      "-w",
-      "start",
-      "-o",
-      `-k ${sockets} -p 55432 -c listen_addresses='' -c fsync=off`,
-    ]);
-    sql(
-      `CREATE ROLE ${quote(manager)} LOGIN NOSUPERUSER CREATEDB; CREATE ROLE ${role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT ${role} TO ${quote(manager)}`,
-    );
     const definition = FixtureDefinitionSchema.parse({
       id: "browser-db",
       provider: "postgresql",

@@ -1,19 +1,31 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../dist/adapters/store.js";
 import { createRun, resolveExecutable } from "../dist/bootstrap.js";
 import { OrchestratorController, controlledDriver } from "../dist/controller.js";
 import { receiptProject, receiptFaultDriver, RECEIPT_FILES } from "./fixtures/receipt-incident.js";
+import { buildBrowserBundle, browserProject } from "./fixtures/browser-incident.js";
+import { startFixturePostgreSql } from "./fixtures/postgresql-fixture.js";
+import { FixtureDefinitionSchema } from "../dist/domain/repository-policy.js";
+import { ImplementationResultSchema } from "../dist/domain/types.js";
+import { bindFixtureExecutable, bindFixtureProvider } from "../dist/adapters/fixtures.js";
 
 const runtime = process.env.EPICD_LIVE_DELIVERY_RUNTIME ?? "sdk";
 if (runtime !== "sdk" && runtime !== "herdr")
   throw new Error("Select sdk or herdr for live delivery");
-const deadlineMinutes = runtime === "herdr" ? 40 : 20;
 const scenario = process.env.EPICD_LIVE_DELIVERY_SCENARIO ?? "plain";
-if (scenario !== "plain" && scenario !== "receipts")
-  throw new Error("Select plain or receipts for live delivery");
+if (!["plain", "receipts", "browser"].includes(scenario))
+  throw new Error("Select plain, receipts or browser for live delivery");
+// Browser recovery includes real dependency extraction, sign-in, database diagnosis
+// and repeated SHA-bound checks. Existing plain/receipt deadlines are unchanged.
+const deadlineMinutes =
+  scenario === "browser" ? (runtime === "herdr" ? 60 : 30) : runtime === "herdr" ? 40 : 20;
+const fixtureCleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const cleanup of fixtureCleanups.splice(0).reverse()) cleanup();
+});
 
 /** Opt-in model acceptance, not a scripted strategy or a substitute for kernel regressions. */
 describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY === "1")(
@@ -45,12 +57,54 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
         writeFileSync(join(source, "source.txt"), "red\n");
         writeFileSync(join(source, "expected.txt"), "green\n");
         const receiptFiles = scenario === "receipts" ? receiptProject(source) : [];
+        let browserDatabase: ReturnType<typeof startFixturePostgreSql> | null = null;
+        let browserFiles: string[] = [];
+        let browserDefinition: ReturnType<typeof FixtureDefinitionSchema.parse> | null = null;
+        if (scenario === "browser") {
+          const bin = process.env.EPICD_TEST_PG_BINDIR,
+            broker = process.env.EPICD_TEST_PGBOUNCER,
+            toolchain = process.env.EPICD_TEST_PLAYWRIGHT_ROOT,
+            browser = process.env.EPICD_TEST_BROWSER_DIRECTORY;
+          if (!bin || !broker || !toolchain || !browser)
+            throw new Error(
+              "Browser acceptance requires explicit PostgreSQL, PgBouncer, Playwright and headless-browser paths",
+            );
+          browserFiles = browserProject(
+            source,
+            buildBrowserBundle(toolchain, browser),
+            join(bin, "psql"),
+          );
+          browserDatabase = startFixturePostgreSql(bin);
+          const ownedDatabase = browserDatabase;
+          process.stderr.write(`Live browser database artifacts: ${ownedDatabase.root}\n`);
+          // Stop only the test-owned server. Retain its data alongside failed/successful run evidence.
+          fixtureCleanups.push(() => ownedDatabase.cleanup(true));
+          browserDefinition = FixtureDefinitionSchema.parse({
+            id: "browser-db",
+            provider: "postgresql",
+            socketDirectory: ownedDatabase.sockets,
+            port: 55432,
+            role: ownedDatabase.manager,
+            database: "browser_fixture",
+            expectedOwner: ownedDatabase.role,
+            operations: ["create"],
+            environmentBinding: "browser",
+            cleanup: "retain",
+          });
+          expect(
+            ownedDatabase.sql("SELECT count(*) FROM pg_database WHERE datname='browser_fixture'"),
+          ).toBe("0");
+        }
         const receiptBaseline = new Map(
           receiptFiles.map((path) => [path, readFileSync(join(source, path), "utf8")]),
         );
         writeFileSync(
           join(source, "README.md"),
-          "# Color fixture\n\nThe application output is source.txt. The required output is exactly green followed by one newline. Validate with `/usr/bin/cmp source.txt expected.txt`. No dependencies or services are required. Only source.txt needs changing; expected.txt and the validation policy must stay unchanged.\n" +
+          "# Color fixture\n\nThe application output is source.txt. The required output is exactly green followed by one newline. Validate with `/usr/bin/cmp source.txt expected.txt`. " +
+            (scenario === "browser"
+              ? "The second required check is `/bin/sh tools/browser-check.sh`; see BROWSER.md for the Playwright test and its declared disposable database. "
+              : "No dependencies or services are required. ") +
+            "Only source.txt needs changing; expected.txt, documentation, helpers, tests, dependencies and the validation policy must stay unchanged.\n" +
             (scenario === "receipts"
               ? "\nValidation helpers are documented in VALIDATION.md. Preserve the helper, documentation and both tracked receipt logs.\n"
               : ""),
@@ -66,13 +120,41 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
               timeoutMs: 10_000,
               stage: "both",
             },
+            ...(browserDefinition
+              ? [
+                  {
+                    id: "browser-login",
+                    command: "/bin/sh",
+                    args: ["tools/browser-check.sh"],
+                    cwd: ".",
+                    timeoutMs: 30000,
+                    stage: "both",
+                    environmentBindings: ["browser"],
+                  },
+                ]
+              : []),
           ],
+          ...(browserDefinition
+            ? {
+                fixtures: [browserDefinition],
+                fixtureValidation: [
+                  {
+                    fixtureId: browserDefinition.id,
+                    validationRole: browserDefinition.expectedOwner,
+                    listenPort: 55433,
+                    connectionVariable: "DATABASE_URL",
+                    pgbouncerExecutable: process.env.EPICD_TEST_PGBOUNCER!,
+                  },
+                ],
+              }
+            : {}),
           budgets: { maxWorkers: 2, taskDecisions: 64, epicDecisions: 128 },
         };
         const policyBytes = `${JSON.stringify(policy, null, 2)}\n`;
         writeFileSync(join(source, ".epicd/policy.json"), policyBytes);
         git("add", "source.txt", "expected.txt", "README.md", ".epicd/policy.json");
         if (receiptFiles.length) git("add", ...receiptFiles);
+        if (browserFiles.length) git("add", ...browserFiles);
         git("commit", "-qm", "Initial red fixture");
         const baseline = git("rev-parse", "HEAD");
         const trackerExecutable = await resolveExecutable(process.env.EPICD_TEST_BR_PATH ?? "br");
@@ -93,7 +175,10 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
           "--type",
           "epic",
           "--description",
-          "Deliver the child task as verified local commits, close the task and epic, publish final tracker state, and complete the run. No external service or user decision is required.",
+          "Deliver the child task as verified local commits, close the task and epic, publish final tracker state, and complete the run. " +
+            (scenario === "browser"
+              ? "The local disposable browser database and dedicated roles are declared; the operator supplies inspection, creation and separate SQL-access grants. First reproduce the browser failure in the implementer's reported checks before changing any fixture; then diagnose and recover it. Database-backed browser validation is mandatory."
+              : "No external service or user decision is required."),
         );
         const task = br(
           "create",
@@ -103,9 +188,15 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
           "--parent",
           epic.id,
           "--description",
-          "Change only source.txt to the exact bytes green followed by one newline. Preserve expected.txt, README.md and .epicd/policy.json. Use independent review and the declared color check.",
+          "Change only source.txt to the exact bytes green followed by one newline. Preserve expected.txt, README.md and .epicd/policy.json. Use independent review and every declared check." +
+            (scenario === "browser"
+              ? " Run both documented checks in the ordinary implementation turn and report their actual outcomes. This acceptance scenario deliberately exercises a code-completion claim alongside validation failure: the implementer should report status completed after the requested source edit is finished, while accurately retaining any failed browser test in its tests list. That is not delivery approval; the engineering lead must diagnose the failure and obtain real kernel browser evidence before review. Preserve BROWSER.md, all tools, Playwright configuration, E2E tests and vendor files."
+              : ""),
           "--acceptance-criteria",
-          "source.txt is exactly green followed by one newline; /usr/bin/cmp source.txt expected.txt exits zero; expected.txt and validation policy are unchanged.",
+          "source.txt is exactly green followed by one newline; /usr/bin/cmp source.txt expected.txt exits zero; expected.txt and validation policy are unchanged." +
+            (scenario === "browser"
+              ? " Real Playwright sign-in authenticates using the declared PostgreSQL fixture and displays Welcome green; kernel browser checks pass at the candidate and actual committed revisions. No authentication bypass, skipped assertion or rewritten helper/dependency is accepted."
+              : ""),
         );
         const index = readFileSync(join(source, ".git/index"));
         writeFileSync(join(source, "source.txt"), "operator-owned concurrent work\n");
@@ -140,6 +231,30 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
             );
           }
           process.stderr.write(`Live delivery run: ${run.runId}\n`);
+          if (browserDefinition) {
+            const fixtures = store.orchestration.fixtures;
+            const binding = await bindFixtureProvider(
+              browserDefinition,
+              join(process.env.EPICD_TEST_PG_BINDIR!, "psql"),
+            );
+            const expiresAt = new Date(Date.now() + (deadlineMinutes + 5) * 60000).toISOString();
+            fixtures.grant(run.runId, store.orchestration.control(run.runId).controlVersion, {
+              fixtureId: browserDefinition.id,
+              binding,
+              operations: ["inspect", "create"],
+              expiresAt,
+            });
+            fixtures.validation.grant(
+              run.runId,
+              store.orchestration.control(run.runId).controlVersion,
+              {
+                fixtureId: browserDefinition.id,
+                binding,
+                pgbouncer: await bindFixtureExecutable(process.env.EPICD_TEST_PGBOUNCER!),
+                expiresAt,
+              },
+            );
+          }
           progress = setInterval(() => {
             const control = store.orchestration.control(run.runId);
             const actions = store.orchestration.actions(run.runId).slice(-3);
@@ -234,6 +349,124 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
             for (const path of RECEIPT_FILES) expect(retained.text).toContain(path);
           }
           const turns = journal.agents.turns(run.runId);
+          if (browserDefinition) {
+            const actions = journal.actions(run.runId);
+            const failedTurn = turns.find((turn) => {
+              if (
+                journal.agents.assignment(run.runId, turn.identity.assignmentId).purpose !==
+                "implementation"
+              )
+                return false;
+              const parsed = ImplementationResultSchema.safeParse(turn.result);
+              return (
+                turn.resultEligible &&
+                parsed.success &&
+                parsed.data.status === "completed" &&
+                parsed.data.tests.some(
+                  (check) =>
+                    check.outcome === "failed" &&
+                    /browser|playwright/i.test(check.command + " " + check.detail),
+                )
+              );
+            });
+            expect(
+              failedTurn,
+              "A real implementer must report completed with a failed browser check; no report is injected",
+            ).toBeDefined();
+            if (!failedTurn) throw new Error("The browser incident did not occur");
+            const observations = [];
+            let cursor = 0;
+            for (;;) {
+              const page = journal.observations(run.runId, cursor, 1000);
+              if (!page.length) break;
+              observations.push(...page);
+              cursor = page.at(-1)!.id;
+            }
+            const artifacts = observations
+              .filter((event) => event.identity?.turnId === failedTurn.identity.turnId)
+              .flatMap((event) => event.artifactIds)
+              .map((id) => journal.diagnostics.read(run.runId, id, 0, 65536).text)
+              .join("\n");
+            expect(artifacts).toContain("Browser fixture authentication failed");
+            expect(artifacts).toContain("1 failed");
+            expect(
+              actions.some(
+                (record) =>
+                  record.status === "succeeded" &&
+                  record.request.action.kind === "continue_agent" &&
+                  record.request.action.agentId === failedTurn.identity.agentId &&
+                  record.createdAt >= failedTurn.updatedAt,
+              ),
+            ).toBe(true);
+            for (const path of ["BROWSER.md", "playwright.config.cjs"])
+              expect(
+                actions.some(
+                  (record) =>
+                    record.status === "succeeded" &&
+                    record.request.action.kind === "inspect_repo" &&
+                    record.request.action.operation === "read" &&
+                    record.request.action.path === path,
+                ),
+              ).toBe(true);
+            expect(
+              actions.some(
+                (record) =>
+                  record.request.action.kind === "inspect_fixture" &&
+                  record.result?.status === "succeeded" &&
+                  record.result.result.kind === "inspection" &&
+                  JSON.parse(record.result.result.text).status === "database_absent",
+              ),
+            ).toBe(true);
+            expect(journal.fixtures.creations(run.runId)).toMatchObject([
+              { fixtureId: browserDefinition.id, generation: 1, status: "owned" },
+            ]);
+            expect(journal.fixtures.creations(run.runId)[0]!.createdAt > failedTurn.updatedAt).toBe(
+              true,
+            );
+            const browserEvidence = actions
+              .filter((record) => record.request.action.kind === "run_validation")
+              .flatMap((record) => {
+                const evidence = journal.delivery.validationForOperation(
+                  run.runId,
+                  record.operationId,
+                );
+                return evidence?.fixtureAccessIds.length ? [evidence] : [];
+              });
+            for (const phase of ["pre_commit", "exact_revision"])
+              expect(
+                browserEvidence.some(
+                  (evidence) =>
+                    evidence.phase === phase &&
+                    evidence.sourceUnchanged &&
+                    evidence.environmentVerified &&
+                    evidence.outcome?.status === "succeeded" &&
+                    evidence.outcome.stdout.includes("1 passed"),
+                ),
+              ).toBe(true);
+            const firstGreen = browserEvidence.find(
+              (evidence) =>
+                evidence.outcome?.status === "succeeded" && evidence.environmentVerified,
+            )!;
+            for (const review of journal.reviews.records(run.runId))
+              if (review.turnIdentity)
+                expect(review.createdAt >= firstGreen.outcome!.endedAt).toBe(true);
+            expect(
+              journal.fixtures.validation
+                .uses(run.runId)
+                .every((use) => use.localStopped && use.remoteStopped),
+            ).toBe(true);
+            for (const path of browserFiles) {
+              expect(git("rev-parse", `${revision}:${path}`)).toBe(
+                git("rev-parse", `${baseline}:${path}`),
+              );
+              expect(git("hash-object", "--no-filters", path)).toBe(
+                git("rev-parse", `${baseline}:${path}`),
+              );
+            }
+            expect(browserDatabase!.sql("SELECT username FROM e2e_users", "browser_fixture")).toBe(
+              "fixture-user",
+            );
+          }
           const agents = journal.agents.instances(run.runId);
           expect(agents.every((agent) => agent.contract.runtime === runtime)).toBe(true);
           if (runtime === "herdr") {
@@ -284,7 +517,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
           store.close();
         }
       },
-      (deadlineMinutes + 1) * 60_000,
+      (deadlineMinutes + (scenario === "browser" ? 5 : 1)) * 60_000,
     );
   },
 );

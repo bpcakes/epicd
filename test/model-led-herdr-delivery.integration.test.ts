@@ -99,7 +99,9 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR_DELI
           // Launch an ordinary test runner, not an agent, in the explicitly returned pane.
           runnerStarted = true;
           await cli(["pane", "run", created.result.root_pane.pane_id, command]);
-          const deadline = Date.now() + 42 * 60_000;
+          const deadline =
+            Date.now() +
+            (process.env.EPICD_LIVE_DELIVERY_SCENARIO === "browser" ? 67 : 42) * 60_000;
           let nextProgress = Date.now(),
             lastProgress = "";
           while (Date.now() < deadline) {
@@ -162,7 +164,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR_DELI
           }
         }
       },
-      44 * 60_000,
+      (process.env.EPICD_LIVE_DELIVERY_SCENARIO === "browser" ? 69 : 44) * 60_000,
     );
   },
 );
