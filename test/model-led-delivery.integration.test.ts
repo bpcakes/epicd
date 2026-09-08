@@ -4,19 +4,23 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { StateStore } from "../dist/adapters/store.js";
 import { createRun, resolveExecutable } from "../dist/bootstrap.js";
-import { OrchestratorController } from "../dist/controller.js";
+import { OrchestratorController, controlledDriver } from "../dist/controller.js";
+import { receiptProject, receiptFaultDriver, RECEIPT_FILES } from "./fixtures/receipt-incident.js";
 
 const runtime = process.env.EPICD_LIVE_DELIVERY_RUNTIME ?? "sdk";
 if (runtime !== "sdk" && runtime !== "herdr")
   throw new Error("Select sdk or herdr for live delivery");
 const deadlineMinutes = runtime === "herdr" ? 40 : 20;
+const scenario = process.env.EPICD_LIVE_DELIVERY_SCENARIO ?? "plain";
+if (scenario !== "plain" && scenario !== "receipts")
+  throw new Error("Select plain or receipts for live delivery");
 
 /** Opt-in model acceptance, not a scripted strategy or a substitute for kernel regressions. */
 describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY === "1")(
   "model-led epic delivery",
   () => {
     it(
-      "delivers a real one-task Beads epic with Astra and independent exact-revision review",
+      `delivers a real one-task Beads epic with Astra and independent exact-revision review (${scenario})`,
       async () => {
         if (runtime === "herdr") {
           expect(process.env.HERDR_ENV).toBe("1");
@@ -40,9 +44,16 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
         git("config", "user.email", "acceptance@example.test");
         writeFileSync(join(source, "source.txt"), "red\n");
         writeFileSync(join(source, "expected.txt"), "green\n");
+        const receiptFiles = scenario === "receipts" ? receiptProject(source) : [];
+        const receiptBaseline = new Map(
+          receiptFiles.map((path) => [path, readFileSync(join(source, path), "utf8")]),
+        );
         writeFileSync(
           join(source, "README.md"),
-          "# Color fixture\n\nThe application output is source.txt. The required output is exactly green followed by one newline. Validate with `/usr/bin/cmp source.txt expected.txt`. No dependencies or services are required. Only source.txt needs changing; expected.txt and the validation policy must stay unchanged.\n",
+          "# Color fixture\n\nThe application output is source.txt. The required output is exactly green followed by one newline. Validate with `/usr/bin/cmp source.txt expected.txt`. No dependencies or services are required. Only source.txt needs changing; expected.txt and the validation policy must stay unchanged.\n" +
+            (scenario === "receipts"
+              ? "\nValidation helpers are documented in VALIDATION.md. Preserve the helper, documentation and both tracked receipt logs.\n"
+              : ""),
         );
         const policy = {
           schemaVersion: 1,
@@ -61,6 +72,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
         const policyBytes = `${JSON.stringify(policy, null, 2)}\n`;
         writeFileSync(join(source, ".epicd/policy.json"), policyBytes);
         git("add", "source.txt", "expected.txt", "README.md", ".epicd/policy.json");
+        if (receiptFiles.length) git("add", ...receiptFiles);
         git("commit", "-qm", "Initial red fixture");
         const baseline = git("rev-parse", "HEAD");
         const trackerExecutable = await resolveExecutable(process.env.EPICD_TEST_BR_PATH ?? "br");
@@ -135,7 +147,23 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
               `Live delivery: ${control.status}, decisions ${control.decisionsUsed}; ${actions.map((action) => `${action.request.action.kind}:${action.status}`).join(", ")}\n`,
             );
           }, 30_000);
-          const result = await new OrchestratorController(store, run.runId).run(abort.signal);
+          let receiptIncident: ReturnType<typeof receiptFaultDriver> | null = null;
+          const result = await new OrchestratorController(
+            store,
+            run.runId,
+            scenario === "receipts"
+              ? {
+                  driver: (currentStore, state) => {
+                    receiptIncident = receiptFaultDriver(
+                      currentStore.orchestration,
+                      controlledDriver(currentStore, state),
+                      state.runtimeConfiguration!.workspaceRoot,
+                    );
+                    return receiptIncident.driver;
+                  },
+                }
+              : {},
+          ).run(abort.signal);
           expect(result.control.status, JSON.stringify(result.escalation)).toBe("complete");
           expect(result.repositoryAdmission).toMatchObject({ phase: "released", ioStopped: true });
           const revision = git("rev-parse", `refs/heads/epicd/${run.runId}`);
@@ -165,6 +193,46 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
               "closed",
             );
           const journal = store.orchestration;
+          if (scenario === "receipts") {
+            // Read via a function because the driver factory runs inside the controller.
+            const injected = (): ReturnType<typeof receiptFaultDriver> | null => receiptIncident;
+            const fault = injected()?.fault;
+            expect(fault, "The receipt incident must actually occur").toBeTruthy();
+            if (!fault) throw new Error("Receipt fault never ran");
+            const failedReview = journal.reviews
+              .records(run.runId)
+              .find((review) => review.workspaceId === fault.identity.workspaceId);
+            expect(failedReview).toBeDefined();
+            const failedEvidence = journal.reviews.evidence(run.runId, failedReview!.evidenceId);
+            expect(failedEvidence).toMatchObject({
+              status: "finished",
+              sourceIntact: false,
+              report: null,
+            });
+            expect(journal.agents.turn(run.runId, fault.identity).resultEligible).toBe(false);
+            for (const delta of fault.deltas)
+              expect(readFileSync(join(fault.workspacePath, delta.path), "utf8")).toBe(delta.after);
+            for (const [path, bytes] of receiptBaseline) {
+              expect(
+                execFileSync("git", ["-C", source, "show", `${revision}:${path}`], {
+                  encoding: "utf8",
+                }),
+              ).toBe(bytes);
+              expect(readFileSync(join(source, path), "utf8")).toBe(bytes);
+            }
+            expect(
+              journal
+                .actions(run.runId)
+                .some(
+                  (action) =>
+                    action.request.action.kind === "inspect_repo" &&
+                    action.request.action.workspaceId === fault.identity.workspaceId &&
+                    action.status === "succeeded",
+                ),
+            ).toBe(true);
+            const retained = journal.diagnostics.read(run.runId, fault.artifactId, 0, 65536);
+            for (const path of RECEIPT_FILES) expect(retained.text).toContain(path);
+          }
           const turns = journal.agents.turns(run.runId);
           const agents = journal.agents.instances(run.runId);
           expect(agents.every((agent) => agent.contract.runtime === runtime)).toBe(true);

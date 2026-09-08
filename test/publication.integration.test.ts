@@ -113,9 +113,46 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     expect(s.journal.publications.records(s.authority.runId)).toEqual([]);
   }, 15000);
 
-  it("blocks evidence-changing actions during publication while inspection and messages remain available", async () => {
+  it("allows immutable coordinator rollover during publication but excludes worker mutations", async () => {
     const s = await fixture();
     const { candidate, commit } = await verified(s);
+    const version = () => s.journal.control(s.authority.runId).controlVersion;
+    const reserveCoordinator = (workspace: Awaited<ReturnType<typeof s.manager.create>>) =>
+      s.journal.agents.reserveAgent(
+        s.authority,
+        {
+          ...target(workspace),
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          instructions: "Continue observing delivery while publication settles",
+          confinementProfile: "fixture-only",
+          contract: {
+            ...s.writer.contract,
+            requested: { model: "gpt-6-astra", reasoningEffort: "high" },
+            effective: { model: "gpt-6-astra", reasoningEffort: "high" },
+          },
+        },
+        version(),
+      );
+    const previous = reserveCoordinator(
+      await s.manager.create(s.authority, s.source, s.head, "coordinator"),
+    );
+    // Pre-existing reservations must not bypass the publication admission fence.
+    const reservations = (["implementation", "coordinator"] as const).map((purpose) =>
+      s.journal.agents.reserveWorkspace(
+        s.authority,
+        {
+          root: join(s.root, "managed"),
+          purpose,
+          sourceMode: "mutable",
+          baselineRevision: s.head,
+        },
+        version(),
+      ),
+    );
+    const userIndex = readFileSync(join(s.source, ".git/index"));
     let release!: () => void;
     let entered = false;
     const gate = new Promise<void>((resolve) => {
@@ -135,6 +172,53 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
         s.publication.publish(s.authority, pending.publicationId, new AbortController().signal),
       ).rejects.toThrow("write-once");
       expect(s.journal.publications.pending(s.authority.runId)?.ioStopped).toBe(false);
+      s.journal.agents.retireStoppedAgent(s.authority, previous, "Bounded context rollover");
+      const workspace = await s.manager.create(s.authority, s.source, s.head, "coordinator");
+      expect(workspace).toMatchObject({
+        purpose: "coordinator",
+        sourceMode: "immutable",
+        status: "ready",
+        baselineRevision: s.head,
+      });
+      expect(git(workspace.path, "rev-parse", "HEAD")).toBe(s.head);
+      const coordinator = reserveCoordinator(workspace);
+      const turn = s.journal.agents.prepareTurn(
+        s.authority,
+        coordinator,
+        randomUUID(),
+        "Inspect publication progress",
+        {},
+        version(),
+      );
+      // Admission proof only: no provider is launched by this regression.
+      expect(s.journal.agents.cancelPreparedTurn(s.authority, turn.identity)).toMatchObject({
+        status: "cancelled",
+        stopEvidence: expect.any(String),
+      });
+      expect(s.journal.publications.pending(s.authority.runId)).toMatchObject({
+        publicationId: pending.publicationId,
+        ioStopped: false,
+      });
+      for (const reserved of reservations) {
+        expect(() =>
+          s.journal.agents.reserveWorkspace(
+            s.authority,
+            {
+              root: join(s.root, "managed"),
+              purpose: reserved.purpose,
+              sourceMode: reserved.sourceMode,
+              baselineRevision: s.head,
+            },
+            version(),
+          ),
+        ).toThrow("Publication excludes new worker workspaces");
+        expect(() =>
+          s.journal.agents.beginWorkspaceOperation(s.authority, reserved, "materialize", version()),
+        ).toThrow("Publication excludes other workspace mutations");
+      }
+      expect(() =>
+        s.journal.agents.beginWorkspaceOperation(s.authority, workspace, "capture", version()),
+      ).toThrow("Publication excludes other workspace mutations");
       const planId = s.journal.delivery.candidate(s.authority.runId, candidate).validationPlanId;
       expect(
         await s.dispatch({
@@ -173,8 +257,15 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
       ).toThrow("Publication excludes new worker turns");
     } finally {
       release();
+      // Settle owned publication I/O before fixture cleanup even when an assertion fails.
+      await operation;
     }
     expect((await operation).status).toBe("succeeded");
+    expect(git(s.source, "rev-parse", `refs/heads/epicd/${s.authority.runId}`)).toBe(
+      commit.revision,
+    );
+    expect(git(s.source, "rev-parse", "HEAD")).toBe(s.head);
+    expect(readFileSync(join(s.source, ".git/index"))).toEqual(userIndex);
   }, 20000);
 
   it("recognizes a lost Git result after confirmed I/O stop without a second publication write", async () => {

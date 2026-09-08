@@ -214,6 +214,7 @@ export class AgentJournal {
       const publication = this.access.publicationPending(authority.runId);
       if (
         publication &&
+        !(input.purpose === "coordinator" && input.sourceMode === "immutable") &&
         !(
           input.purpose === "delivery" &&
           input.creationOperationId ===
@@ -337,6 +338,11 @@ export class AgentJournal {
       if (
         publication &&
         kind !== "inspect_materialization" &&
+        !(
+          workspace.purpose === "coordinator" &&
+          workspace.sourceMode === "immutable" &&
+          kind === "materialize"
+        ) &&
         !(
           workspace.purpose === "delivery" &&
           workspace.creationOperationId ===

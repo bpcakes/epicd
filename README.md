@@ -291,6 +291,10 @@ The native run allows 40 minutes. The harness retains its printed `/var/tmp/epic
 
 The 2026-09-08 native acceptance passed in 26½ minutes: 72 decisions, ten Astra/high conversations, three approved independent reviews, task/epic closure and final tracker publication. All 60 turns had stop evidence; 58 had actual native endpoints and two were cancelled with never-started receipts. The run exercised two byte-bounded observation pages and preserved the original checkout, index, README and concurrent source edits. This live run preceded the subsequent large-action preview hardening; its exact evidence and follow-up verification are recorded in the plan. Receipt/browser recovery scenarios and the remaining resource/authority release audit are still open.
 
+Set `EPICD_LIVE_DELIVERY_SCENARIO=receipts` before either live delivery command to exercise receipt contamination recovery. The test appends two receipts to a stopped private review copy, explicitly labeled as host-test fault injection. It requires model-chosen inspection, fresh independent exact-revision evidence, completed delivery and preserved user work; it does not demonstrate an immutable reviewer writing, active-turn intervention or knowledge reuse on a second task. Terminal results and remaining incident requirements are recorded in the plan.
+
+The SDK receipt case passed on 2026-09-08 in 17½ minutes: 90 decisions, twelve Astra/high conversations, preserved contaminated evidence, three subsequent independent approvals and completed delivery. All 79 turns stopped. This incident has not yet passed through native Herdr; the earlier native plain-delivery result does not substitute for it.
+
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 
 ```bash

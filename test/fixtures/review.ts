@@ -93,6 +93,7 @@ export async function fixture(
   required = check,
   format: "sha1" | "sha256" = "sha1",
   tracker?: ReviewTrackerSetup,
+  initializeSource?: (source: string) => void,
 ) {
   const root = mkdtempSync("/var/tmp/epicd-review-");
   const source = join(root, "source");
@@ -101,6 +102,7 @@ export async function fixture(
   git(source, "config", "user.name", "Fixture");
   git(source, "config", "user.email", "fixture@example.test");
   writeFileSync(join(source, "app.txt"), "red\n");
+  initializeSource?.(source);
   const trackedTask = tracker
     ? await tracker.initialize(source)
     : { epicId: "demo", taskId: "demo.1" };

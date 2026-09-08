@@ -101,7 +101,7 @@ export class WorkspaceManager {
     if (workspace.status !== "reserved" && workspace.status !== "ready") return "incomplete";
     return this.exclusive(authority, workspace, "inspect_materialization", async () => {
       try {
-        await this.owned(authority, identity, true);
+        await this.owned(authority, identity, "reserved");
         const git = new KernelGit(workspace.path);
         await this.assertPrivateGit(git, signal);
         if (
@@ -758,7 +758,7 @@ export class WorkspaceManager {
     authority: ControllerAuthority,
     identity: WorkspaceIdentity,
   ): Promise<WorkspaceRecord> {
-    return this.owned(authority, identity);
+    return this.owned(authority, identity, "diagnostic");
   }
 
   async inspectionTree(
@@ -846,12 +846,12 @@ export class WorkspaceManager {
     signal: AbortSignal,
     body: (git: KernelGit, workspace: WorkspaceRecord) => Promise<T>,
   ): Promise<T> {
-    const workspace = await this.owned(authority, identity);
+    const workspace = await this.owned(authority, identity, "diagnostic");
     const git = new KernelGit(workspace.path);
     await this.assertPrivateGit(git, signal);
     const result = await body(git, workspace);
     await this.assertPrivateGit(git, signal);
-    await this.owned(authority, identity);
+    await this.owned(authority, identity, "diagnostic");
     signal.throwIfAborted();
     return result;
   }
@@ -1287,7 +1287,7 @@ export class WorkspaceManager {
   private async owned(
     authority: ControllerAuthority,
     identity: WorkspaceIdentity,
-    allowReserved = false,
+    access: "ready" | "reserved" | "diagnostic" = "ready",
   ): Promise<WorkspaceRecord> {
     this.journal.assertAuthority(authority);
     const workspace = this.journal.agents.workspace(authority.runId, identity);
@@ -1297,11 +1297,35 @@ export class WorkspaceManager {
         "workspace_path_changed",
         "Managed workspace path changed; preserve it",
       );
-    if (!(workspace.status === "ready" || (allowReserved && workspace.status === "reserved")))
+    if (!(
+      workspace.status === "ready" ||
+      (access === "reserved" && workspace.status === "reserved") ||
+      (access === "diagnostic" && workspace.status === "quarantined")
+    ))
       throw new WorkspaceError(
         "workspace_unavailable",
         "Workspace is not ready for this operation",
       );
+    if (workspace.status === "quarantined") {
+      // Read-only diagnosis does not release quarantine or prove ownership of
+      // unexpected changes. Unknown old turns/I/O must be reconciled first.
+      this.assertStopped(workspace);
+      if (
+        this.journal.agents.activeWorkspaceOperation(authority.runId, workspace) ||
+        this.journal.agents
+          .turns(authority.runId)
+          .some(
+            (turn) =>
+              turn.identity.workspaceId === workspace.workspaceId &&
+              turn.identity.workspaceGeneration === workspace.workspaceGeneration &&
+              !turn.stopEvidence,
+          )
+      )
+        throw new WorkspaceError(
+          "quarantine_unsettled",
+          "Reconcile old turn and workspace I/O stop before inspecting this quarantined copy",
+        );
+    }
     this.journal.assertAuthority(authority);
     return workspace;
   }

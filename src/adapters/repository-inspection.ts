@@ -236,10 +236,11 @@ export async function inspectRepository(
       path,
       workspaceId: workspace.workspaceId,
       workspaceGeneration: workspace.workspaceGeneration,
+      workspaceStatus: workspace.status,
       baselineRevision: workspace.baselineRevision,
       observedAt: new Date().toISOString(),
       evidenceWarning:
-        "Diagnostic observation, not validation or approval. Concurrent source changes and later pages may differ. History is anchored to the registered baseline, not mutable HEAD.",
+        "Diagnostic observation, not validation or approval. Quarantined copies stay ineligible; reading a delta does not establish its writer or authorize restoration. Concurrent source changes and later pages may differ. History is anchored to the registered baseline, not mutable HEAD.",
       offsetUnit: request.operation === "read" ? "redacted_utf16_characters" : "rows",
       offset: request.offset,
       rows,

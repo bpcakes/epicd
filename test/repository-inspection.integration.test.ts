@@ -168,6 +168,80 @@ async function fixture(format: "sha1" | "sha256" = "sha1") {
 }
 
 describe.skipIf(process.platform !== "linux")("kernel repository inspection", () => {
+  function reserveReader(s: Awaited<ReturnType<typeof fixture>>) {
+    const settings = { model: "worker", reasoningEffort: "high" as const };
+    return s.journal.agents.reserveAgent(
+      s.authority,
+      {
+        ...s.workspace,
+        role: "implementation",
+        purpose: "implementation",
+        taskId: "demo.1",
+        candidateId: null,
+        instructions: "Inspect the repository",
+        confinementProfile: "test",
+        contract: SdkAgentSessionContractSchema.parse({
+          runtime: "sdk",
+          requested: settings,
+          effective: settings,
+        }),
+      },
+      s.journal.control(s.authority.runId).controlVersion,
+    );
+  }
+
+  it("reads and diffs a stopped quarantined copy without reopening it for work", async () => {
+    const s = await fixture(),
+      agent = reserveReader(s);
+    writeFileSync(join(s.workspace.path, "app.txt"), "unknown-writer delta\n");
+    s.journal.agents.revokeAgent(s.authority, agent, "Unexpected source mutation");
+    expect((await s.inspect({ path: "app.txt" })).rows).toEqual([
+      { text: "unknown-writer delta\n" },
+    ]);
+    const diff = await s.inspect({ operation: "diff", path: "." });
+    expect(diff.workspaceStatus).toBe("quarantined");
+    expect(diff.rows.map((row: { path: string }) => row.path)).toEqual(["app.txt"]);
+    expect(diff.evidenceWarning).toContain("does not establish its writer");
+    expect((await s.inspect({ operation: "history", path: ".", limit: 1 })).rows[0].text).toContain(
+      s.revision,
+    );
+    expect(s.journal.agents.workspace(s.authority.runId, s.workspace).status).toBe("quarantined");
+    expect(() => reserveReader(s)).toThrow("Agent needs a ready, unoccupied workspace");
+    await expect(s.manager.read(s.authority, s.workspace, "app.txt", 0, 100)).rejects.toThrow(
+      "Workspace is not ready",
+    );
+    expect(readFileSync(join(s.workspace.path, "app.txt"), "utf8")).toBe("unknown-writer delta\n");
+  });
+
+  it.each(["turn", "io"] as const)(
+    "refuses quarantined inspection while old %s stop remains unconfirmed",
+    async (kind) => {
+      const s = await fixture(),
+        agent = reserveReader(s);
+      if (kind === "turn")
+        s.journal.agents.prepareTurn(
+          s.authority,
+          agent,
+          randomUUID(),
+          "Unsettled turn",
+          {},
+          s.journal.control(s.authority.runId).controlVersion,
+        );
+      else
+        s.journal.agents.beginWorkspaceOperation(
+          s.authority,
+          s.workspace,
+          "capture",
+          s.journal.control(s.authority.runId).controlVersion,
+        );
+      s.journal.agents.revokeAgent(s.authority, agent, "Unsettled old work");
+      const open = vi.spyOn(InspectionFiles, "open");
+      expect((await s.dispatch(s.action())).result.status).toBe("rejected");
+      expect(open).not.toHaveBeenCalled();
+      expect(s.journal.agents.workspace(s.authority.runId, s.workspace).status).toBe("quarantined");
+    },
+  );
+
   it("reads E2E instructions during a writer turn without manufacturing evidence or changing user Git", async () => {
     const s = await fixture();
     const index = readFileSync(join(s.source, ".git/index"));
