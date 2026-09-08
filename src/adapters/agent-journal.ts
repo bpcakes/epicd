@@ -603,7 +603,7 @@ export class AgentJournal {
     });
   }
 
-  /** Bind once before the fixed validation worker may execute any repository or service I/O. */
+  /** Bind once before a fixed workspace worker may execute repository or service I/O. */
   bindWorkspaceExecution(
     authority: ControllerAuthority,
     operationId: string,
@@ -614,7 +614,7 @@ export class AgentJournal {
       const operation = this.workspaceOperation(authority.runId, operationId);
       const execution = CommandLifetimeSchema.parse(input);
       if (
-        operation.kind !== "validation" ||
+        !["validation", "commit"].includes(operation.kind) ||
         operation.controllerLeaseId !== authority.leaseId ||
         operation.stopEvidence ||
         operation.execution ||
@@ -626,7 +626,7 @@ export class AgentJournal {
       )
         throw new AgentCoordinationError(
           "workspace_execution_conflict",
-          "Workspace execution requires its original unused validation operation",
+          "Workspace execution requires its original unused validation or commit operation",
         );
       operation.execution = execution;
       this.db

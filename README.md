@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 38. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 39. Use a fresh state path; unsupported existing data is left intact.
 
 Persisted ownership fields must be explicit: missing workspace creation bindings, turn launches, native endpoint bindings or decision-attempt turn identities are invalid, not implicitly `null`. Reading incomplete records does not repair them or release their resources.
 
@@ -63,11 +63,17 @@ A retained result can settle its historical acknowledgement; current review and 
 
 An interrupted `interrupt_action` acknowledgment can be settled as failed by `reconcile_action` or current-format restart recovery. The signal may already have been sent. Recovery never sends it again, changes the target's result, or clears its resource exclusions; the original target still needs its own outcome and stop evidence.
 
-This works through the shared kernel for both SDK and native Herdr runtimes. It is current-format restart recovery, not migration support. Abandoned controller I/O for these delivery actions and retained-resource cleanup remain unfinished; repository ownership has the separate recovery boundary below.
+This works through the shared kernel for both SDK and native Herdr runtimes. It is current-format restart recovery, not migration support. Some abandoned controller I/O and retained-resource cleanup remain unfinished; repository ownership has the separate recovery boundary below.
+
+Private application commit construction now has one independently supervised lifetime covering source preflight, tree/object construction and its private retention-ref write. The kernel binds a one-use launch before dispatch. Controller loss interrupts the worker's process namespace; recovery either reads its exact stop receipt or fences an unused launch gate. A missing receipt keeps the source excluded even if the expected Git ref exists. Recovery never repeats the writer. Only subsequent physical inspection can establish the retained commit and unchanged source; exact-revision validation, independent review and publication remain separate requirements.
+
+This boundary uses the existing format-39 workspace execution record in both runtimes. It does not supervise tracker-commit construction, capture, workspace materialization or the later read-only commit inspection. A crash before writer binding or during that inspection can still require unresolved-I/O intervention. No receipt or absent PID is substituted for those operations' own stop proof.
 
 ### Recoverable workspace disposal
 
 `dispose_workspace` retires a stopped independent review, verification or diagnostic copy and moves its complete directory into run-private `.disposed` storage. Already-retired coordinator copies can also be disposed. Implementation and delivery repositories remain protected object sources. Every exact turn and launch must have confirmed stop, workspace I/O must be settled, and pending instructions must be resolved first. A native `not_started` receipt does not prove that its host shell stopped, so that case is refused. No Herdr pane, tab or session is closed.
+
+Herdr 0.8.2/protocol 20 exposes pane/tab closure by ID without an atomic expected-terminal/process guard. Automatic endpoint cleanup remains unavailable: inspecting a terminal and then closing its ID would leave a reuse race with user-owned work.
 
 The original workspace identity can never be reused. All contents—including ignored files, receipts and symlinks—remain recoverable; this is not permanent disk reclamation. `inspect_workspace` reports the retained location and disposal outcome. `inspect_repo` resolves the original retained copy by identity and keeps its usual redaction and read-only limits. Historical approval survives healthy retirement; later evidence revocation cannot reactivate a retired workspace. Retention is not new validation evidence.
 

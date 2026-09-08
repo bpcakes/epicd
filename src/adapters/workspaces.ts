@@ -29,6 +29,7 @@ import { digestJson } from "../domain/repository-policy.js";
 import { assertWorkspaceDirectory, retainedWorkspacePath } from "./workspace-disposal-files.js";
 import type { CommitRecord } from "../domain/commits.js";
 import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
+import { runCommitIO } from "./commit-io.js";
 
 const FILE_LIMIT = 64 * 1024 * 1024;
 const CHECKOUT_LIMIT = 512 * 1024 * 1024;
@@ -358,69 +359,76 @@ export class WorkspaceManager {
     input: CommitRecord,
     signal?: AbortSignal,
   ): Promise<void> {
+    await runCommitIO(this.journal, this, authority, input, signal);
+  }
+
+  /** Fixed supervised worker only. Its host supervisor, not this process, proves final stop. */
+  async executeCandidateCommit(
+    authority: ControllerAuthority,
+    input: CommitRecord,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const record = this.journal.commits.assertWritable(authority, input.commitId);
-    let succeeded = false;
-    try {
-      const workspace = await this.owned(authority, record);
-      this.assertStopped(workspace);
-      const git = new KernelGit(workspace.path);
-      await this.assertPrivateGit(git, signal);
-      const snapshot = this.journal.delivery.candidate(authority.runId, record).snapshot!;
-      if (
-        (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() !==
-        record.parentRevision
-      )
-        throw new WorkspaceError(
-          "commit_parent_changed",
-          "Commit source no longer has the approved parent",
-        );
-      const files = await this.scan(git, record.parentRevision, signal);
-      if (digestJson(files.map((file) => file.entry)) !== record.fingerprint)
-        throw new WorkspaceError(
-          "commit_source_changed",
-          "Commit source differs from the independent approval",
-        );
-      await this.assertProtectedTracker(git, record.parentRevision, files, signal);
-      // A separate, kernel-built index ignores arbitrary existing staging.
-      const tree = await this.writeTree(git, snapshot.manifest, signal);
-      if (tree !== record.fullTree)
-        throw new WorkspaceError(
-          "commit_tree_changed",
-          "Temporary index differs from the approved tree",
-        );
-      const revision = (
-        await git.text(["hash-object", "-t", "commit", "--stdin"], {
-          input: record.objectContent,
-          ...optionalSignal(signal),
-        })
-      ).trim();
-      this.journal.commits.prepareWrite(authority, record.commitId, revision);
-      this.journal.commits.assertWritable(authority, record.commitId);
-      const written = (
-        await git.text(["hash-object", "-w", "-t", "commit", "--stdin"], {
-          input: record.objectContent,
-          ...optionalSignal(signal),
-        })
-      ).trim();
-      if (written !== revision)
-        throw new WorkspaceError(
-          "commit_object_changed",
-          "Stored commit differs from its persisted write intent",
-        );
-      this.journal.commits.assertWritable(authority, record.commitId);
-      await git.text(
-        ["update-ref", `refs/epicd/commits/${record.commitId}`, revision, ""],
-        optionalSignal(signal),
+    const operation = this.journal.agents.workspaceOperation(
+      authority.runId,
+      record.workspaceOperationId,
+    );
+    if (!operation.execution || operation.executionStop)
+      throw new WorkspaceError(
+        "commit_worker_unbound",
+        "Commit construction requires its live supervised execution",
       );
-      succeeded = true;
-    } finally {
-      this.journal.agents.finishWorkspaceOperation(
-        authority,
-        record.workspaceOperationId,
-        succeeded ? "succeeded" : "failed",
-        "Trusted commit adapter awaited every Git process and filesystem operation",
+    const workspace = await this.owned(authority, record);
+    this.assertStopped(workspace);
+    const git = new KernelGit(workspace.path);
+    await this.assertPrivateGit(git, signal);
+    const snapshot = this.journal.delivery.candidate(authority.runId, record).snapshot!;
+    if (
+      (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() !==
+      record.parentRevision
+    )
+      throw new WorkspaceError(
+        "commit_parent_changed",
+        "Commit source no longer has the approved parent",
       );
-    }
+    const files = await this.scan(git, record.parentRevision, signal);
+    if (digestJson(files.map((file) => file.entry)) !== record.fingerprint)
+      throw new WorkspaceError(
+        "commit_source_changed",
+        "Commit source differs from the independent approval",
+      );
+    await this.assertProtectedTracker(git, record.parentRevision, files, signal);
+    // A separate, kernel-built index ignores arbitrary existing staging.
+    const tree = await this.writeTree(git, snapshot.manifest, signal);
+    if (tree !== record.fullTree)
+      throw new WorkspaceError(
+        "commit_tree_changed",
+        "Temporary index differs from the approved tree",
+      );
+    const revision = (
+      await git.text(["hash-object", "-t", "commit", "--stdin"], {
+        input: record.objectContent,
+        ...optionalSignal(signal),
+      })
+    ).trim();
+    this.journal.commits.prepareWrite(authority, record.commitId, revision);
+    this.journal.commits.assertWritable(authority, record.commitId);
+    const written = (
+      await git.text(["hash-object", "-w", "-t", "commit", "--stdin"], {
+        input: record.objectContent,
+        ...optionalSignal(signal),
+      })
+    ).trim();
+    if (written !== revision)
+      throw new WorkspaceError(
+        "commit_object_changed",
+        "Stored commit differs from its persisted write intent",
+      );
+    this.journal.commits.assertWritable(authority, record.commitId);
+    await git.text(
+      ["update-ref", `refs/epicd/commits/${record.commitId}`, revision, ""],
+      optionalSignal(signal),
+    );
   }
 
   /** Derive a tracker-only tree from committed custody, without touching any checkout or index. */

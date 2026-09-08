@@ -6,6 +6,7 @@ import { KernelGitError } from "../adapters/kernel-git.js";
 import { DeliveryError } from "../adapters/delivery-journal.js";
 import { OperationFailed } from "./guards.js";
 import { registerTrackerCommitCapabilities } from "./tracker-commits.js";
+import { reconcileCommitIO } from "../adapters/commit-io.js";
 
 export function registerCommitCapabilities(kernel: ActionKernel, workspaces: WorkspaceManager) {
   const journal = kernel.journal;
@@ -92,6 +93,7 @@ export async function reconcileCommit(
   journal.assertAuthority(authority);
   const record = journal.commits.record(authority.runId, commitId);
   if (["created", "failed"].includes(record.status)) return record;
+  await reconcileCommitIO(journal, authority, commitId);
   const observed = await workspaces.inspectCandidateCommit(authority, record, signal);
   return journal.commits.finish(
     authority,

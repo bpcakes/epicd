@@ -1,10 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
-import { KernelGit } from "../src/adapters/kernel-git.js";
 import { reconcileCommit } from "../src/kernel/commits.js";
 import type { CandidateIdentity } from "../src/domain/delivery.js";
 import { fixture, check, finding, git, resource, success, target } from "./fixtures/review.js";
@@ -245,24 +244,21 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
     const s = await fixture();
     const { candidate } = await approved(s);
     const run = s.authority.runId;
-    const original = KernelGit.prototype.text;
-    const fault = vi.spyOn(KernelGit.prototype, "text").mockImplementation(async function (
-      this: KernelGit,
-      args,
-      options,
-    ) {
-      if (args[0] === "update-ref" && args[1]?.startsWith("refs/epicd/commits/"))
-        throw new Error("Injected failure before ref write");
-      return original.call(this, args, options);
-    });
-    try {
-      expect(
-        (await s.dispatch({ kind: "request_commit", ...candidate, subject: "Unretained object" }))
-          .status,
-      ).toBe("indeterminate");
-    } finally {
-      fault.mockRestore();
-    }
+    const write = s.manager.writeCandidateCommit.bind(s.manager);
+    s.manager.writeCandidateCommit = async (authority, intent, signal) => {
+      // A parent-process Git mock cannot affect the isolated writer. Hold the
+      // exact private ref lock so the real Git process fails after object write.
+      const directory = join(s.workspace.path, ".git/refs/epicd/commits");
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, `${intent.commitId}.lock`), "fixture-owned lock\n", {
+        flag: "wx",
+      });
+      await write(authority, intent, signal);
+    };
+    expect(
+      (await s.dispatch({ kind: "request_commit", ...candidate, subject: "Unretained object" }))
+        .status,
+    ).toBe("failed");
     const pending = s.journal.commits.records(run)[0]!;
     const settled = await reconcileCommit(s.journal, s.manager, s.authority, pending.commitId);
     expect(settled).toMatchObject({
@@ -272,6 +268,13 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
     });
     expect(settled.failure).toContain("retention ref was not installed");
     expect(git(s.workspace.path, "cat-file", "-t", pending.revision!)).toBe("commit");
+    expect(
+      readFileSync(
+        join(s.workspace.path, `.git/refs/epicd/commits/${pending.commitId}.lock`),
+        "utf8",
+      ),
+    ).toBe("fixture-owned lock\n");
+    expect(git(s.workspace.path, "for-each-ref", "refs/epicd/commits/")).toBe("");
     expect(
       await s.dispatch({
         kind: "create_review_workspace",
