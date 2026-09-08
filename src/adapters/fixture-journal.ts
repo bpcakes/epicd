@@ -62,6 +62,7 @@ export class FixtureJournal {
       policy(runId: string): RepositoryPolicy;
       transaction<T>(authority: ControllerAuthority, body: () => T): T;
       action(runId: string, actionId: string): ActionRecord | null;
+      actionForOperation(runId: string, operationId: string): ActionRecord | null;
       operatorTransaction<T>(runId: string, version: number, body: () => T): T;
       note(runId: string, kind: string, message: string): void;
     },

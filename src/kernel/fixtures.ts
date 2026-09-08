@@ -31,8 +31,16 @@ export function registerFixtureCapabilities(
   });
   kernel.registerExternal("reconcile_fixture_access", async ({ authority, signal }, action) => {
     try {
-      const fixtures = journal.fixtures.validation,
-        use = fixtures.use(authority.runId, action.accessId);
+      const fixtures = journal.fixtures.validation;
+      let use = fixtures.use(authority.runId, action.accessId);
+      if (use.status === "reserved") {
+        if (kernel.operation(use.operationId))
+          throw new CapabilityRejected(
+            "fixture_access_action_live",
+            "The original validation is still executing; interrupt and await its exact operation before reconciling",
+          );
+        use = fixtures.noDispatch(authority, use.accessId);
+      }
       if (!use.localStopped)
         throw new CapabilityRejected(
           "fixture_access_local_unknown",

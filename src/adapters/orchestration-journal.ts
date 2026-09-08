@@ -234,6 +234,7 @@ export class OrchestrationJournal {
     this.fixtures = new FixtureJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
       action: (runId, actionId) => this.action(runId, actionId),
+      actionForOperation: (runId, operationId) => this.actionForOperation(runId, operationId),
       control: (runId) => this.control(runId),
       policy: (runId) => this.policy(runId),
       operatorTransaction: (runId, version, body) =>

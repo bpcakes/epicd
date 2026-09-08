@@ -41,6 +41,7 @@ type Access = {
   transaction<T>(authority: ControllerAuthority, body: () => T): T;
   operatorTransaction<T>(runId: string, version: number, body: () => T): T;
   action(runId: string, actionId: string): ActionRecord | null;
+  actionForOperation(runId: string, operationId: string): ActionRecord | null;
   definition(runId: string, fixtureId: string): FixtureDefinition;
   creations(runId: string): FixtureCreation[];
   note(runId: string, kind: string, message: string): void;
@@ -357,6 +358,64 @@ export class FixtureValidationJournal {
         "fixture.validation_dispatched",
         `${accessId}: admitted fixed fixture transport`,
       );
+    });
+  }
+  /** Close an unused SQL gate, not the interrupted validation or its workspace I/O. */
+  noDispatch(authority: ControllerAuthority, accessId: string): FixtureValidationUse {
+    return this.access.transaction(authority, () => {
+      const use = this.use(authority.runId, accessId);
+      if (use.status !== "reserved")
+        fail(
+          "fixture_access_dispatch_uncertain",
+          "Only an unused fixture SQL dispatch gate can be closed without transport stop evidence",
+        );
+      const parent = this.access.actionForOperation(authority.runId, use.operationId);
+      if (parent && ["accepted", "running"].includes(parent.status))
+        fail(
+          "fixture_access_action_live",
+          "Interrupt the parent validation before reconciling its unused SQL gate",
+        );
+      const row = this.db
+        .prepare("SELECT record_json FROM validation_evidence WHERE run_id=? AND evidence_id=?")
+        .get(authority.runId, use.evidenceId) as { record_json: string } | undefined;
+      const parsed = ValidationEvidenceSchema.safeParse(row ? JSON.parse(row.record_json) : null);
+      const evidence = parsed.success ? parsed.data : null;
+      if (
+        !parent ||
+        !["run_validation", "run_diagnostic_check"].includes(parent.request.action.kind) ||
+        !evidence ||
+        evidence.runId !== use.runId ||
+        evidence.evidenceId !== use.evidenceId ||
+        evidence.operationId !== use.operationId ||
+        evidence.controllerLeaseId !== use.controllerLeaseId ||
+        !evidence.fixtureAccessIds.includes(accessId) ||
+        evidence.policyDigest !== use.policyDigest ||
+        parent.policyDigest !== use.policyDigest ||
+        !this.provenanceMatches(use)
+      )
+        fail(
+          "fixture_access_provenance_changed",
+          "Unused SQL access must retain its exact validation, action, grant and fixture provenance",
+        );
+      // Dispatch and this closure use the same immediate transaction. A delayed
+      // preflight or beforeSpawn callback cannot reopen the one-use gate, even
+      // when its original controller lease is still current. No fresh SQL grant
+      // is needed: this records non-dispatch and never observes the database.
+      const closed = FixtureValidationUseSchema.parse({
+        ...use,
+        status: "not_started",
+        localStopped: true,
+        remoteStopped: true,
+        detail:
+          "Unused SQL dispatch gate closed; no repository SQL transport was dispatched. Parent validation outcome and workspace I/O stop remain unverified by this closure.",
+      });
+      this.save(closed);
+      this.access.note(
+        use.runId,
+        "fixture.validation_not_started",
+        `${accessId}: ${closed.detail}`,
+      );
+      return closed;
     });
   }
   localStopped(authority: ControllerAuthority, accessId: string): void {

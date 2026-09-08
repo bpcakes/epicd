@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   bindFixtureExecutable,
   bindFixtureProvider,
@@ -19,9 +20,11 @@ import {
   RequiredCheckSchema,
   ValidationServiceSchema,
 } from "../src/domain/repository-policy.js";
-import { fixture, success, target } from "./fixtures/review.js";
+import { fixture, success, target, waitFor } from "./fixtures/review.js";
 import { startFixturePostgreSql } from "./fixtures/postgresql-fixture.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
+import type { OrchestrationJournal } from "../src/adapters/orchestration-journal.js";
+import type { ControllerAuthority } from "../src/domain/orchestration.js";
 
 const bin = process.env.EPICD_TEST_PG_BINDIR;
 const broker = process.env.EPICD_TEST_PGBOUNCER;
@@ -181,9 +184,307 @@ async function setup(
   }
 }
 
+/** Stop at the real durable reservation boundary; no repository command is launched. */
+function reserveOnly(f: Awaited<ReturnType<typeof setup>>) {
+  const { journal, authority } = f.s;
+  const admitted = journal.acceptAction(authority, f.s.decision(f.action));
+  if (admitted.kind !== "accepted") throw new Error("Expected validation admission");
+  const parent = journal.startAction(authority, admitted.action.actionId);
+  const evidence = journal.delivery.beginValidation(authority, parent.actionId);
+  const use = journal.fixtures.validation.use(authority.runId, evidence.fixtureAccessIds[0]!);
+  expect(use.status).toBe("reserved");
+  return { parent, evidence, use };
+}
+
+function accessRecovery(journal: OrchestrationJournal, authority: ControllerAuthority) {
+  const kernel = new ActionKernel(journal);
+  registerFixtureCapabilities(kernel, new PostgreSqlFixtureInspector());
+  const decision = (action: KernelAction) => {
+    const ticket = journal.beginDecision(
+      authority,
+      journal.latestObservationCursor(authority.runId),
+      journal.control(authority.runId).controlVersion,
+    );
+    return {
+      explanation: "Inspect the unused SQL gate without replaying validation",
+      evidenceIds: [],
+      request: {
+        schemaVersion: 1 as const,
+        decisionId: ticket.decisionId,
+        observationCursor: ticket.observationCursor,
+        expectedControlVersion: ticket.expectedControlVersion,
+        action,
+      },
+    };
+  };
+  return {
+    kernel,
+    decision,
+    dispatch: async (action: KernelAction) => {
+      const result = await kernel.execute(decision(action), authority);
+      return result.status === "running" ? await kernel.operation(result.operationId)! : result;
+    },
+  };
+}
+
 describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
   "granted fixture SQL through the real validation kernel",
   () => {
+    it.each([
+      { diagnostic: false, preflight: false, replacement: false, revoked: false },
+      { diagnostic: false, preflight: true, replacement: true, revoked: true },
+      { diagnostic: true, preflight: false, replacement: true, revoked: true },
+      { diagnostic: true, preflight: true, replacement: false, revoked: false },
+    ])("closes only an unused SQL gate after interruption: %j", async (options) => {
+      const f = await setup({ diagnostic: options.diagnostic });
+      let observe: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        const { parent, evidence, use } = reserveOnly(f);
+        let preflight = null;
+        if (options.preflight) {
+          preflight = await new PostgreSqlFixtureValidationProvider().observe(
+            f.definition,
+            f.validation,
+            use,
+            () => f.s.journal.assertAuthority(f.s.authority),
+            AbortSignal.timeout(5000),
+          );
+          f.s.journal.fixtures.validation.admit(f.s.authority, use.accessId, preflight);
+        }
+        const previousAuthority = f.s.authority;
+        if (options.replacement) f.s.newLease();
+        const journal = options.replacement ? f.s.reopen().orchestration : f.s.journal;
+        const authority = f.s.authority;
+        journal.markInterruptedActions(authority);
+        if (options.revoked)
+          journal.fixtures.validation.revoke(
+            authority.runId,
+            journal.control(authority.runId).controlVersion,
+            use.grantId,
+          );
+        const retainedParent = journal.action(authority.runId, parent.actionId);
+        const retainedWorkspace = journal.agents.workspaceOperation(
+          authority.runId,
+          evidence.workspaceOperationId,
+        );
+        const retainedGrants = journal.fixtures.validation.grants(authority.runId);
+        expect(retainedParent?.status).toBe("indeterminate");
+        expect(retainedWorkspace.stopEvidence).toBeNull();
+        observe = vi.spyOn(PostgreSqlFixtureValidationProvider.prototype, "observe");
+        const recovery = accessRecovery(journal, authority);
+        const request = recovery.decision({
+          kind: "reconcile_fixture_access",
+          accessId: use.accessId,
+        });
+        const running = await recovery.kernel.execute(request, authority);
+        if (running.status !== "running") throw new Error(JSON.stringify(running));
+        const result = await recovery.kernel.operation(running.operationId)!;
+        const payload = success(result);
+        expect(payload.kind).toBe("inspection");
+        const closed = journal.fixtures.validation.use(authority.runId, use.accessId);
+        expect(closed).toEqual({
+          ...use,
+          preflight,
+          status: "not_started",
+          localStopped: true,
+          remoteStopped: true,
+          detail: expect.stringContaining(
+            "Parent validation outcome and workspace I/O stop remain unverified",
+          ),
+        });
+        expect(await recovery.kernel.execute(request, authority)).toEqual(result);
+        expect(
+          (await recovery.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }))
+            .status,
+        ).toBe("succeeded");
+        expect(observe).not.toHaveBeenCalled();
+        expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toEqual(closed);
+        expect(journal.fixtures.validation.grants(authority.runId)).toEqual(retainedGrants);
+        expect(journal.action(authority.runId, parent.actionId)).toEqual(retainedParent);
+        expect(journal.delivery.evidence(authority.runId, evidence.evidenceId)).toEqual(evidence);
+        expect(
+          journal.agents.workspaceOperation(authority.runId, evidence.workspaceOperationId),
+        ).toEqual(retainedWorkspace);
+        expect(
+          journal.agents.activeWorkspaceOperation(authority.runId, evidence)?.operationId,
+        ).toBe(evidence.workspaceOperationId);
+        expect(journal.fixtures.validation.eligible(authority.runId, use.accessId)).toBe(false);
+        expect(journal.delivery.satisfiesCheck(authority.runId, evidence.evidenceId)).toBe(false);
+        expect(() =>
+          journal.fixtures.validation.dispatch(previousAuthority, use.accessId),
+        ).toThrow();
+        if (preflight)
+          expect(() =>
+            journal.fixtures.validation.admit(previousAuthority, use.accessId, preflight),
+          ).toThrow();
+        expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toEqual(closed);
+        expect(f.sql("SELECT to_regclass('public.proof') IS NULL", "browser_fixture")).toBe("t");
+      } finally {
+        observe?.mockRestore();
+        f.cleanup();
+      }
+    });
+    it("refuses a running parent and changed validation/creation provenance without closing its gate", async () => {
+      const f = await setup(),
+        db = new Database(f.s.path);
+      try {
+        const { parent, evidence, use } = reserveOnly(f);
+        const before = f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId);
+        expect(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+        ).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_action_live",
+        });
+        expect(f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId)).toEqual(
+          before,
+        );
+        f.s.journal.markInterruptedActions(f.s.authority);
+        for (const delta of [
+          { runId: randomUUID() },
+          { evidenceId: randomUUID() },
+          { operationId: randomUUID() },
+        ]) {
+          // Indexed identities are protected by SQLite before the capability
+          // can see them. Do not disable those constraints for fault injection.
+          expect(() =>
+            db
+              .prepare("UPDATE validation_evidence SET record_json=? WHERE evidence_id=?")
+              .run(JSON.stringify({ ...evidence, ...delta }), evidence.evidenceId),
+          ).toThrow("CHECK constraint failed");
+          expect(f.s.journal.delivery.evidence(f.s.authority.runId, evidence.evidenceId)).toEqual(
+            evidence,
+          );
+        }
+        for (const delta of [
+          { controllerLeaseId: randomUUID() },
+          { fixtureAccessIds: [] },
+          { policyDigest: "0".repeat(64) },
+        ]) {
+          db.prepare("UPDATE validation_evidence SET record_json=? WHERE evidence_id=?").run(
+            JSON.stringify({ ...evidence, ...delta }),
+            evidence.evidenceId,
+          );
+          expect(
+            await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+          ).toMatchObject({
+            status: "rejected",
+            code: "fixture_access_provenance_changed",
+          });
+          expect(f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId)).toEqual(
+            before,
+          );
+        }
+        db.prepare("UPDATE validation_evidence SET record_json=? WHERE evidence_id=?").run(
+          JSON.stringify(evidence),
+          evidence.evidenceId,
+        );
+        for (const delta of [{ marker: "changed" }, { operationId: randomUUID() }]) {
+          db.prepare("UPDATE fixture_validation_uses SET record_json=? WHERE access_id=?").run(
+            JSON.stringify({ ...use, ...delta }),
+            use.accessId,
+          );
+          expect(
+            await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+          ).toMatchObject({
+            status: "rejected",
+            code: "fixture_access_provenance_changed",
+          });
+        }
+        db.prepare("UPDATE fixture_validation_uses SET record_json=? WHERE access_id=?").run(
+          JSON.stringify(use),
+          use.accessId,
+        );
+        expect(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: randomUUID() }),
+        ).toMatchObject({ status: "rejected", code: "unknown_fixture_access" });
+        expect(f.s.journal.action(f.s.authority.runId, parent.actionId)?.status).toBe(
+          "indeterminate",
+        );
+        expect(f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId)).toEqual(
+          before,
+        );
+      } finally {
+        db.close();
+        f.cleanup();
+      }
+    });
+    it("rolls back unused-gate closure when its journal observation cannot be recorded", async () => {
+      const f = await setup(),
+        db = new Database(f.s.path);
+      try {
+        const { use, evidence } = reserveOnly(f);
+        f.s.journal.markInterruptedActions(f.s.authority);
+        db.exec(
+          "CREATE TRIGGER deny_unused_gate_observation BEFORE INSERT ON observations WHEN json_extract(NEW.observation_json,'$.kind')='fixture.validation_not_started' BEGIN SELECT RAISE(ABORT,'test unused gate observation failure'); END",
+        );
+        expect(
+          (await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId })).status,
+        ).toBe("indeterminate");
+        expect(f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId)).toEqual(use);
+        expect(f.s.journal.delivery.evidence(f.s.authority.runId, evidence.evidenceId)).toEqual(
+          evidence,
+        );
+        db.exec("DROP TRIGGER deny_unused_gate_observation");
+        expect(
+          (await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId })).status,
+        ).toBe("succeeded");
+      } finally {
+        db.close();
+        f.cleanup();
+      }
+    });
+    it("does not close a reserved gate while its original kernel operation is still unwinding", async () => {
+      const f = await setup();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered = false;
+      const verify = f.s.manager.verifyValidationWorkspace.bind(f.s.manager);
+      const held = vi
+        .spyOn(f.s.manager, "verifyValidationWorkspace")
+        .mockImplementation(async (...args) => {
+          entered = true;
+          await gate;
+          return verify(...args);
+        });
+      let settled: Promise<unknown> | undefined;
+      try {
+        const running = await f.s.kernel.execute(f.s.decision(f.action), f.s.authority);
+        if (running.status !== "running") throw new Error(JSON.stringify(running));
+        const pending = f.s.kernel.operation(running.operationId)!;
+        settled = pending.then(
+          (result) => result,
+          (error: unknown) => error,
+        );
+        await waitFor(() => entered);
+        const use = f.s.journal.fixtures.validation.uses(f.s.authority.runId).at(-1)!;
+        expect(use.status).toBe("reserved");
+        // Fault: durable action interruption is recorded before the still-owned
+        // handler has acknowledged stop. The live operation must take precedence.
+        f.s.journal.markInterruptedActions(f.s.authority);
+        expect(f.s.kernel.operation(use.operationId)).toBe(pending);
+        expect(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+        ).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_action_live",
+          detail: expect.stringContaining("still executing"),
+        });
+        expect(f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId)).toEqual(use);
+        expect(f.sql("SELECT to_regclass('public.proof') IS NULL", "browser_fixture")).toBe("t");
+        release();
+        // The deliberately interrupted action cannot overwrite its durable state
+        // when the original handler later returns. Await that terminal failure.
+        expect(await settled).toEqual(new Error("Action state changed before settlement"));
+      } finally {
+        release();
+        await settled;
+        held.mockRestore();
+        f.cleanup();
+      }
+    });
     it("uses the same restricted fixture and stop proofs for diagnostics without satisfying delivery", async () => {
       const f = await setup({ diagnostic: true });
       try {
@@ -696,6 +997,9 @@ describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
           use.accessId,
         );
         const observer = new PostgreSqlFixtureValidationProvider();
+        expect(() =>
+          f.s.journal.fixtures.validation.noDispatch(f.s.authority, use.accessId),
+        ).toThrow("Only an unused fixture SQL dispatch gate");
         const observation = await observer.observe(
           f.definition,
           f.validation,

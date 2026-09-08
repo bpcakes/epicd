@@ -261,6 +261,8 @@ Reference `"browser"` in a check's `environmentBindings`. The orchestrator choos
 
 SQLite binds each access to its validation operation, workspace evidence, creation generation and grant. Local process exit does not prove a PostgreSQL query stopped. The kernel accepts environment evidence only after both local stop and a fresh exact-resource observation with no other database connections. A timeout or revoked grant can therefore release the stopped local workspace while preserving the database exclusion. The orchestrator can use `inspect_fixture_access` and `reconcile_fixture_access` to inspect it without replaying SQL. A renewed grant permits a new read, not acceptance of an observation begun under the old grant. Reconciliation never changes failed or unverified evidence into a pass.
 
+If an interrupted validation reserved SQL access but never dispatched its transport, `reconcile_fixture_access` can atomically close that unused gate, including after controller replacement or grant revocation. The original action must no longer be running, and the recorded validation, creation and grant must still match. This performs no database query or mutation and prevents delayed callbacks from dispatching SQL. It does **not** settle the parent validation, release its workspace I/O exclusion, or supply process-stop or passing-check evidence. Once SQL transport was dispatched, an unknown local stop still preserves the exclusion; server quiescence cannot repair that missing acknowledgment.
+
 Unknown local stop, a replaced socket or unresolved remote work prevents reuse, runtime handoff and run completion. An already recorded local stop can be reconciled after current-format restart; a missing acknowledgment remains unknown. No automatic backend termination, fixture reset or cleanup is implemented. Both runtimes use this shared kernel, but the real PostgreSQL contract tests do not establish authenticated model-led browser recovery.
 
 ## Check-scoped PostgreSQL validation
@@ -377,6 +379,8 @@ EPICD_TEST_PGBOUNCER=/absolute/path/to/pgbouncer \
 ```
 
 These tests create their own roles and peer mappings only in owned temporary clusters. They cover actual SQL, privilege rejection, grant revocation, journal rollback, remote-stop exclusion and cold reconciliation; they do not configure the operator's PostgreSQL service.
+
+The unused SQL-gate recovery change passed 166 tests across 11 fixture, delivery-recovery and runtime-handoff suites with no skips. Seven new cases cover interruption before dispatch, preflight, controller replacement, revoked grants, provenance checks, audit rollback and a still-executing original handler. They use real PostgreSQL/PgBouncer and controlled boundary faults, not autonomous model judgments. Already-dispatched SQL with missing local-stop acknowledgment remains excluded. This is bounded recovery verification, not release certification.
 
 The real browser fixture needs a local npm project containing `@playwright/test` and its matching Playwright headless Chromium directory. It bundles those dependencies and the current native Node executable into the temporary test repository; it does not expose a host browser/cache directory to agents or validation. The mechanical browser contract is:
 
