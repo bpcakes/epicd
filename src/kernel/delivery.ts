@@ -6,6 +6,7 @@ import { DeliveryError } from "../adapters/delivery-journal.js";
 import { KernelGitError } from "../adapters/kernel-git.js";
 import { runCandidateValidation } from "../adapters/validation.js";
 import { redactSensitiveText } from "../util/redact.js";
+import { FixtureAuthorityError } from "../adapters/fixture-journal.js";
 
 /** Installs executable capabilities; it does not select any follow-up action. */
 export function registerDeliveryCapabilities(
@@ -144,7 +145,14 @@ export function registerDeliveryCapabilities(
     },
   );
   kernel.registerExternal("run_validation", async ({ authority, record, signal }) => {
-    const intent = journal.delivery.beginValidation(authority, record.actionId);
+    let intent;
+    try {
+      intent = journal.delivery.beginValidation(authority, record.actionId);
+    } catch (error) {
+      if (error instanceof FixtureAuthorityError)
+        throw new CapabilityRejected(error.code, error.message);
+      throw error;
+    }
     const evidence = await runCandidateValidation(journal, workspaces, authority, intent, signal);
     return {
       kind: "validation",

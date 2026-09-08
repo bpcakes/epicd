@@ -72,7 +72,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 29;
+export const ORCHESTRATION_SCHEMA_VERSION = 30;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -251,7 +251,12 @@ export class OrchestrationJournal {
           .immediate(),
       note: (runId, kind, summary) => {
         this.recordObservation(runId, {
-          source: ["fixture.granted", "fixture.grant_revoked"].includes(kind)
+          source: [
+            "fixture.granted",
+            "fixture.grant_revoked",
+            "fixture.validation_granted",
+            "fixture.validation_revoked",
+          ].includes(kind)
             ? "operator"
             : "fixture-kernel",
           sourceEventId: randomUUID(),
@@ -333,6 +338,7 @@ export class OrchestrationJournal {
       action: (runId, actionId) => this.action(runId, actionId),
       observe: (authority, input) => this.appendObservation(authority, input),
       agents: this.agents,
+      fixtures: this.fixtures,
       reviewChecks: (runId, taskId) => this.reviews.requiredChecks(runId, taskId),
       exactCommit: (runId, candidate, revision) => this.commits.exact(runId, candidate, revision),
       assertPublicationIdle: (runId) => {
@@ -533,6 +539,8 @@ export class OrchestrationJournal {
     )
       unfinished("A commit operation remains unsettled");
     const fixtures = this.fixtures.creations(runId);
+    if (this.fixtures.validation.uses(runId).some((use) => !use.localStopped || !use.remoteStopped))
+      unfinished("Fixture validation requires independent local and database stop evidence");
     if (
       fixtures.some(
         (fixture) =>
@@ -980,6 +988,7 @@ export class OrchestrationJournal {
           "inspect_agent",
           "inspect_artifact",
           "inspect_fixture",
+          "inspect_fixture_access",
         ].includes(action.request.action.kind),
       });
       return this.requiredAction(authority.runId, actionId);

@@ -110,6 +110,15 @@ function fixture(inspect = vi.fn<FixtureInspector["inspect"]>(async () => catalo
   };
 }
 describe("operator-scoped fixture inspection", () => {
+  it("rejects unknown SQL access IDs as invalid requests without querying a provider", async () => {
+    const f = fixture();
+    for (const kind of ["inspect_fixture_access", "reconcile_fixture_access"] as const)
+      expect(
+        await f.dispatch(f.request({ kind, accessId: "11111111-1111-4111-8111-111111111111" })),
+      ).toMatchObject({ status: "rejected", code: "unknown_fixture_access" });
+    expect(f.inspect).not.toHaveBeenCalled();
+    expect(f.journal.fixtures.validation.uses(f.state.runId)).toEqual([]);
+  });
   it("does not convert repository declarations or conversational approval into a grant", async () => {
     const f = fixture();
     expect(await f.dispatch()).toMatchObject({

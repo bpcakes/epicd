@@ -18,6 +18,7 @@ const supported = new Set<ActionRecord["request"]["action"]["kind"]>([
   "run_review",
   "request_commit",
   "reconcile_action",
+  "reconcile_fixture_access",
 ]);
 const failed = (detail: string): RecoveryObservation => ({ status: "failed", detail });
 const unresolved = (detail: string): RecoveryObservation => ({ status: "unresolved", detail });
@@ -110,7 +111,7 @@ export async function reconcileDeliveryAction(
     signal?.throwIfAborted();
     const run = authority.runId,
       action = record.request.action;
-    if (action.kind === "reconcile_action")
+    if (action.kind === "reconcile_action" || action.kind === "reconcile_fixture_access")
       return failed(
         "Interrupted reconciliation lost its acknowledgement. Inspect the original action again; no resource stop was inferred and no delivery effect was replayed.",
       );

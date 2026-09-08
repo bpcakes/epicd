@@ -75,7 +75,10 @@ export function assertRuntimeHandoffReady(
           !["owned", "not_created"].includes(record.status) ||
           (record.status === "owned" &&
             (!record.clientStopEvidence || !record.observation?.backendStopped)),
-      )
+      ) ||
+    journal.fixtures.validation
+      .uses(runId)
+      .some((record) => !record.localStopped || !record.remoteStopped)
   )
     throw new Error("Settle retained delivery and fixture operations before runtime handoff");
 }

@@ -17,8 +17,17 @@ import {
 } from "../domain/fixtures.js";
 import type { ActionRecord, ControllerAuthority, ControlState } from "../domain/orchestration.js";
 import { redactSensitiveText } from "../util/redact.js";
+import {
+  FixtureValidationJournal,
+  FIXTURE_VALIDATION_TABLES,
+  createFixtureValidationSchema,
+} from "./fixture-validation-journal.js";
 
-export const FIXTURE_TABLES = ["fixture_grants", "fixture_creations"] as const;
+export const FIXTURE_TABLES = [
+  "fixture_grants",
+  "fixture_creations",
+  ...FIXTURE_VALIDATION_TABLES,
+] as const;
 export function createFixturesSchema(db: Database.Database): void {
   db.exec(`CREATE TABLE fixture_grants (
     grant_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
@@ -31,6 +40,7 @@ export function createFixturesSchema(db: Database.Database): void {
     operation_id TEXT NOT NULL UNIQUE REFERENCES actions(operation_id),
     record_json TEXT NOT NULL CHECK(json_valid(record_json)), UNIQUE(run_id, fixture_id, generation)
   ) STRICT;`);
+  createFixtureValidationSchema(db);
 }
 export class FixtureAuthorityError extends Error {
   constructor(
@@ -44,6 +54,7 @@ export class FixtureAuthorityError extends Error {
 
 /** Operator grants are separate from policy and model-requested actions. */
 export class FixtureJournal {
+  readonly validation: FixtureValidationJournal;
   constructor(
     private readonly db: Database.Database,
     private readonly access: {
@@ -54,7 +65,13 @@ export class FixtureJournal {
       operatorTransaction<T>(runId: string, version: number, body: () => T): T;
       note(runId: string, kind: string, message: string): void;
     },
-  ) {}
+  ) {
+    this.validation = new FixtureValidationJournal(db, {
+      ...access,
+      definition: (runId, fixtureId) => this.definition(runId, fixtureId),
+      creations: (runId) => this.creations(runId),
+    });
+  }
 
   definition(runId: string, fixtureId: string) {
     const definition = this.access.policy(runId).fixtures.find((item) => item.id === fixtureId);
@@ -85,9 +102,16 @@ export class FixtureJournal {
   }
   summary(runId: string) {
     const grants = this.grants(runId),
-      creations = this.creations(runId);
+      creations = this.creations(runId),
+      validationGrants = this.validation.grants(runId),
+      validationUses = this.validation.uses(runId);
     return this.access.policy(runId).fixtures.map((definition) => {
       const latest = creations.findLast((item) => item.fixtureId === definition.id);
+      const fixtureUses = validationUses.filter((use) => use.fixtureId === definition.id);
+      const recentUses = fixtureUses.slice(-10);
+      const visibleUses = fixtureUses.filter(
+        (use) => !use.remoteStopped || recentUses.includes(use),
+      );
       return {
         fixtureId: definition.id,
         grants: grants
@@ -108,7 +132,26 @@ export class FixtureJournal {
           : null,
         ownership:
           "Requires a fresh matching provider observation; recorded creation alone is not current evidence",
-        environmentBindingAvailable: false,
+        environmentBindingAvailable: this.validation.requestAvailable(runId, definition.id),
+        validation: {
+          declared: this.access
+            .policy(runId)
+            .fixtureValidation.some((entry) => entry.fixtureId === definition.id),
+          grants: validationGrants
+            .filter((grant) => grant.fixtureId === definition.id && !grant.revokedAt)
+            .map((grant) => ({ grantId: grant.grantId, expiresAt: grant.expiresAt })),
+          omittedStoppedAccesses: fixtureUses.length - visibleUses.length,
+          accesses: visibleUses.map((use) => ({
+            accessId: use.accessId,
+            evidenceId: use.evidenceId,
+            status: use.status,
+            localStopped: use.localStopped,
+            remoteStopped: use.remoteStopped,
+            detail: use.detail,
+          })),
+          admission:
+            "run_validation requires a separate SQL-access grant, owned creation, fresh safe-role/catalog checks and no unsettled fixture use",
+        },
       };
     });
   }

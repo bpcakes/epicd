@@ -61,6 +61,26 @@ export const FixtureDefinitionSchema = z.strictObject({
 });
 export type FixtureDefinition = z.infer<typeof FixtureDefinitionSchema>;
 
+/** Explicit SQL-access policy for a dedicated disposable fixture role, not the management role. */
+export const FixtureValidationPolicySchema = z.strictObject({
+  fixtureId: z.string().min(1).max(256),
+  validationRole: z
+    .string()
+    .regex(/^[A-Za-z_][A-Za-z0-9_]{0,62}$/)
+    .refine((name) => name !== "pgbouncer"),
+  listenPort: z.number().int().min(1024).max(65535),
+  connectionVariable: z
+    .string()
+    .regex(/^(?:[A-Z][A-Z0-9_]*_)?DATABASE_URL$/)
+    .max(128),
+  pgbouncerExecutable: z
+    .string()
+    .startsWith("/")
+    .max(4096)
+    .refine((path) => !path.includes("\0")),
+});
+export type FixtureValidationPolicy = z.infer<typeof FixtureValidationPolicySchema>;
+
 /** Scratch services inside a check's existing isolation, never a host endpoint. */
 export const ValidationServiceSchema = z.strictObject({
   id: z.string().min(1).max(256),
@@ -117,6 +137,7 @@ export const RepositoryPolicySchema = z
       .max(100)
       .default([]),
     fixtures: z.array(FixtureDefinitionSchema).max(100).default([]),
+    fixtureValidation: z.array(FixtureValidationPolicySchema).max(4).default([]),
     validationServices: z.array(ValidationServiceSchema).max(4).default([]),
     budgets: z
       .strictObject({
@@ -162,12 +183,39 @@ export const RepositoryPolicySchema = z
         message: "Host fixture and check-service binding IDs must be distinct",
       });
     for (const field of ["port", "connectionVariable"] as const) {
-      const values = policy.validationServices.map((service) => service[field]);
+      const values = [
+        ...policy.validationServices.map((service) => service[field]),
+        ...policy.fixtureValidation.map((entry) =>
+          field === "port" ? entry.listenPort : entry.connectionVariable,
+        ),
+      ];
       if (new Set(values).size !== values.length)
         context.addIssue({
           code: "custom",
           path: ["validationServices"],
           message: `Check-service ${field} values must be distinct`,
+        });
+    }
+    const fixtureIds = policy.fixtureValidation.map((entry) => entry.fixtureId);
+    if (new Set(fixtureIds).size !== fixtureIds.length)
+      context.addIssue({
+        code: "custom",
+        path: ["fixtureValidation"],
+        message: "Fixture access declarations must be unique",
+      });
+    for (const entry of policy.fixtureValidation) {
+      const fixture = policy.fixtures.find((item) => item.id === entry.fixtureId);
+      if (
+        !fixture ||
+        fixture.expectedOwner !== entry.validationRole ||
+        !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(fixture.database) ||
+        ["postgres", "template0", "template1", "pgbouncer"].includes(fixture.database)
+      )
+        context.addIssue({
+          code: "custom",
+          path: ["fixtureValidation"],
+          message:
+            "Validation needs one declared non-system database owned by its dedicated validation role",
         });
     }
   });

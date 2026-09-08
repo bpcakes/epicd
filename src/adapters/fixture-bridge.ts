@@ -19,7 +19,8 @@ const FixtureBridgeTransportSchema = z.strictObject({
 /** Transport only, NOT an authorization grant or proof of safe SQL privileges.
  * A controller caller must separately authorize the exact resource generation and
  * restricted role, and establish remote backend stop before releasing that resource.
- * No public capability currently admits this transport to validation evidence.
+ * The fixture validation journal owns those grants and observations; the bridge
+ * itself cannot create an eligible validation witness.
  */
 export type FixtureBridgeTransport = z.infer<typeof FixtureBridgeTransportSchema>;
 

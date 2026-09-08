@@ -34,6 +34,7 @@ import type { AgentJournal } from "./agent-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
 import type { CommitRecord } from "../domain/commits.js";
 import type { EpicDeliveryTarget } from "./epic-delivery.js";
+import type { FixtureJournal } from "./fixture-journal.js";
 
 export const DELIVERY_TABLES = [
   "validation_plans",
@@ -101,6 +102,7 @@ type Access = {
   action(runId: string, actionId: string): ActionRecord | null;
   observe(authority: ControllerAuthority, input: ObservationInput): unknown;
   agents: AgentJournal;
+  fixtures: FixtureJournal;
   reviewChecks(runId: string, taskId: string): z.infer<typeof RequiredCheckSchema>[];
   exactCommit(runId: string, candidate: CandidateIdentity, revision: string): CommitRecord;
   assertPublicationIdle(runId: string): void;
@@ -623,11 +625,30 @@ export class DeliveryJournal {
           "This validation check is not required at the selected revision stage",
         );
       const services = this.access.policy(authority.runId).validationServices;
-      if (check.environmentBindings.some((id) => !services.some((service) => service.id === id)))
+      const hostBindings = check.environmentBindings.filter(
+        (id) => !services.some((service) => service.id === id),
+      );
+      if (hostBindings.length > 1 || check.environmentBindings.length > 4)
         throw new DeliveryError(
-          "fixture_bridge_unavailable",
-          "Host fixture bindings cannot enter validation; declare a separate check-scoped service or configure a restricted bridge",
+          "fixture_bridge_limit",
+          "A check may use one host fixture and up to four total environment bindings",
         );
+      const fixtures = hostBindings.map((id) => {
+        const definition = this.access
+          .policy(authority.runId)
+          .fixtures.find((fixture) => fixture.environmentBinding === id);
+        if (
+          !definition ||
+          !this.access
+            .policy(authority.runId)
+            .fixtureValidation.some((entry) => entry.fixtureId === definition.id)
+        )
+          throw new DeliveryError(
+            "fixture_bridge_unavailable",
+            "Host fixture validation needs an explicit restricted-bridge declaration and separate operator grant",
+          );
+        return definition;
+      });
       const exclusion = this.access.agents.beginWorkspaceOperation(
         authority,
         workspace,
@@ -653,13 +674,16 @@ export class DeliveryJournal {
         revision: snapshot.snapshotRevision,
         fingerprint: candidate.snapshot.fingerprint,
         confinementProfile: "bwrap-read-only-source-v1",
-        environmentGenerations: check.environmentBindings.map((id) => ({
-          bindingId: id,
-          instanceId: randomUUID(),
-          generation: 1,
-          definitionDigest: digestJson(services.find((service) => service.id === id)!),
-          runtime: null,
-        })),
+        environmentGenerations: check.environmentBindings
+          .filter((id) => services.some((service) => service.id === id))
+          .map((id) => ({
+            bindingId: id,
+            instanceId: randomUUID(),
+            generation: 1,
+            definitionDigest: digestJson(services.find((service) => service.id === id)!),
+            runtime: null,
+          })),
+        fixtureAccessIds: [],
         environmentVerified: false,
         status: "running",
         outcome: null,
@@ -680,6 +704,23 @@ export class DeliveryJournal {
           workspace.workspaceGeneration,
           JSON.stringify(evidence),
         );
+      evidence.fixtureAccessIds = fixtures.map(
+        (fixture) =>
+          this.access.fixtures.validation.reserve(
+            authority,
+            record.actionId,
+            evidence.evidenceId,
+            fixture.id,
+          ).accessId,
+      );
+      if (evidence.fixtureAccessIds.length)
+        this.db
+          .prepare("UPDATE validation_evidence SET record_json=? WHERE run_id=? AND evidence_id=?")
+          .run(
+            JSON.stringify(ValidationEvidenceSchema.parse(evidence)),
+            authority.runId,
+            evidence.evidenceId,
+          );
       this.changed(authority, "validation.started", evidence.evidenceId);
       return evidence;
     });
@@ -755,9 +796,12 @@ export class DeliveryJournal {
         );
       const parsed = ValidationOutcomeSchema.parse(input);
       const verifiedEnvironment =
-        evidence.environmentGenerations.length === 0 ||
+        (evidence.environmentGenerations.length === 0 && evidence.fixtureAccessIds.length === 0) ||
         (environmentVerified &&
-          evidence.environmentGenerations.every((entry) => entry.runtime !== null));
+          evidence.environmentGenerations.every((entry) => entry.runtime !== null) &&
+          evidence.fixtureAccessIds.every((id) =>
+            this.access.fixtures.validation.eligible(authority.runId, id),
+          ));
       const outcome = {
         ...parsed,
         stdout: redactSensitiveText(parsed.stdout, 65535),
@@ -956,19 +1000,31 @@ export class DeliveryJournal {
       evidence.policyDigest === this.access.control(runId).policyDigest &&
       evidence.sourceUnchanged &&
       evidence.environmentVerified &&
-      evidence.environmentGenerations.length === check.environmentBindings.length &&
-      check.environmentBindings.every((binding) =>
-        evidence.environmentGenerations.some((entry) => {
-          const definition = this.access
-            .policy(runId)
-            .validationServices.find((service) => service.id === binding);
-          return (
-            entry.bindingId === binding &&
-            entry.runtime !== null &&
-            definition &&
-            digestJson(definition) === entry.definitionDigest
-          );
-        }),
+      evidence.environmentGenerations.length + evidence.fixtureAccessIds.length ===
+        check.environmentBindings.length &&
+      check.environmentBindings.every(
+        (binding) =>
+          evidence.environmentGenerations.some((entry) => {
+            const definition = this.access
+              .policy(runId)
+              .validationServices.find((service) => service.id === binding);
+            return (
+              entry.bindingId === binding &&
+              entry.runtime !== null &&
+              definition &&
+              digestJson(definition) === entry.definitionDigest
+            );
+          }) ||
+          evidence.fixtureAccessIds.some((id) => {
+            const use = this.access.fixtures.validation.use(runId, id);
+            return (
+              use.evidenceId === evidence.evidenceId &&
+              use.operationId === evidence.operationId &&
+              this.access.fixtures.definition(runId, use.fixtureId).environmentBinding ===
+                binding &&
+              this.access.fixtures.validation.eligible(runId, id)
+            );
+          }),
       ) &&
       evidence.outcome?.status === "succeeded" &&
       evidence.outcome.exitCode === 0 &&

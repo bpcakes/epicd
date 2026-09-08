@@ -5,6 +5,8 @@ import { startConfinedCommand, type ConfinedCommandHandle } from "./sandbox.js";
 import type { WorkspaceManager } from "./workspaces.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { redactSensitiveText } from "../util/redact.js";
+import { PostgreSqlFixtureValidationProvider } from "./fixture-validation-provider.js";
+import type { FixtureBridgeTransport } from "./fixture-bridge.js";
 import {
   bindValidationService,
   verifyValidationServices,
@@ -24,6 +26,11 @@ export async function runCandidateValidation(
   const plan = journal.delivery.plan(authority.runId, evidence.validationPlanId);
   const check = plan.checks.find((item) => item.id === evidence.checkId)!;
   const writablePaths = journal.policy(authority.runId).writableScratch;
+  const fixtureJournal = journal.fixtures.validation;
+  const fixtureUses = evidence.fixtureAccessIds.map((id) =>
+    fixtureJournal.use(authority.runId, id),
+  );
+  const fixtureProvider = new PostgreSqlFixtureValidationProvider();
   const controller = new AbortController();
   const abort = () => controller.abort(signal.reason);
   signal.addEventListener("abort", abort, { once: true });
@@ -40,6 +47,7 @@ export async function runCandidateValidation(
       journal.actionForOperation(authority.runId, evidence.operationId)?.status !== "running"
     )
       throw new Error("Validation intent is no longer dispatchable");
+    for (const use of fixtureUses) fixtureJournal.assertDispatch(authority, use.accessId);
     controller.signal.throwIfAborted();
   };
   const health = setInterval(() => {
@@ -52,6 +60,41 @@ export async function runCandidateValidation(
   let handle: ConfinedCommandHandle | null = null;
   let outcomeObserved = false;
   let services: BoundValidationService[] = [];
+  let fixtureBridge: FixtureBridgeTransport | undefined;
+  const settleFixtures = async () => {
+    for (const use of fixtureUses) {
+      fixtureJournal.localStopped(authority, use.accessId);
+      if (fixtureJournal.use(authority.runId, use.accessId).status !== "dispatched") continue;
+      try {
+        const observedUse = fixtureJournal.observationUse(authority.runId, use.accessId);
+        const observation = await fixtureProvider.observe(
+          journal.fixtures.definition(authority.runId, use.fixtureId),
+          fixtureJournal.policy(authority.runId, use.fixtureId),
+          observedUse,
+          () => {
+            journal.assertAuthority(authority);
+            fixtureJournal.observationUse(authority.runId, use.accessId, observedUse.grantId);
+          },
+          AbortSignal.timeout(10_000),
+        );
+        fixtureJournal.observeStopped(authority, use.accessId, observation, observedUse.grantId);
+      } catch (error) {
+        journal.assertAuthority(authority);
+        journal.appendObservation(authority, {
+          source: "validation",
+          sourceEventId: `fixture-stop-${use.accessId}`,
+          kind: "validation.fixture_unsettled",
+          summary: redactSensitiveText(
+            `Fixture ${use.accessId} needs reconciliation: ${String(error)}`,
+            7999,
+          ),
+          artifactIds: [],
+          identity: null,
+          wakesOrchestrator: true,
+        });
+      }
+    }
+  };
   try {
     const snapshot = journal.delivery.snapshotAtRevision(
       authority.runId,
@@ -68,6 +111,26 @@ export async function runCandidateValidation(
       controller.signal,
     );
     assertDispatch();
+    for (const use of fixtureUses) {
+      const definition = journal.fixtures.definition(authority.runId, use.fixtureId),
+        policy = fixtureJournal.policy(authority.runId, use.fixtureId);
+      const observation = await fixtureProvider.observe(
+        definition,
+        policy,
+        use,
+        assertDispatch,
+        controller.signal,
+      );
+      fixtureJournal.admit(authority, use.accessId, observation);
+      fixtureBridge = {
+        definition,
+        binding: use.binding,
+        pgbouncer: use.pgbouncer,
+        validationRole: policy.validationRole,
+        listenPort: policy.listenPort,
+        connectionVariable: policy.connectionVariable,
+      };
+    }
     if (evidence.environmentGenerations.length) {
       const definitions = evidence.environmentGenerations.map((entry) =>
         journal
@@ -102,14 +165,18 @@ export async function runCandidateValidation(
       ),
       {
         signal: controller.signal,
+        ...(fixtureBridge ? { fixtureBridge } : {}),
         beforeSpawn: async () => {
           await verifyValidationServices(services);
           assertDispatch();
+          for (const use of fixtureUses) fixtureJournal.dispatch(authority, use.accessId);
         },
       },
     );
     const result = await handle.result;
     outcomeObserved = true;
+    clearInterval(health);
+    await settleFixtures();
     let sourceUnchanged = false;
     let environmentVerified = services.length === 0;
     if (services.length) {
@@ -129,6 +196,9 @@ export async function runCandidateValidation(
         });
       }
     }
+    environmentVerified =
+      environmentVerified &&
+      fixtureUses.every((use) => fixtureJournal.eligible(authority.runId, use.accessId));
     try {
       // After a cancelled process, still inspect the stopped copy without the cancelled signal.
       await workspaces.verifyValidationWorkspace(
@@ -166,11 +236,15 @@ export async function runCandidateValidation(
     // A returned handle remains owned until its result proves process closure, including startup errors.
     if (handle) {
       handle.interrupt();
-      await handle.result.catch(() => undefined);
+      await handle.result.catch((stopError) => {
+        if (stopError instanceof NamespaceStopUnprovenError) throw stopError;
+      });
     }
     journal.assertAuthority(authority); // A replaced lease cannot turn late results into evidence.
     if (error instanceof NamespaceStopUnprovenError) throw error;
     if (outcomeObserved) throw error; // Do not replace an observed result with an invented startup failure.
+    clearInterval(health);
+    await settleFixtures();
     const at = new Date().toISOString();
     return journal.delivery.finishValidation(
       authority,

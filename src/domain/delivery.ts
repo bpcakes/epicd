@@ -122,6 +122,7 @@ export const ValidationEvidenceSchema = WorkspaceIdentitySchema.extend({
   fingerprint: Id,
   confinementProfile: z.literal("bwrap-read-only-source-v1"),
   environmentGenerations: z.array(ValidationEnvironmentSchema).max(4),
+  fixtureAccessIds: z.array(z.uuid()).max(1),
   environmentVerified: z.boolean(),
   status: z.enum(["running", "finished"]),
   outcome: ValidationOutcomeSchema.nullable(),

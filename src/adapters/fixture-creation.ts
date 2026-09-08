@@ -115,6 +115,17 @@ COMMIT;\n`;
 /** One non-reconnecting psql session; the kernel authorizes mutation only after its backend is bound. */
 export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
   constructor(private readonly bwrapPath = "/usr/bin/bwrap") {}
+  /** Trusted fixed catalog readers only. Never accept a model/repository SQL string here. */
+  async readCatalog(
+    definition: FixtureDefinition,
+    binding: FixtureProviderBinding,
+    database: string,
+    sql: string,
+    guard: () => void,
+    signal: AbortSignal,
+  ): Promise<string> {
+    return this.session(definition, binding, true, sql, null, guard, signal, database);
+  }
   async create(
     definition: FixtureDefinition,
     intent: FixtureCreation,
@@ -206,6 +217,7 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
     onHandshake: ((line: string) => string) | null,
     guard: () => void,
     signal: AbortSignal,
+    database = "postgres",
   ): Promise<string> {
     const assertBinding = async () => {
       if (
@@ -285,7 +297,7 @@ export class PostgreSqlFixtureCreator implements FixtureCreationProvider {
       "--username",
       definition.role,
       "--dbname",
-      "postgres",
+      database,
       "--file",
       "-",
     );

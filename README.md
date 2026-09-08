@@ -2,9 +2,9 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 29. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 30. Use a fresh state path; unsupported existing data is left intact.
 
-The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Host-fixture reset/cleanup and restricted shared-service access, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
+The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Restricted validation access to run-created PostgreSQL fixtures is implemented under separate operator grants. Host-fixture reset/cleanup, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
 ## Requirements
 
@@ -92,7 +92,7 @@ The JSON declaration uses schema version 1. Include the checks that actually est
 }
 ```
 
-Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Host fixture declarations do not themselves grant service authority. Explicit grants, catalog inspection and absent-database creation are implemented; host-fixture reset, cleanup and restricted shared-service access are not. Separately declared check-scoped PostgreSQL services can now supply an isolated database for validation.
+Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Host fixture declarations do not themselves grant service authority. Explicit grants allow catalog inspection, absent-database creation and separately authorized restricted validation access; host-fixture reset and cleanup are not implemented. Separately declared check-scoped PostgreSQL services can also supply an isolated database for validation.
 
 Policy is frozen when a run is created. Editing the repository file does not change an existing run's permissions or required checks.
 
@@ -200,7 +200,60 @@ To authorize creation too, use `--operations inspect,create` with a declaration 
 
 Before mutation, SQLite records the generation, planned database OID, operation marker and exact creation backend. A one-use dispatch gate prevents mutation replay. The new database starts with connections disabled; a locked transaction verifies its identity before installing the ownership marker and enabling connections. Completion requires a separate observation proving that backend has stopped and the resource's OID, name, owner and marker match. [PostgreSQL's CREATE DATABASE reference](https://www.postgresql.org/docs/current/sql-createdatabase.html) describes the explicit OID, ownership and transaction constraints.
 
-`reconcile_fixture_creation` inspects a recorded creation without repeating SQL mutations. It requires an inspection grant after dispatch. An unmarked, changed or possibly still-running creation remains uncertain and is preserved. A replaced socket cannot prove that the old backend stopped. Only a never-dispatched intent, or confirmed backend stop followed by an absent resource, permits a new creation generation. Reset/cleanup remain unavailable, and successful creation does not make the fixture accessible to repository validation.
+`reconcile_fixture_creation` inspects a recorded creation without repeating SQL mutations. It requires an inspection grant after dispatch. An unmarked, changed or possibly still-running creation remains uncertain and is preserved. A replaced socket cannot prove that the old backend stopped. Only a never-dispatched intent, or confirmed backend stop followed by an absent resource, permits a new creation generation. Reset/cleanup remain unavailable. Successful creation alone does not make the fixture accessible to repository validation; SQL access requires the separate declaration and grant below.
+
+## Restricted validation against a run-created fixture
+
+Add a `fixtureValidation` entry alongside the corresponding fixture in the frozen policy. For example, these fields declare one disposable database and its dedicated SQL role:
+
+```json
+{
+  "fixtures": [
+    {
+      "id": "browser-db",
+      "provider": "postgresql",
+      "socketDirectory": "/run/postgresql",
+      "port": 5432,
+      "role": "fixture_manager",
+      "database": "browser_fixture",
+      "expectedOwner": "browser_role",
+      "operations": ["create"],
+      "environmentBinding": "browser",
+      "cleanup": "retain"
+    }
+  ],
+  "fixtureValidation": [
+    {
+      "fixtureId": "browser-db",
+      "validationRole": "browser_role",
+      "listenPort": 55432,
+      "connectionVariable": "DATABASE_URL",
+      "pgbouncerExecutable": "/usr/bin/pgbouncer"
+    }
+  ]
+}
+```
+
+The existing PostgreSQL service, management role, dedicated validation login, authentication configuration and native PgBouncer executable must already be prepared by the operator. Use canonical paths. Epicd does not install packages, create roles, change HBA/peer mappings or adopt an existing database. The management role needs authority to create the declared database for its expected owner; it is never exposed to repository commands. The validation role must have no superuser, role/database-creation, replication, RLS-bypass, membership or outside-object authority. The kernel also rejects unsafe callable functions, privileged parameter grants, foreign-data access and enabled event triggers. These deliberately conservative checks can reject an extension-enabled database. A broad peer-authenticated account is not a substitute for the dedicated role.
+
+After reviewing the frozen declaration, grant SQL access separately from creation:
+
+```bash
+node dist/cli.js grant-fixture-validation RUN_ID browser-db --state STATE_PATH \
+  --control-version VERSION --expires-at EXPIRY_ISO8601 \
+  --psql-path /absolute/path/to/native/psql
+
+node dist/cli.js revoke-fixture-validation RUN_ID GRANT_ID --state STATE_PATH \
+  --control-version VERSION
+```
+
+The grant authorizes repository SQL in that disposable database under its dedicated role, including changes that PostgreSQL permits to the role's own password/settings. It does not authorize broader host administration. The provider/socket and broker identities are pinned; expiry is at most 24 hours. Granting access does not query, create or adopt a database. An inspection/creation grant, ordinary user response or model request cannot mint this permission.
+
+Reference `"browser"` in a check's `environmentBindings`. The orchestrator chooses `provision_declared_fixture` and `run_validation` as separate actions. Validation requires this run's successful creation record, exact database OID/owner/marker, a current SQL grant, fresh role/catalog checks and no unresolved earlier access. The unchanged check receives `DATABASE_URL` for one private TCP database/role mapping. Its nested sandbox cannot see the upstream or admin sockets, broker configuration or broker processes. A check can use at most one host fixture and four total environment bindings; local-service ports and URL variables must be distinct.
+
+SQLite binds each access to its validation operation, workspace evidence, creation generation and grant. Local process exit does not prove a PostgreSQL query stopped. The kernel accepts environment evidence only after both local stop and a fresh exact-resource observation with no other database connections. A timeout or revoked grant can therefore release the stopped local workspace while preserving the database exclusion. The orchestrator can use `inspect_fixture_access` and `reconcile_fixture_access` to inspect it without replaying SQL. A renewed grant permits a new read, not acceptance of an observation begun under the old grant. Reconciliation never changes failed or unverified evidence into a pass.
+
+Unknown local stop, a replaced socket or unresolved remote work prevents reuse, runtime handoff and run completion. An already recorded local stop can be reconciled after current-format restart; a missing acknowledgment remains unknown. No automatic backend termination, fixture reset or cleanup is implemented. Both runtimes use this shared kernel, but the real PostgreSQL contract tests do not establish authenticated model-led browser recovery.
 
 ## Check-scoped PostgreSQL validation
 
@@ -293,13 +346,23 @@ The 2026-09-08 native acceptance passed in 26½ minutes: 72 decisions, ten Astra
 
 Set `EPICD_LIVE_DELIVERY_SCENARIO=receipts` before either live delivery command to exercise receipt contamination recovery. The test appends two receipts to a stopped private review copy, explicitly labeled as host-test fault injection. It requires model-chosen inspection, fresh independent exact-revision evidence, completed delivery and preserved user work; it does not demonstrate an immutable reviewer writing, active-turn intervention or knowledge reuse on a second task. Terminal results and remaining incident requirements are recorded in the plan.
 
-The SDK receipt case passed on 2026-09-08 in 17½ minutes: 90 decisions, twelve Astra/high conversations, preserved contaminated evidence, three subsequent independent approvals and completed delivery. All 79 turns stopped. This incident has not yet passed through native Herdr; the earlier native plain-delivery result does not substitute for it.
+The SDK receipt case passed on 2026-09-08 in 17½ minutes: 90 decisions, twelve Astra/high conversations, preserved contaminated evidence, three subsequent independent approvals and completed delivery. All 79 turns stopped. The native injected-receipt case subsequently passed at `f632686` in 38¾ minutes: 83 decisions, twelve Astra/high conversations, all 77 turns with native endpoints and stop evidence, three fresh approvals, final tracker publication, ownership release and preserved original work. These are bounded post-stop injection scenarios, not live wrapper-denial or browser recovery.
 
 The opt-in fixture contract uses real PostgreSQL binaries but creates and stops its own Unix-socket-only cluster; it never uses an existing host database service:
 
 ```bash
 EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin npm test -- test/fixture-postgresql.integration.test.ts test/fixture-creation-postgresql.integration.test.ts test/validation-services.integration.test.ts test/delivery.integration.test.ts
 ```
+
+For restricted host-fixture validation, also supply a native PgBouncer binary:
+
+```bash
+EPICD_TEST_PG_BINDIR=/absolute/path/to/postgresql/bin \
+EPICD_TEST_PGBOUNCER=/absolute/path/to/pgbouncer \
+  npm test -- test/fixture-bridge.test.ts test/fixture-bridge.integration.test.ts test/fixture-validation-policy.test.ts test/fixture-validation.integration.test.ts
+```
+
+These tests create their own roles and peer mappings only in owned temporary clusters. They cover actual SQL, privilege rejection, grant revocation, journal rollback, remote-stop exclusion and cold reconciliation; they do not configure the operator's PostgreSQL service.
 
 The original dispatcher and its dedicated tests have been removed. Their history remains in Git; old state, user repositories, and user-owned Herdr resources are not deleted by this hard cut.
 

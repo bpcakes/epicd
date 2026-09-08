@@ -8,6 +8,7 @@ import type { OrchestrationJournal } from "../adapters/orchestration-journal.js"
 import type { ControllerAuthority } from "../domain/orchestration.js";
 import type { FixtureCreation } from "../domain/fixtures.js";
 import { NamespaceStopUnprovenError } from "../adapters/pid-namespace.js";
+import { PostgreSqlFixtureValidationProvider } from "../adapters/fixture-validation-provider.js";
 
 export function registerFixtureCapabilities(
   kernel: ActionKernel,
@@ -15,6 +16,63 @@ export function registerFixtureCapabilities(
   creator?: FixtureCreationProvider,
 ): void {
   const journal = kernel.journal;
+  kernel.registerLocal("inspect_fixture_access", ({ authority }, action) => {
+    try {
+      return {
+        kind: "inspection",
+        text: JSON.stringify(journal.fixtures.validation.use(authority.runId, action.accessId)),
+        artifactIds: [],
+      };
+    } catch (error) {
+      if (error instanceof FixtureAuthorityError)
+        throw new CapabilityRejected(error.code, error.message);
+      throw error;
+    }
+  });
+  kernel.registerExternal("reconcile_fixture_access", async ({ authority, signal }, action) => {
+    try {
+      const fixtures = journal.fixtures.validation,
+        use = fixtures.use(authority.runId, action.accessId);
+      if (!use.localStopped)
+        throw new CapabilityRejected(
+          "fixture_access_local_unknown",
+          "A database observation cannot prove an unacknowledged local proxy stopped; preserve the access exclusion",
+        );
+      let current = use;
+      if (!use.remoteStopped) {
+        const read = fixtures.observationUse(authority.runId, use.accessId);
+        const observation = await new PostgreSqlFixtureValidationProvider().observe(
+          journal.fixtures.definition(authority.runId, use.fixtureId),
+          fixtures.policy(authority.runId, use.fixtureId),
+          read,
+          () => {
+            journal.assertAuthority(authority);
+            fixtures.observationUse(authority.runId, use.accessId, read.grantId);
+          },
+          signal,
+        );
+        current = fixtures.observeStopped(authority, use.accessId, observation, read.grantId);
+      }
+      return {
+        kind: "inspection",
+        text: JSON.stringify({
+          accessId: current.accessId,
+          status: current.status,
+          localStopped: current.localStopped,
+          remoteStopped: current.remoteStopped,
+          detail: current.detail,
+          warning:
+            "No validation command or database mutation was replayed. Reconciliation never upgrades a failed or unverified check to a pass.",
+        }),
+        artifactIds: [],
+      };
+    } catch (error) {
+      if (error instanceof FixtureAuthorityError)
+        throw new CapabilityRejected(error.code, error.message);
+      if (error instanceof FixtureTransportError) throw new OperationFailed(error.message);
+      throw error;
+    }
+  });
   if (creator) {
     kernel.registerExternal(
       "provision_declared_fixture",
@@ -146,7 +204,10 @@ export function registerFixtureCapabilities(
             generation: settled.generation,
             status: settled.status,
             detail: settled.detail,
-            environmentBindingAvailable: false,
+            environmentBindingAvailable: journal.fixtures.validation.requestAvailable(
+              authority.runId,
+              settled.fixtureId,
+            ),
           }),
         };
       } catch (error) {
@@ -188,7 +249,10 @@ export function registerFixtureCapabilities(
             ? catalog.database.owner === definition.expectedOwner
             : null,
           ownership: "not_established",
-          environmentBindingAvailable: false,
+          environmentBindingAvailable: journal.fixtures.validation.requestAvailable(
+            authority.runId,
+            definition.id,
+          ),
           limitation:
             "Catalog-only observation, not fixture connectivity, run ownership, provisioning authority, or repository validation access. Peer authentication is not inferred from connection success.",
         }),

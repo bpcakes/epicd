@@ -23,7 +23,11 @@ import { registerDiagnosticWorkspaceCapabilities } from "../../src/kernel/diagno
 import { registerCommitCapabilities } from "../../src/kernel/commits.js";
 import { registerPublicationCapabilities } from "../../src/kernel/publication.js";
 import { registerReviewCapabilities } from "../../src/kernel/reviews.js";
-import { RepositoryPolicySchema, RequiredCheckSchema } from "../../src/domain/repository-policy.js";
+import {
+  RepositoryPolicySchema,
+  RequiredCheckSchema,
+  type RepositoryPolicy,
+} from "../../src/domain/repository-policy.js";
 import { SdkAgentSessionContractSchema } from "../../src/domain/types.js";
 import {
   type ActionResult,
@@ -94,6 +98,7 @@ export async function fixture(
   format: "sha1" | "sha256" = "sha1",
   tracker?: ReviewTrackerSetup,
   initializeSource?: (source: string) => void,
+  policyInput: Partial<RepositoryPolicy> = {},
 ) {
   const root = mkdtempSync("/var/tmp/epicd-review-");
   const source = join(root, "source");
@@ -140,7 +145,7 @@ export async function fixture(
           }
         : {}),
     },
-    RepositoryPolicySchema.parse({ schemaVersion: 1, requiredChecks: [required] }),
+    RepositoryPolicySchema.parse({ schemaVersion: 1, ...policyInput, requiredChecks: [required] }),
   );
   const lease = store.acquireLease(state.runId);
   let authority: ControllerAuthority = {

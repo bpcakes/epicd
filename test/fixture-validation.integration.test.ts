@@ -1,0 +1,847 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { userInfo } from "node:os";
+import Database from "better-sqlite3";
+import { describe, expect, it } from "vitest";
+import {
+  bindFixtureExecutable,
+  bindFixtureProvider,
+  PostgreSqlFixtureInspector,
+} from "../src/adapters/fixtures.js";
+import { PostgreSqlFixtureCreator } from "../src/adapters/fixture-creation.js";
+import { PostgreSqlFixtureValidationProvider } from "../src/adapters/fixture-validation-provider.js";
+import { assertRuntimeHandoffReady } from "../src/adapters/runtime-handoff.js";
+import { FixtureValidationUseSchema } from "../src/domain/fixture-validation.js";
+import { registerFixtureCapabilities } from "../src/kernel/fixtures.js";
+import { ActionKernel } from "../src/kernel/actions.js";
+import {
+  FixtureDefinitionSchema,
+  RequiredCheckSchema,
+  ValidationServiceSchema,
+} from "../src/domain/repository-policy.js";
+import { fixture, success, target } from "./fixtures/review.js";
+import type { KernelAction } from "../src/domain/orchestration.js";
+
+const bin = process.env.EPICD_TEST_PG_BINDIR;
+const broker = process.env.EPICD_TEST_PGBOUNCER;
+const quote = (s: string) => '"' + s.replaceAll('"', '""') + '"';
+async function setup(
+  options: {
+    create?: boolean;
+    grant?: boolean;
+    query?: string;
+    timeoutMs?: number;
+    localService?: boolean;
+  } = {},
+) {
+  const root = mkdtempSync("/var/tmp/epicd-fixture-validation-"),
+    data = join(root, "cluster"),
+    sockets = join(root, "sockets");
+  mkdirSync(sockets);
+  const manager = userInfo().username,
+    role = "epicd_fixture_role",
+    admin = "epicd_fixture_bootstrap";
+  const run = (name: string, args: string[]) =>
+    execFileSync(join(bin!, name), args, {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const sql = (query: string, database = "postgres") =>
+    run("psql", [
+      "-X",
+      "-w",
+      "-qAt",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-h",
+      sockets,
+      "-p",
+      "55432",
+      "-U",
+      admin,
+      "-d",
+      database,
+      "-c",
+      query,
+    ]);
+  let started = false;
+  const cleanup = () => {
+    if (started) {
+      try {
+        run("pg_ctl", ["-D", data, "-m", "immediate", "-w", "stop"]);
+      } catch (cause) {
+        throw new Error(`Preserved uncertain owned PostgreSQL fixture at ${root}`, { cause });
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  };
+  try {
+    run("initdb", [
+      "-D",
+      data,
+      "--auth-local=peer",
+      "--auth-host=reject",
+      "--no-sync",
+      "--locale=C.UTF-8",
+      "-U",
+      admin,
+    ]);
+    // This cluster is created by this test. Never edit or connect to the operator's database service.
+    writeFileSync(
+      join(data, "pg_hba.conf"),
+      `local all ${admin} trust\nlocal all all peer map=epicd_fixture_test\n`,
+    );
+    writeFileSync(
+      join(data, "pg_ident.conf"),
+      `epicd_fixture_test ${quote(manager)} ${quote(manager)}\nepicd_fixture_test ${quote(manager)} ${role}\n`,
+    );
+    started = true;
+    run("pg_ctl", [
+      "-D",
+      data,
+      "-l",
+      join(root, "postgres.log"),
+      "-w",
+      "start",
+      "-o",
+      `-k ${sockets} -p 55432 -c listen_addresses='' -c fsync=off`,
+    ]);
+    sql(
+      `CREATE ROLE ${quote(manager)} LOGIN NOSUPERUSER CREATEDB; CREATE ROLE ${role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT ${role} TO ${quote(manager)}`,
+    );
+    const definition = FixtureDefinitionSchema.parse({
+      id: "browser-db",
+      provider: "postgresql",
+      socketDirectory: sockets,
+      port: 55432,
+      role: manager,
+      database: "browser_fixture",
+      expectedOwner: role,
+      operations: ["create"],
+      environmentBinding: "browser",
+      cleanup: "retain",
+    });
+    const validation = {
+      fixtureId: definition.id,
+      validationRole: role,
+      listenPort: 55433,
+      connectionVariable: "DATABASE_URL",
+      pgbouncerExecutable: broker!,
+    };
+    const query =
+      options.query ??
+      "CREATE TABLE IF NOT EXISTS proof(value text); INSERT INTO proof VALUES ('green'); SELECT value FROM proof LIMIT 1";
+    const check = RequiredCheckSchema.parse({
+      id: "browser-sql",
+      command: "/bin/sh",
+      args: [
+        "-c",
+        `test "$(cat app.txt)" = green && ${
+          options.localService
+            ? `${bin}/psql -X -w -qAt -v ON_ERROR_STOP=1 "$SCRATCH_DATABASE_URL" -c 'SELECT current_database()' && `
+            : ""
+        }exec ${bin}/psql -X -w -qAt -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "$1"`,
+        "fixture-check",
+        query,
+      ],
+      environmentBindings: options.localService ? ["scratch-db", "browser"] : ["browser"],
+      timeoutMs: options.timeoutMs ?? 5000,
+    });
+    const s = await fixture(check, "sha1", undefined, undefined, {
+      fixtures: [definition],
+      fixtureValidation: [validation],
+      validationServices: options.localService
+        ? [
+            ValidationServiceSchema.parse({
+              id: "scratch-db",
+              provider: "postgresql",
+              lifetime: "check",
+              binDirectory: bin,
+              database: "scratch_fixture",
+              role: "scratch_owner",
+              port: 55434,
+              connectionVariable: "SCRATCH_DATABASE_URL",
+            }),
+          ]
+        : [],
+    });
+    registerFixtureCapabilities(
+      s.kernel,
+      new PostgreSqlFixtureInspector(),
+      new PostgreSqlFixtureCreator(),
+    );
+    const binding = await bindFixtureProvider(definition, join(bin!, "psql")),
+      pgbouncer = await bindFixtureExecutable(broker!);
+    const grant = () =>
+      s.journal.fixtures.validation.grant(
+        s.authority.runId,
+        s.journal.control(s.authority.runId).controlVersion,
+        {
+          fixtureId: definition.id,
+          binding,
+          pgbouncer,
+          expiresAt: new Date(Date.now() + 120000).toISOString(),
+        },
+      );
+    s.journal.fixtures.grant(
+      s.authority.runId,
+      s.journal.control(s.authority.runId).controlVersion,
+      {
+        fixtureId: definition.id,
+        binding,
+        operations: ["create", "inspect"],
+        expiresAt: new Date(Date.now() + 120000).toISOString(),
+      },
+    );
+    if (options.grant !== false) grant();
+    if (options.create !== false)
+      success(
+        await s.dispatch({
+          kind: "provision_declared_fixture",
+          fixtureId: definition.id,
+          operation: "create",
+          expectedGeneration: 0,
+        }),
+      );
+    const planId = await s.define(),
+      candidate = await s.capture(planId),
+      copy = await s.copy(candidate);
+    const action: KernelAction = {
+      kind: "run_validation",
+      ...candidate,
+      ...target(copy),
+      validationPlanId: planId,
+      checkId: check.id,
+    };
+    const validate = async () => {
+      const result = success(await s.dispatch(action));
+      if (result.kind !== "validation") throw new Error("Expected validation payload");
+      return {
+        result,
+        evidence: s.journal.delivery.evidence(s.authority.runId, result.evidenceId),
+        use: s.journal.fixtures.validation.uses(s.authority.runId).at(-1)!,
+      };
+    };
+    return {
+      s,
+      root,
+      definition,
+      validation,
+      binding,
+      pgbouncer,
+      grant,
+      sql,
+      role,
+      admin,
+      manager,
+      action,
+      validate,
+      cleanup,
+    };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+
+describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
+  "granted fixture SQL through the real validation kernel",
+  () => {
+    it("uses the operator CLI to grant and revoke SQL access separately from creation", async () => {
+      const f = await setup({ grant: false });
+      try {
+        const cli = (...args: string[]) =>
+          execFileSync(process.execPath, ["dist/cli.js", ...args, "--state", f.s.path], {
+            encoding: "utf8",
+            timeout: 5000,
+          });
+        expect(
+          f.s.journal.fixtures.validation.requestAvailable(f.s.authority.runId, f.definition.id),
+        ).toBe(false);
+        const version = String(f.s.journal.control(f.s.authority.runId).controlVersion);
+        expect(
+          cli(
+            "grant-fixture-validation",
+            f.s.authority.runId,
+            f.definition.id,
+            "--control-version",
+            version,
+            "--expires-at",
+            new Date(Date.now() + 60000).toISOString(),
+            "--psql-path",
+            join(bin!, "psql"),
+          ),
+        ).toContain("SQL-access grant");
+        const grant = f.s.journal.fixtures.validation.grants(f.s.authority.runId).at(-1)!;
+        expect(grant.binding).toEqual(f.binding);
+        expect(
+          f.s.journal.fixtures.validation.requestAvailable(f.s.authority.runId, f.definition.id),
+        ).toBe(true);
+        expect(
+          cli(
+            "revoke-fixture-validation",
+            f.s.authority.runId,
+            grant.grantId,
+            "--control-version",
+            String(f.s.journal.control(f.s.authority.runId).controlVersion),
+          ),
+        ).toContain("SQL access revoked");
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_grant_required",
+        });
+        expect(f.s.journal.fixtures.grants(f.s.authority.runId).at(-1)?.revokedAt).toBeNull();
+      } finally {
+        f.cleanup();
+      }
+    });
+    it("creates the declared fixture, validates its actual data and records exact environment evidence", async () => {
+      const f = await setup();
+      try {
+        const { result, evidence, use } = await f.validate();
+        expect(result, JSON.stringify(evidence.outcome)).toMatchObject({
+          outcome: "succeeded",
+          satisfiesCheck: true,
+        });
+        expect(evidence).toMatchObject({
+          environmentVerified: true,
+          sourceUnchanged: true,
+          fixtureAccessIds: [use.accessId],
+          environmentGenerations: [],
+        });
+        expect(use).toMatchObject({
+          status: "stopped",
+          localStopped: true,
+          remoteStopped: true,
+          preflight: { otherConnections: 0 },
+          finalObservation: { otherConnections: 0 },
+        });
+        expect(use.preflight?.role).toMatchObject({
+          name: f.role,
+          superuser: false,
+          memberships: false,
+          externalDependencies: false,
+          unsafeFunctions: false,
+        });
+        expect(f.sql("SELECT value FROM proof", "browser_fixture")).toBe("green");
+        expect(readFileSync(join(f.s.source, "app.txt"), "utf8")).toBe("red\n");
+        const count = f.s.journal.fixtures.validation.uses(f.s.authority.runId).length;
+        const repeated = await f.s.kernel.execute(
+          f.s.decision({ kind: "inspect_fixture_access", accessId: use.accessId }),
+          f.s.authority,
+        );
+        expect(repeated.status).toBe("succeeded");
+        expect(f.s.journal.fixtures.validation.uses(f.s.authority.runId)).toHaveLength(count);
+        f.s.journal.fixtures.validation.revoke(
+          f.s.authority.runId,
+          f.s.journal.control(f.s.authority.runId).controlVersion,
+          use.grantId,
+        );
+        // Revocation prevents new SQL, but does not erase valid historical evidence.
+        expect(f.s.journal.delivery.satisfiesCheck(f.s.authority.runId, evidence.evidenceId)).toBe(
+          true,
+        );
+      } finally {
+        f.cleanup();
+      }
+    });
+    it("does not turn a creation grant or a pre-existing database into SQL-access authority", async () => {
+      const f = await setup({ create: false, grant: false });
+      try {
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_grant_required",
+        });
+        f.grant();
+        f.sql(`CREATE DATABASE browser_fixture OWNER ${f.role}`);
+        f.sql(
+          "CREATE TABLE untouched(value text); INSERT INTO untouched VALUES ('operator')",
+          "browser_fixture",
+        );
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_not_owned",
+        });
+        expect(f.s.journal.fixtures.validation.uses(f.s.authority.runId)).toEqual([]);
+        expect(f.sql("SELECT value FROM untouched", "browser_fixture")).toBe("operator");
+      } finally {
+        f.cleanup();
+      }
+    });
+    it("binds both an isolated check-local service and the exact granted host fixture", async () => {
+      const f = await setup({ localService: true, timeoutMs: 10000 });
+      try {
+        const { result, evidence, use } = await f.validate();
+        expect(result, JSON.stringify(evidence.outcome)).toMatchObject({
+          outcome: "succeeded",
+          satisfiesCheck: true,
+        });
+        expect(evidence).toMatchObject({
+          environmentVerified: true,
+          fixtureAccessIds: [use.accessId],
+          environmentGenerations: [{ bindingId: "scratch-db" }],
+        });
+        expect(evidence.outcome?.stdout).toBe("scratch_fixture\ngreen\n");
+        expect(f.sql("SELECT value FROM proof", "browser_fixture")).toBe("green");
+        expect(f.sql("SELECT count(*) FROM pg_database WHERE datname='scratch_fixture'")).toBe("0");
+      } finally {
+        f.cleanup();
+      }
+    });
+    it.each([
+      "SUPERUSER",
+      "CREATEDB",
+      "CREATEROLE",
+      "REPLICATION",
+      "BYPASSRLS",
+      "membership",
+      "externalOwnership",
+      "externalAcl",
+      "parameterPublic",
+      "securityDefiner",
+      "functionGrant",
+      "foreignWrapper",
+      "eventTrigger",
+    ])("rejects %s authority before any repository SQL executes", async (variant) => {
+      const f = await setup();
+      try {
+        if (["SUPERUSER", "CREATEDB", "CREATEROLE", "REPLICATION", "BYPASSRLS"].includes(variant))
+          f.sql(`ALTER ROLE ${f.role} ${variant}`);
+        if (variant === "membership") f.sql(`GRANT pg_read_server_files TO ${f.role}`);
+        if (variant === "externalOwnership")
+          f.sql(`CREATE DATABASE outside_fixture OWNER ${f.role}`);
+        if (variant === "externalAcl") f.sql(`GRANT CREATE ON DATABASE postgres TO ${f.role}`);
+        if (variant === "parameterPublic")
+          f.sql("GRANT SET ON PARAMETER session_preload_libraries TO PUBLIC");
+        if (variant === "securityDefiner")
+          f.sql(
+            "CREATE FUNCTION public.privileged() RETURNS integer LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+            "browser_fixture",
+          );
+        if (variant === "functionGrant")
+          f.sql(
+            `GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO ${f.role}`,
+            "browser_fixture",
+          );
+        if (variant === "foreignWrapper")
+          f.sql(
+            `CREATE FOREIGN DATA WRAPPER unsafe_wrapper; GRANT USAGE ON FOREIGN DATA WRAPPER unsafe_wrapper TO ${f.role}`,
+            "browser_fixture",
+          );
+        if (variant === "eventTrigger")
+          f.sql(
+            "CREATE FUNCTION public.ddl_hook() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END'; CREATE EVENT TRIGGER test_hook ON ddl_command_start EXECUTE FUNCTION public.ddl_hook()",
+            "browser_fixture",
+          );
+        const { result, evidence, use } = await f.validate();
+        expect(result).toMatchObject({ outcome: "not_started", satisfiesCheck: false });
+        expect(evidence.outcome?.stderr).toContain("forbidden authority");
+        expect(use).toMatchObject({
+          status: "not_started",
+          localStopped: true,
+          remoteStopped: true,
+          preflight: null,
+        });
+        expect(f.sql("SELECT to_regclass('public.proof') IS NULL", "browser_fixture")).toBe("t");
+      } finally {
+        f.cleanup();
+      }
+    });
+    it("retains a remote query exclusion after local timeout and reconciles without upgrading failed evidence", async () => {
+      const f = await setup({ query: "SELECT pg_sleep(20)", timeoutMs: 1200 });
+      try {
+        const { result, evidence, use } = await f.validate();
+        expect(result, JSON.stringify(evidence.outcome)).toMatchObject({
+          outcome: "timed_out",
+          satisfiesCheck: false,
+        });
+        expect(use).toMatchObject({
+          status: "dispatched",
+          localStopped: true,
+          remoteStopped: false,
+        });
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_busy",
+        });
+        const control = (kind: "pause" | "resume") =>
+          f.s.journal.operatorControl(
+            f.s.authority.runId,
+            f.s.journal.control(f.s.authority.runId).controlVersion,
+            { kind },
+          );
+        control("pause");
+        expect(() =>
+          assertRuntimeHandoffReady(
+            f.s.journal,
+            f.s.authority,
+            f.s.journal.control(f.s.authority.runId).controlVersion,
+          ),
+        ).toThrow("Settle retained delivery and fixture operations");
+        control("resume");
+        const pending = success(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+        );
+        expect(pending.kind).toBe("inspection");
+        if (pending.kind === "inspection")
+          expect(JSON.parse(pending.text).remoteStopped).toBe(false);
+        // Explicit test-owned server cancellation simulates the query ending. Production
+        // reconciliation never terminates an unattributed or operator-owned backend.
+        const identity = f
+          .sql(
+            "SELECT pid::text||':'||extract(epoch from backend_start)::text FROM pg_stat_activity WHERE datname='browser_fixture' AND query='SELECT pg_sleep(20)' AND state='active'",
+          )
+          .split(":");
+        expect(identity[0]).toMatch(/^\d+$/);
+        expect(identity[1]).toMatch(/^\d+\.\d+$/);
+        expect(
+          f.sql(
+            `SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid=${identity[0]} AND extract(epoch from backend_start)=${identity[1]}`,
+          ),
+        ).toBe("t");
+        await expect
+          .poll(
+            () => f.sql("SELECT count(*) FROM pg_stat_activity WHERE datname='browser_fixture'"),
+            { timeout: 5000 },
+          )
+          .toBe("0");
+        const settled = success(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+        );
+        if (settled.kind !== "inspection") throw new Error("Expected reconciliation inspection");
+        expect(JSON.parse(settled.text)).toMatchObject({
+          status: "stopped",
+          localStopped: true,
+          remoteStopped: true,
+        });
+        expect(
+          f.s.journal.delivery.evidence(f.s.authority.runId, evidence.evidenceId)
+            .environmentVerified,
+        ).toBe(false);
+        expect(f.s.journal.delivery.satisfiesCheck(f.s.authority.runId, evidence.evidenceId)).toBe(
+          false,
+        );
+        control("pause");
+        expect(() =>
+          assertRuntimeHandoffReady(
+            f.s.journal,
+            f.s.authority,
+            f.s.journal.control(f.s.authority.runId).controlVersion,
+          ),
+        ).not.toThrow();
+      } finally {
+        f.cleanup();
+      }
+    });
+    it("revokes an in-flight grant without mistaking local cancellation for PostgreSQL stop", async () => {
+      const f = await setup({ query: "SELECT pg_sleep(20)", timeoutMs: 15000 });
+      const pending = f.validate();
+      try {
+        await expect
+          .poll(
+            () =>
+              f.sql(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname='browser_fixture' AND query='SELECT pg_sleep(20)' AND state='active'",
+              ),
+            { timeout: 5000 },
+          )
+          .toBe("1");
+        const grant = f.s.journal.fixtures.validation.grants(f.s.authority.runId).at(-1)!;
+        f.s.journal.fixtures.validation.revoke(
+          f.s.authority.runId,
+          f.s.journal.control(f.s.authority.runId).controlVersion,
+          grant.grantId,
+        );
+        const { evidence, use } = await pending;
+        expect(evidence).toMatchObject({
+          outcome: { status: "cancelled" },
+          environmentVerified: false,
+        });
+        expect(use).toMatchObject({
+          status: "dispatched",
+          localStopped: true,
+          remoteStopped: false,
+        });
+        expect(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+        ).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_grant_required",
+        });
+        f.grant();
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_busy",
+        });
+        const read = success(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+        );
+        if (read.kind !== "inspection") throw new Error("Expected inspection");
+        expect(JSON.parse(read.text)).toMatchObject({ localStopped: true, remoteStopped: false });
+        const observedUse = f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId);
+        const readGrant = f.s.journal.fixtures.validation.observationUse(
+          f.s.authority.runId,
+          use.accessId,
+        );
+        expect(observedUse.finalObservation).not.toBeNull();
+        f.grant();
+        expect(() =>
+          f.s.journal.fixtures.validation.observationUse(
+            f.s.authority.runId,
+            use.accessId,
+            readGrant.grantId,
+          ),
+        ).toThrow("operator SQL-access grant");
+        expect(() =>
+          f.s.journal.fixtures.validation.observeStopped(
+            f.s.authority,
+            use.accessId,
+            observedUse.finalObservation!,
+            readGrant.grantId,
+          ),
+        ).toThrow("operator SQL-access grant");
+        expect(f.s.journal.fixtures.validation.use(f.s.authority.runId, use.accessId)).toEqual(
+          observedUse,
+        );
+        expect(f.s.journal.delivery.evidence(f.s.authority.runId, evidence.evidenceId)).toEqual(
+          evidence,
+        );
+      } finally {
+        await pending.catch(() => undefined);
+        f.cleanup();
+      }
+    });
+    it("rejects stale or expired grants and rolls back revocation if the audit write fails", async () => {
+      const f = await setup(),
+        db = new Database(f.s.path);
+      try {
+        const journal = f.s.journal.fixtures.validation,
+          run = f.s.authority.runId;
+        const original = journal.grants(run),
+          version = f.s.journal.control(run).controlVersion;
+        const input = {
+          fixtureId: f.definition.id,
+          binding: f.binding,
+          pgbouncer: f.pgbouncer,
+          expiresAt: new Date(Date.now() + 60000).toISOString(),
+        };
+        expect(() => journal.grant(run, version - 1, input)).toThrow("Control changed");
+        for (const expiresAt of [
+          new Date(Date.now() - 1).toISOString(),
+          new Date(Date.now() + 90000000).toISOString(),
+        ])
+          expect(() => journal.grant(run, version, { ...input, expiresAt })).toThrow(
+            "Grant expiry",
+          );
+        expect(journal.grants(run)).toEqual(original);
+        db.exec(
+          "CREATE TRIGGER deny_fixture_grant_audit BEFORE INSERT ON observations BEGIN SELECT RAISE(ABORT,'test grant audit failure'); END",
+        );
+        expect(() => journal.revoke(run, version, original.at(-1)!.grantId)).toThrow(
+          "test grant audit failure",
+        );
+        expect(journal.grants(run)).toEqual(original);
+        expect(f.s.journal.control(run).controlVersion).toBe(version);
+      } finally {
+        db.close();
+        f.cleanup();
+      }
+    });
+    it("refuses changed access provenance and contradictory durable stop records", async () => {
+      const f = await setup(),
+        db = new Database(f.s.path);
+      try {
+        const { use } = await f.validate(),
+          journal = f.s.journal.fixtures.validation;
+        expect(journal.eligible(f.s.authority.runId, use.accessId)).toBe(true);
+        for (const delta of [
+          {
+            binding: {
+              ...use.binding,
+              executable: { ...use.binding.executable, digest: "0".repeat(64) },
+            },
+          },
+          { pgbouncer: { ...use.pgbouncer, digest: "0".repeat(64) } },
+          { databaseOid: "999999" },
+          { marker: "different-marker" },
+          { generation: use.generation + 1 },
+        ]) {
+          db.prepare("UPDATE fixture_validation_uses SET record_json=? WHERE access_id=?").run(
+            JSON.stringify({ ...use, ...delta }),
+            use.accessId,
+          );
+          expect(journal.eligible(f.s.authority.runId, use.accessId)).toBe(false);
+          expect(() => journal.observationUse(f.s.authority.runId, use.accessId)).toThrow(
+            "recorded grant or creation",
+          );
+        }
+        db.prepare("UPDATE fixture_validation_uses SET record_json=? WHERE access_id=?").run(
+          JSON.stringify(use),
+          use.accessId,
+        );
+        for (const delta of [
+          { localStopped: false },
+          { remoteStopped: false },
+          { preflight: null },
+          { finalObservation: null },
+          { status: "reserved" },
+          { status: "dispatched" },
+          { status: "not_started" },
+        ])
+          expect(FixtureValidationUseSchema.safeParse({ ...use, ...delta }).success).toBe(false);
+      } finally {
+        db.close();
+        f.cleanup();
+      }
+    });
+    it("does not repair a lost local-stop acknowledgment from server quiescence or a replacement lease", async () => {
+      const f = await setup(),
+        db = new Database(f.s.path);
+      try {
+        const { use, evidence } = await f.validate();
+        // Fault injection: retain dispatched intent while removing the durable local acknowledgment.
+        db.prepare("UPDATE fixture_validation_uses SET record_json=? WHERE access_id=?").run(
+          JSON.stringify({
+            ...use,
+            status: "dispatched",
+            localStopped: false,
+            remoteStopped: false,
+            finalObservation: null,
+          }),
+          use.accessId,
+        );
+        const observer = new PostgreSqlFixtureValidationProvider();
+        const observation = await observer.observe(
+          f.definition,
+          f.validation,
+          use,
+          () => f.s.journal.assertAuthority(f.s.authority),
+          AbortSignal.timeout(5000),
+        );
+        expect(observation.otherConnections).toBe(0);
+        expect(() =>
+          f.s.journal.fixtures.validation.observeStopped(
+            f.s.authority,
+            use.accessId,
+            observation,
+            use.grantId,
+          ),
+        ).toThrow("Remote quiescence alone");
+        expect(
+          await f.s.dispatch({ kind: "reconcile_fixture_access", accessId: use.accessId }),
+        ).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_local_unknown",
+        });
+        const reopened = f.s.reopen(),
+          authority = f.s.newLease(),
+          journal = reopened.orchestration;
+        expect(() => journal.fixtures.validation.localStopped(authority, use.accessId)).toThrow(
+          "replacement controller",
+        );
+        expect(journal.delivery.satisfiesCheck(authority.runId, evidence.evidenceId)).toBe(false);
+        expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toMatchObject({
+          localStopped: false,
+          remoteStopped: false,
+        });
+      } finally {
+        db.close();
+        f.cleanup();
+      }
+    });
+    it("atomically rolls back evidence, workspace exclusion and fixture reservation if recording the use fails", async () => {
+      const f = await setup(),
+        db = new Database(f.s.path);
+      try {
+        db.exec(
+          "CREATE TRIGGER deny_fixture_use BEFORE INSERT ON fixture_validation_uses BEGIN SELECT RAISE(ABORT,'test journal failure'); END",
+        );
+        const result = await f.s.dispatch(f.action);
+        expect(result.status).not.toBe("succeeded");
+        expect(db.prepare("SELECT count(*) AS n FROM validation_evidence").get()).toEqual({ n: 0 });
+        expect(f.s.journal.fixtures.validation.uses(f.s.authority.runId)).toEqual([]);
+        expect(
+          f.s.journal.agents.activeWorkspaceOperation(
+            f.s.authority.runId,
+            f.action as Extract<KernelAction, { kind: "run_validation" }>,
+          ),
+        ).toBeNull();
+        expect(f.sql("SELECT to_regclass('public.proof') IS NULL", "browser_fixture")).toBe("t");
+      } finally {
+        db.close();
+        f.cleanup();
+      }
+    });
+    it("cold-reconciles acknowledged local stop under a new lease without replaying SQL or rewriting failed evidence", async () => {
+      const f = await setup({ query: "SELECT pg_sleep(20)", timeoutMs: 1200 });
+      try {
+        const { evidence, use } = await f.validate();
+        expect(use).toMatchObject({ localStopped: true, remoteStopped: false });
+        const reopened = f.s.reopen(),
+          authority = f.s.newLease(),
+          journal = reopened.orchestration;
+        expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toEqual(use);
+        expect(() => journal.fixtures.validation.dispatch(authority, use.accessId)).toThrow();
+        const kernel = new ActionKernel(journal);
+        registerFixtureCapabilities(
+          kernel,
+          new PostgreSqlFixtureInspector(),
+          new PostgreSqlFixtureCreator(),
+        );
+        const act = async (action: KernelAction) => {
+          const ticket = journal.beginDecision(
+            authority,
+            journal.latestObservationCursor(authority.runId),
+            journal.control(authority.runId).controlVersion,
+          );
+          const result = await kernel.execute(
+            {
+              explanation: "Reconcile existing database access without replay",
+              evidenceIds: [],
+              request: {
+                schemaVersion: 1,
+                decisionId: ticket.decisionId,
+                observationCursor: ticket.observationCursor,
+                expectedControlVersion: ticket.expectedControlVersion,
+                action,
+              },
+            },
+            authority,
+          );
+          return result.status === "running" ? await kernel.operation(result.operationId)! : result;
+        };
+        const [pid, startedAt] = f
+          .sql(
+            "SELECT pid::text||':'||extract(epoch from backend_start)::text FROM pg_stat_activity WHERE datname='browser_fixture' AND query='SELECT pg_sleep(20)' AND state='active'",
+          )
+          .split(":");
+        expect(pid).toMatch(/^\d+$/);
+        expect(startedAt).toMatch(/^\d+\.\d+$/);
+        expect(
+          f.sql(
+            `SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid=${pid} AND extract(epoch from backend_start)=${startedAt}`,
+          ),
+        ).toBe("t");
+        await expect
+          .poll(
+            () => f.sql("SELECT count(*) FROM pg_stat_activity WHERE datname='browser_fixture'"),
+            { timeout: 5000 },
+          )
+          .toBe("0");
+        expect(
+          (await act({ kind: "reconcile_fixture_access", accessId: use.accessId })).status,
+        ).toBe("succeeded");
+        expect(journal.fixtures.validation.use(authority.runId, use.accessId)).toMatchObject({
+          status: "stopped",
+          remoteStopped: true,
+        });
+        expect(journal.delivery.evidence(authority.runId, evidence.evidenceId)).toEqual(evidence);
+        expect(journal.delivery.satisfiesCheck(authority.runId, evidence.evidenceId)).toBe(false);
+      } finally {
+        f.cleanup();
+      }
+    });
+  },
+);

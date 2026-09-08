@@ -5,7 +5,7 @@ import { Command, Option } from "commander";
 import { render } from "ink";
 import { StateStore, defaultStatePath } from "./adapters/store.js";
 import { createRun, handoffRuntime } from "./bootstrap.js";
-import { bindFixtureProvider } from "./adapters/fixtures.js";
+import { bindFixtureExecutable, bindFixtureProvider } from "./adapters/fixtures.js";
 import { FixtureOperationSchema } from "./domain/fixtures.js";
 import { OrchestratorController } from "./controller.js";
 import {
@@ -89,6 +89,54 @@ export function createProgram() {
     .name("epicd")
     .description("Persistent Astra engineering lead under a Git and Beads safety kernel")
     .version("0.1.0");
+  stateOption(
+    program
+      .command("grant-fixture-validation <run-id> <fixture-id>")
+      .description(
+        "Grant checked SQL use of a declared disposable database and its dedicated role; separate from creation authority",
+      ),
+  )
+    .requiredOption("--control-version <number>", "version observed in status", versionNumber)
+    .requiredOption("--expires-at <ISO-time>", "expiry within the next 24 hours")
+    .requiredOption("--psql-path <path>", "canonical native psql executable")
+    .action(
+      async (
+        runId: string,
+        fixtureId: string,
+        options: BaseOptions & { controlVersion: number; expiresAt: string; psqlPath: string },
+      ) =>
+        withStore(options, async (store) => {
+          const fixtures = store.orchestration.fixtures,
+            definition = fixtures.definition(runId, fixtureId),
+            policy = fixtures.validation.policy(runId, fixtureId);
+          const binding = await bindFixtureProvider(definition, resolve(options.psqlPath));
+          const pgbouncer = await bindFixtureExecutable(policy.pgbouncerExecutable);
+          const grant = fixtures.validation.grant(runId, options.controlVersion, {
+            fixtureId,
+            binding,
+            pgbouncer,
+            expiresAt: options.expiresAt,
+          });
+          process.stdout.write(
+            `SQL-access grant ${grant.grantId} recorded; no server query or adoption occurred. Runtime still requires owned creation and restricted-role checks.\n`,
+          );
+        }),
+    );
+  stateOption(
+    program
+      .command("revoke-fixture-validation <run-id> <grant-id>")
+      .description("Revoke SQL access without discarding unsettled database work"),
+  )
+    .requiredOption("--control-version <number>", "version observed in status", versionNumber)
+    .action(
+      async (runId: string, grantId: string, options: BaseOptions & { controlVersion: number }) =>
+        withStore(options, (store) => {
+          store.orchestration.fixtures.validation.revoke(runId, options.controlVersion, grantId);
+          process.stdout.write(
+            "SQL access revoked. Resource exclusions remain until local and remote stop are proven.\n",
+          );
+        }),
+    );
   stateOption(
     program
       .command("grant-fixture <run-id> <fixture-id>")
