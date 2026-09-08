@@ -525,14 +525,21 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     const s = await fixture(),
       run = s.authority.runId;
     const action = await request(s, "capture_candidate");
-    const capture = s.manager.capture.bind(s.manager);
-    vi.spyOn(s.manager, "capture").mockImplementation(async (...args) => {
-      await capture(...args);
-      throw new Error("Lost captured manifest");
-    });
-    const lost = await s.dispatch(action);
-    expect(lost.status).toBe("indeterminate");
+    // The worker is now a separate process. Fault the real durable snapshot write,
+    // not a parent-only method that cannot intercept its result.
+    const db = new Database(s.path);
+    let lost;
+    try {
+      db.exec(
+        "CREATE TRIGGER deny_capture_snapshot BEFORE UPDATE ON candidates WHEN json_extract(NEW.record_json, '$.captureIO.pendingSnapshot') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'Lost captured manifest'); END",
+      );
+      lost = await s.dispatch(action);
+    } finally {
+      db.close();
+    }
+    expect(lost.status).toBe("failed");
     const refs = git(s.workspace.path, "for-each-ref", "refs/epicd/candidates/");
+    expect(refs).not.toBe("");
     const recovered = cold(s);
     const captures = vi.spyOn(recovered.manager, "capture");
     expect(

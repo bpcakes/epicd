@@ -1,12 +1,10 @@
 import type { ActionContext, ActionKernel } from "./actions.js";
 import { CapabilityRejected, OperationFailed } from "./guards.js";
-import { WorkspaceError, type WorkspaceManager } from "../adapters/workspaces.js";
-import { AgentCoordinationError } from "../adapters/agent-journal.js";
-import { DeliveryError } from "../adapters/delivery-journal.js";
-import { KernelGitError } from "../adapters/kernel-git.js";
+import type { WorkspaceManager } from "../adapters/workspaces.js";
 import { runCandidateValidation } from "../adapters/validation.js";
 import { redactSensitiveText } from "../util/redact.js";
 import { FixtureAuthorityError } from "../adapters/fixture-journal.js";
+import { runCaptureIO } from "../adapters/capture-io.js";
 
 /** Installs executable capabilities; it does not select any follow-up action. */
 export function registerDeliveryCapabilities(
@@ -32,11 +30,23 @@ export function registerDeliveryCapabilities(
     artifactIds: [],
   }));
   kernel.registerLocal("inspect_candidate", ({ authority }, action) => {
-    const { snapshot, ...candidate } = journal.delivery.candidate(authority.runId, action);
+    const { snapshot, captureIO, ...candidate } = journal.delivery.candidate(
+      authority.runId,
+      action,
+    );
     return {
       kind: "inspection",
       text: JSON.stringify({
         ...candidate,
+        captureIO: captureIO
+          ? {
+              workspaceOperationId: captureIO.workspaceOperationId,
+              snapshotRetained: captureIO.pendingSnapshot !== null,
+              settled:
+                journal.agents.workspaceOperation(authority.runId, captureIO.workspaceOperationId)
+                  .stopEvidence !== null,
+            }
+          : null,
         snapshot: snapshot
           ? { ...snapshot, manifest: undefined, files: snapshot.manifest.length }
           : null,
@@ -94,36 +104,14 @@ export function registerDeliveryCapabilities(
         "capture_settled",
         "Inspect the already recorded candidate outcome",
       );
-    try {
-      const snapshot = await workspaces.capture(
-        authority,
-        candidate,
-        candidate.candidateId,
-        signal,
-      );
-      journal.delivery.finishCapture(authority, candidate, snapshot);
-      return {
-        kind: "resource",
-        resourceId: candidate.candidateId,
-        generation: candidate.candidateGeneration,
-      };
-    } catch (error) {
-      if (
-        error instanceof WorkspaceError ||
-        error instanceof AgentCoordinationError ||
-        error instanceof DeliveryError ||
-        error instanceof KernelGitError ||
-        signal.aborted
-      ) {
-        journal.delivery.failCapture(
-          authority,
-          candidate,
-          error instanceof Error ? error.message : "Capture cancelled",
-        );
-        throw new OperationFailed(error instanceof Error ? error.message : "Capture failed");
-      }
-      throw error; // Unknown I/O/persistence failures need reconciliation, never blind replay.
-    }
+    const settled = await runCaptureIO(journal, workspaces, authority, candidate, signal);
+    if (settled.status !== "captured")
+      throw new OperationFailed(settled.failure ?? "Capture failed");
+    return {
+      kind: "resource",
+      resourceId: settled.candidateId,
+      generation: settled.candidateGeneration,
+    };
   });
   kernel.registerExternal(
     "create_review_workspace",

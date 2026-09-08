@@ -72,15 +72,45 @@ export const CandidateRecordSchema = CandidateIdentitySchema.extend({
   validationPlanId: Id,
   policyDigest: Id,
   status: z.enum(["capturing", "captured", "failed"]),
+  // The worker retains bytes here; only independent stop reconciliation promotes them.
+  captureIO: z
+    .strictObject({
+      workspaceOperationId: z.uuid(),
+      controllerLeaseId: Id,
+      pendingSnapshot: WorkspaceSnapshotSchema.nullable(),
+    })
+    .nullable(),
   snapshot: WorkspaceSnapshotSchema.nullable(),
   failure: z.string().max(4000).nullable(),
   createdAt: At,
   capturedAt: At.nullable(),
-}).refine(
-  (value) =>
-    (value.status === "captured") === (value.snapshot !== null && value.capturedAt !== null),
-  "A captured candidate requires an exact snapshot",
-);
+})
+  .refine(
+    (value) =>
+      (value.source.kind === "implementation") === (value.captureIO !== null) &&
+      (value.captureIO?.pendingSnapshot == null ||
+        (value.status === "capturing" && value.failure === null)),
+    "Only an implementation capture has a worker intent; unsettled bytes are never a terminal snapshot",
+  )
+  .refine(
+    (value) =>
+      value.status === "captured"
+        ? value.snapshot !== null && value.capturedAt !== null && value.failure === null
+        : value.snapshot === null && value.capturedAt === null,
+    "A captured candidate requires an exact snapshot",
+  )
+  .refine(
+    (value) =>
+      [value.snapshot, value.captureIO?.pendingSnapshot].every(
+        (snapshot) =>
+          !snapshot ||
+          (snapshot.runId === value.runId &&
+            snapshot.workspaceId === value.workspaceId &&
+            snapshot.workspaceGeneration === value.workspaceGeneration &&
+            digestJson(snapshot.manifest) === snapshot.fingerprint),
+      ),
+    "Retained snapshots must match the candidate identity and manifest fingerprint",
+  );
 export type CandidateRecord = z.infer<typeof CandidateRecordSchema>;
 export const CandidateWorkspaceSchema = WorkspaceIdentitySchema.extend({
   schemaVersion: z.literal(1),

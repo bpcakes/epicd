@@ -9,6 +9,7 @@ import { reconcileCommit } from "./commits.js";
 import { reconcileReview } from "./reviews.js";
 import { CapabilityRejected } from "./guards.js";
 import { reconcileValidationIO } from "../adapters/validation-io.js";
+import { reconcileCaptureIO } from "../adapters/capture-io.js";
 import { reconcileWorkspaceDisposal } from "../adapters/workspace-disposal-io.js";
 import { settleRecoveryObservation, type RecoveryObservation } from "./reconcile.js";
 
@@ -199,8 +200,9 @@ export async function reconcileDeliveryAction(
       };
     }
     if (action.kind === "capture_candidate") {
-      const candidate = journal.delivery.candidateForOperation(run, record.operationId);
+      let candidate = journal.delivery.candidateForOperation(run, record.operationId);
       if (!candidate) return failed("No capture intent exists; no candidate write was admitted");
+      candidate = await reconcileCaptureIO(journal, authority, candidate);
       if (candidate.status === "captured" && candidate.snapshot) {
         if (digestJson(candidate.snapshot.manifest) !== candidate.snapshot.fingerprint)
           return unresolved("Captured manifest integrity changed; preserve the original state");
@@ -208,15 +210,7 @@ export async function reconcileDeliveryAction(
       }
       if (candidate.status === "failed")
         return failed(candidate.failure ?? "Capture previously failed");
-      if (
-        journal.agents.activeWorkspaceOperation(run, candidate) ||
-        journal.agents.workspace(run, candidate).activeTurnId
-      )
-        return unresolved("Capture or source work may still be active; no snapshot was recreated");
-      const detail =
-        "Stopped capture did not durably retain its snapshot; preserve any private objects and choose a new capture if useful";
-      journal.delivery.failCapture(authority, candidate, detail);
-      return failed(detail);
+      return unresolved("Capture has no settled worker outcome; no snapshot was recreated");
     }
     if (
       action.kind === "create_review_workspace" ||

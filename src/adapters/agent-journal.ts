@@ -140,6 +140,7 @@ export function createAgentsSchema(db: Database.Database): void {
 }
 
 type Access = {
+  captureInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   validationInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   transaction<T>(authority: ControllerAuthority, body: () => T): T;
   control(runId: string): ControlState;
@@ -564,6 +565,10 @@ export class AgentJournal {
         operation.kind === "validation" &&
         operation.execution === null &&
         this.access.validationInterruptedBeforeLaunch(authority.runId, operationId);
+      const unlaunchedCapture =
+        operation.kind === "capture" &&
+        operation.execution === null &&
+        this.access.captureInterruptedBeforeLaunch(authority.runId, operationId);
       if (operation.execution && !operation.executionStop)
         throw new AgentCoordinationError(
           "workspace_execution_unsettled",
@@ -572,7 +577,8 @@ export class AgentJournal {
       if (
         operation.controllerLeaseId !== authority.leaseId &&
         !independentlyStopped &&
-        !unlaunchedValidation
+        !unlaunchedValidation &&
+        !unlaunchedCapture
       )
         throw new AgentCoordinationError(
           "workspace_operation_uncertain",
@@ -614,11 +620,12 @@ export class AgentJournal {
       const operation = this.workspaceOperation(authority.runId, operationId);
       const execution = CommandLifetimeSchema.parse(input);
       if (
-        !["validation", "commit"].includes(operation.kind) ||
+        !["validation", "commit", "capture"].includes(operation.kind) ||
         operation.controllerLeaseId !== authority.leaseId ||
         operation.stopEvidence ||
         operation.execution ||
         this.access.validationInterruptedBeforeLaunch(authority.runId, operationId) ||
+        this.access.captureInterruptedBeforeLaunch(authority.runId, operationId) ||
         execution.runId !== authority.runId ||
         execution.operationId !== operationId ||
         execution.controllerLeaseId !== operation.controllerLeaseId ||
@@ -626,7 +633,7 @@ export class AgentJournal {
       )
         throw new AgentCoordinationError(
           "workspace_execution_conflict",
-          "Workspace execution requires its original unused validation or commit operation",
+          "Workspace execution requires its original unused validation, commit or capture operation",
         );
       operation.execution = execution;
       this.db

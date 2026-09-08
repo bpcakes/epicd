@@ -77,7 +77,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 39;
+export const ORCHESTRATION_SCHEMA_VERSION = 40;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -300,6 +300,14 @@ export class OrchestrationJournal {
       turn: (runId, identity) => this.agents.turn(runId, identity),
     });
     this.agents = new AgentJournal(db, {
+      captureInterruptedBeforeLaunch: (runId, operationId) => {
+        const candidate = this.delivery.candidateForWorkspaceOperation(runId, operationId);
+        return (
+          candidate?.status === "failed" &&
+          candidate.snapshot === null &&
+          candidate.captureIO?.pendingSnapshot === null
+        );
+      },
       validationInterruptedBeforeLaunch: (runId, operationId) => {
         const evidence = this.delivery.validationForWorkspaceOperation(runId, operationId);
         return evidence?.status === "interrupted" && evidence.outcome === null;

@@ -67,6 +67,8 @@ export function createDeliverySchema(db: Database.Database): void {
     ) STRICT;
     CREATE UNIQUE INDEX IF NOT EXISTS one_pending_candidate ON candidates(run_id, task_id)
       WHERE json_extract(record_json, '$.status') = 'capturing';
+    CREATE UNIQUE INDEX IF NOT EXISTS one_capture_per_workspace_operation
+      ON candidates(json_extract(record_json, '$.captureIO.workspaceOperationId'));
     CREATE TABLE IF NOT EXISTS candidate_workspaces (
       workspace_id TEXT PRIMARY KEY, workspace_generation INTEGER NOT NULL,
       run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
@@ -314,6 +316,12 @@ export class DeliveryJournal {
           "capture_uncertain",
           "Reconcile the earlier candidate capture before creating another",
         );
+      const exclusion = this.access.agents.beginWorkspaceOperation(
+        authority,
+        workspace,
+        "capture",
+        this.access.control(authority.runId).controlVersion,
+      );
       const candidate = CandidateRecordSchema.parse({
         schemaVersion: 1,
         runId: authority.runId,
@@ -332,6 +340,11 @@ export class DeliveryJournal {
         validationPlanId: plan.planId,
         policyDigest: record.policyDigest,
         status: "capturing",
+        captureIO: {
+          workspaceOperationId: exclusion.operationId,
+          controllerLeaseId: authority.leaseId,
+          pendingSnapshot: null,
+        },
         snapshot: null,
         createdAt: now(),
         capturedAt: null,
@@ -416,6 +429,7 @@ export class DeliveryJournal {
         validationPlanId: plan.planId,
         policyDigest: record.policyDigest,
         status: "captured",
+        captureIO: null,
         snapshot: target.snapshot,
         failure: null,
         createdAt: now(),
@@ -446,41 +460,67 @@ export class DeliveryJournal {
       : null;
   }
 
-  finishCapture(
+  /** Trusted fixed worker only. Retaining bytes does not release exclusion or admit review. */
+  recordCaptureOutcome(
     authority: ControllerAuthority,
     identity: CandidateIdentity,
-    input: WorkspaceSnapshot,
+    input: { snapshot: WorkspaceSnapshot } | { failure: string },
   ): CandidateRecord {
     return this.access.transaction(authority, () => {
       const candidate = this.candidate(authority.runId, identity);
-      if (candidate.status === "failed")
-        throw new DeliveryError("capture_failed", "A failed capture cannot be silently promoted");
-      const snapshot = WorkspaceSnapshotSchema.parse(input);
+      const io = candidate.captureIO;
+      if (!io || candidate.status !== "capturing" || io.controllerLeaseId !== authority.leaseId)
+        throw new DeliveryError(
+          "capture_owner_changed",
+          "Only the original pending capture may retain an outcome",
+        );
+      const operation = this.access.agents.workspaceOperation(
+        authority.runId,
+        io.workspaceOperationId,
+      );
+      if (
+        operation.kind !== "capture" ||
+        operation.workspaceId !== candidate.workspaceId ||
+        operation.workspaceGeneration !== candidate.workspaceGeneration ||
+        operation.controllerLeaseId !== io.controllerLeaseId ||
+        !operation.execution ||
+        operation.executionStop ||
+        operation.stopEvidence
+      )
+        throw new DeliveryError(
+          "capture_execution_changed",
+          "Capture requires its bound running worker",
+        );
+      const snapshot = "snapshot" in input ? WorkspaceSnapshotSchema.parse(input.snapshot) : null;
+      const failure = "failure" in input ? redactSensitiveText(input.failure, 3999) : null;
       const workspace = this.access.agents.workspace(authority.runId, candidate);
       if (
-        snapshot.runId !== authority.runId ||
-        snapshot.workspaceId !== candidate.workspaceId ||
-        snapshot.workspaceGeneration !== candidate.workspaceGeneration ||
-        snapshot.parentRevision !== workspace.baselineRevision ||
-        digestJson(snapshot.manifest) !== snapshot.fingerprint
+        snapshot &&
+        (snapshot.runId !== authority.runId ||
+          snapshot.workspaceId !== candidate.workspaceId ||
+          snapshot.workspaceGeneration !== candidate.workspaceGeneration ||
+          snapshot.parentRevision !== workspace.baselineRevision ||
+          digestJson(snapshot.manifest) !== snapshot.fingerprint)
       )
         throw new DeliveryError(
           "capture_mismatch",
           "Snapshot does not match its reserved source identity and fingerprint",
         );
-      if (candidate.snapshot) {
-        if (digestJson(candidate.snapshot) !== digestJson(snapshot))
+      if (io.pendingSnapshot || candidate.failure !== null) {
+        if (
+          digestJson(io.pendingSnapshot) !== digestJson(snapshot) ||
+          candidate.failure !== failure
+        )
           throw new DeliveryError(
             "capture_conflict",
             "Candidate identity already holds different bytes",
           );
         return candidate;
       }
-      if (Buffer.byteLength(JSON.stringify(snapshot)) > 32 * 1024 * 1024)
+      if (snapshot && Buffer.byteLength(JSON.stringify(snapshot)) > 32 * 1024 * 1024)
         throw new DeliveryError("manifest_too_large", "Candidate manifest exceeds 32 MiB");
-      candidate.snapshot = snapshot;
-      candidate.status = "captured";
-      candidate.capturedAt = now();
+      io.pendingSnapshot = snapshot;
+      candidate.failure = failure;
       this.db
         .prepare("UPDATE candidates SET record_json = ? WHERE run_id = ? AND candidate_id = ?")
         .run(
@@ -488,18 +528,61 @@ export class DeliveryJournal {
           authority.runId,
           candidate.candidateId,
         );
-      this.changed(authority, "candidate.captured", candidate.candidateId);
+      this.changed(authority, "candidate.capture_outcome_retained", candidate.candidateId);
       return candidate;
     });
   }
 
-  failCapture(authority: ControllerAuthority, identity: CandidateIdentity, detail: string): void {
-    this.access.transaction(authority, () => {
+  /** Stop-only proof cannot invent a snapshot, and an object/ref is not stop proof. */
+  finishCaptureIO(authority: ControllerAuthority, identity: CandidateIdentity): CandidateRecord {
+    return this.access.transaction(authority, () => {
       const candidate = this.candidate(authority.runId, identity);
-      if (candidate.status !== "capturing")
-        throw new DeliveryError("capture_settled", "Capture already has a terminal outcome");
-      candidate.status = "failed";
-      candidate.failure = redactSensitiveText(detail, 3999);
+      const io = candidate.captureIO;
+      if (!io)
+        throw new DeliveryError(
+          "capture_intent_missing",
+          "Published epic candidates have no capture worker",
+        );
+      const operation = this.access.agents.workspaceOperation(
+        authority.runId,
+        io.workspaceOperationId,
+      );
+      if (
+        operation.kind !== "capture" ||
+        operation.workspaceId !== candidate.workspaceId ||
+        operation.workspaceGeneration !== candidate.workspaceGeneration ||
+        operation.controllerLeaseId !== io.controllerLeaseId ||
+        (operation.execution !== null && operation.executionStop === null)
+      )
+        throw new DeliveryError(
+          "capture_io_unsettled",
+          "Capture lacks its complete workspace-worker stop proof",
+        );
+      if (operation.stopEvidence) {
+        if (candidate.status === "capturing")
+          throw new DeliveryError(
+            "capture_outcome_unsettled",
+            "Stopped capture has no terminal journal outcome",
+          );
+        return candidate;
+      }
+      if (
+        candidate.status !== "capturing" ||
+        (io.pendingSnapshot && operation.executionStop?.kind !== "stopped") ||
+        (candidate.failure !== null && !operation.execution)
+      )
+        throw new DeliveryError(
+          "capture_execution_missing",
+          "Capture outcome differs from its admitted worker",
+        );
+      candidate.snapshot = io.pendingSnapshot;
+      candidate.status = candidate.snapshot ? "captured" : "failed";
+      candidate.capturedAt = candidate.snapshot ? now() : null;
+      candidate.failure = candidate.snapshot
+        ? null
+        : (candidate.failure ??
+          "Stopped capture did not durably retain its snapshot; preserve any private objects and choose a new capture if useful");
+      io.pendingSnapshot = null;
       this.db
         .prepare("UPDATE candidates SET record_json = ? WHERE run_id = ? AND candidate_id = ?")
         .run(
@@ -507,7 +590,20 @@ export class DeliveryJournal {
           authority.runId,
           candidate.candidateId,
         );
-      this.changed(authority, "candidate.capture_failed", candidate.candidateId);
+      this.access.agents.finishWorkspaceOperation(
+        authority,
+        operation.operationId,
+        candidate.status === "captured" ? "succeeded" : "failed",
+        operation.execution
+          ? "Independent complete-capture worker stop receipt retained; only the original durable snapshot may be promoted"
+          : "Capture interrupted before any fixed worker was admitted; later binding and launch are forbidden",
+      );
+      this.changed(
+        authority,
+        candidate.status === "captured" ? "candidate.captured" : "candidate.capture_failed",
+        candidate.candidateId,
+      );
+      return candidate;
     });
   }
 
@@ -996,6 +1092,15 @@ export class DeliveryJournal {
   }
   candidateForOperation(runId: string, operationId: string): CandidateRecord | null {
     return this.byOperation(CandidateRecordSchema, "candidates", runId, operationId);
+  }
+  candidateForWorkspaceOperation(runId: string, operationId: string): CandidateRecord | null {
+    return (
+      this.all(
+        CandidateRecordSchema,
+        "SELECT record_json FROM candidates WHERE run_id=? AND json_extract(record_json, '$.captureIO.workspaceOperationId')=?",
+        [runId, operationId],
+      )[0] ?? null
+    );
   }
   validationForOperation(runId: string, operationId: string): ValidationEvidence | null {
     return this.byOperation(ValidationEvidenceSchema, "validation_evidence", runId, operationId);

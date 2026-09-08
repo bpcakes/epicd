@@ -30,6 +30,7 @@ import { assertWorkspaceDirectory, retainedWorkspacePath } from "./workspace-dis
 import type { CommitRecord } from "../domain/commits.js";
 import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
 import { runCommitIO } from "./commit-io.js";
+import type { CandidateIdentity } from "../domain/delivery.js";
 
 const FILE_LIMIT = 64 * 1024 * 1024;
 const CHECKOUT_LIMIT = 512 * 1024 * 1024;
@@ -152,6 +153,7 @@ export class WorkspaceManager {
     });
   }
 
+  /** Low-level trusted workspace primitive. Delivery capture uses the fixed worker below. */
   async capture(
     authority: ControllerAuthority,
     identity: WorkspaceIdentity,
@@ -163,6 +165,41 @@ export class WorkspaceManager {
     return this.exclusive(authority, identity, "capture", () =>
       this.captureStopped(authority, identity, snapshotId, signal),
     );
+  }
+
+  /** Fixed worker only; its caller owns the independently supervised workspace exclusion. */
+  async executeCandidateCapture(authority: ControllerAuthority, identity: CandidateIdentity) {
+    const candidate = this.journal.delivery.candidate(authority.runId, identity);
+    const io = candidate.captureIO;
+    if (!io)
+      throw new WorkspaceError(
+        "capture_intent_missing",
+        "Capture requires its reserved worker intent",
+      );
+    const operation = this.journal.agents.workspaceOperation(
+      authority.runId,
+      io.workspaceOperationId,
+    );
+    if (
+      candidate.status !== "capturing" ||
+      io.controllerLeaseId !== authority.leaseId ||
+      !operation.execution ||
+      operation.executionStop ||
+      operation.stopEvidence
+    )
+      throw new WorkspaceError(
+        "capture_execution_missing",
+        "Capture requires its bound running worker",
+      );
+    try {
+      const snapshot = await this.captureStopped(authority, candidate, candidate.candidateId);
+      this.journal.delivery.recordCaptureOutcome(authority, candidate, { snapshot });
+    } catch (error) {
+      this.journal.delivery.recordCaptureOutcome(authority, candidate, {
+        failure: error instanceof Error ? error.message : "Capture failed",
+      });
+      throw error;
+    }
   }
 
   private async captureStopped(
