@@ -179,6 +179,9 @@ describe.runIf(process.platform === "linux")("diagnostic reviewer conversations"
     };
     const started = await s.kernel.execute(s.decision(action), s.authority);
     if (started.status !== "running") throw new Error("Expected running diagnostic");
+    // Retain the live handle before interruption can settle and evict it from the registry.
+    const pending = s.kernel.operation(started.operationId);
+    expect(pending).not.toBeNull();
     await waitFor(() => {
       const turn = s.journal.agents.turns(s.authority.runId).at(-1);
       return turn?.identity.operationId === started.operationId && !!turn.submissionAcknowledgement;
@@ -192,7 +195,8 @@ describe.runIf(process.platform === "linux")("diagnostic reviewer conversations"
         turnId: turn.identity.turnId,
       }),
     ).toMatchObject({ status: "succeeded" });
-    expect(await s.kernel.operation(started.operationId)).toMatchObject({ status: "failed" });
+    expect(await pending).toMatchObject({ status: "failed" });
+    expect(s.kernel.operation(started.operationId)).toBeNull();
     expect(s.journal.agents.turn(s.authority.runId, turn.identity)).toMatchObject({
       status: "cancelled",
       resultEligible: false,
