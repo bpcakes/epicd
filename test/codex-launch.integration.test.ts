@@ -1,5 +1,7 @@
 import {
   copyFile,
+  chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
@@ -30,6 +32,9 @@ import {
 } from "../src/adapters/codex-launch.js";
 import { writeCodexConfinement } from "../src/adapters/codex-confinement.js";
 import { runCommand } from "../src/util/command.js";
+import { REVIEW_PACKET_PATH, reviewPacketBinding } from "../src/domain/review-packet.js";
+import { startNamespaceProcess } from "../src/adapters/pid-namespace.js";
+import { CODEX_PERMISSION_PROFILE } from "../src/adapters/codex-confinement.js";
 
 const roots: { path: string; controls: string[] }[] = [];
 afterEach(async () => {
@@ -100,11 +105,118 @@ async function fixture() {
     model: "gpt-6-astra",
     reasoningEffort: "high" as const,
     authCachePath: null,
+    reviewPacket: null,
   };
   return { root, input };
 }
 
 describe.skipIf(process.platform !== "linux")("confined Codex launcher", () => {
+  it.runIf(process.env.EPICD_CODEX_CONFINEMENT === "1")(
+    "lets real Codex local tools read the packet but not change it or read launch control",
+    async () => {
+      const { input } = await fixture();
+      const text = '{"evidence":"complete retained bytes"}\n';
+      await writeFile(join(input.controlDirectory, "review-evidence.json"), text, { mode: 0o400 });
+      const { launch } = await createCodexLauncher(
+        { ...input, reviewPacket: reviewPacketBinding(text) },
+        fileURLToPath(import.meta.url),
+      );
+      const command = await codexLaunchCommand(launch, ["exec", "--version"]);
+      const output = join(input.confinement.artifacts, "packet-probe.json");
+      const script = `const fs = require('node:fs');
+        const text = fs.readFileSync(${JSON.stringify(REVIEW_PACKET_PATH)}, 'utf8');
+        let writable = false, controlReadable = false;
+        try { fs.appendFileSync(${JSON.stringify(REVIEW_PACKET_PATH)}, 'changed'); writable = true; } catch {}
+        try { fs.readFileSync(${JSON.stringify(join(input.controlDirectory, "launch.json"))}); controlReadable = true; } catch {}
+        fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({ text, writable, controlReadable }));`;
+      // Trusted contract probe replaces only the provider entrypoint with Codex's
+      // local sandbox command. No model request or simulated permission decision.
+      const args = [
+        ...command.args.slice(0, command.args.lastIndexOf("--") + 1),
+        input.confinement.executable,
+        "sandbox",
+        "-P",
+        CODEX_PERMISSION_PROFILE,
+        "-C",
+        input.confinement.workspace,
+        "--",
+        join(input.confinement.workspace, "fixture-node"),
+        "-e",
+        script,
+      ];
+      const namespace = startNamespaceProcess(command.command, args, {
+        cwd: command.cwd,
+        env: command.env,
+        stdio: "pipe",
+        extraInput: text,
+        timeoutMs: 10000,
+      });
+      const closed = once(namespace.child, "close");
+      namespace.child.stdout?.resume();
+      let stderr = "";
+      namespace.child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      try {
+        await closed;
+        expect(namespace.completion(), stderr).toEqual({ code: 0, reason: null });
+        expect(JSON.parse(await readFile(output, "utf8"))).toEqual({
+          text,
+          writable: false,
+          controlReadable: false,
+        });
+      } finally {
+        if (namespace.child.exitCode === null && namespace.child.signalCode === null)
+          namespace.interrupt();
+        await closed;
+      }
+    },
+    15000,
+  );
+
+  it("passes only verified packet bytes over private input, never the control path or credentials", async () => {
+    const { input } = await fixture();
+    const text = '{"evidence":"original retained record"}\n';
+    const path = join(input.controlDirectory, "review-evidence.json");
+    await writeFile(path, text, { mode: 0o400 });
+    const { launch } = await createCodexLauncher(
+      { ...input, reviewPacket: reviewPacketBinding(text) },
+      fileURLToPath(import.meta.url),
+    );
+    const command = await codexLaunchCommand(launch, ["exec", "--version"]);
+    expect(command.extraInput).toBe(text);
+    expect(command.args).toContain("--ro-bind-data");
+    expect(command.args).toContain(REVIEW_PACKET_PATH);
+    expect(command.args).not.toContain(path);
+    expect(JSON.stringify(command.env)).not.toContain(text);
+    expect(JSON.stringify(command.args)).not.toContain(text);
+    await chmod(path, 0o600);
+    await writeFile(path, text.replace("original", "tampered"));
+    await chmod(path, 0o400);
+    expect(command.extraInput).toBe(text); // Already verified bytes do not follow the host file.
+    await expect(codexLaunchCommand(launch, ["exec", "--version"])).rejects.toThrow("differs");
+  });
+
+  it.each(["missing", "writable", "symlink", "hardlink"])(
+    "refuses a %s review packet before starting Codex",
+    async (variant) => {
+      const { input, root } = await fixture();
+      const text = "packet";
+      const path = join(input.controlDirectory, "review-evidence.json");
+      const retained = join(root, "retained");
+      await writeFile(retained, text, { mode: 0o400 });
+      if (variant === "writable") await writeFile(path, text, { mode: 0o600 });
+      if (variant === "symlink") await symlink(retained, path);
+      if (variant === "hardlink") await link(retained, path);
+      const { launch } = await createCodexLauncher(
+        { ...input, reviewPacket: reviewPacketBinding(text) },
+        fileURLToPath(import.meta.url),
+      );
+      await expect(codexLaunchCommand(launch, ["exec", "--version"])).rejects.toThrow();
+      expect(await readFile(retained, "utf8")).toBe(text);
+    },
+  );
+
   it("pins model and effort and rejects sandbox, provider, config, and session drift", async () => {
     const { input } = await fixture();
     const { launch } = await createCodexLauncher(input, fileURLToPath(import.meta.url));

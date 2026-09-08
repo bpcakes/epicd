@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
@@ -16,6 +16,8 @@ import {
   preventCodexLaunchStart,
   readCodexLaunchStop,
 } from "./codex-launch.js";
+import { reviewPacketBinding } from "../domain/review-packet.js";
+import { digestJson } from "../domain/repository-policy.js";
 
 export type ControlledLaunchOptions = {
   root: string;
@@ -46,6 +48,7 @@ export class ControlledLaunches {
       throw new Error("Reconcile an existing launch instead of dispatching it again");
     const agent = journal.agents.instance(authority.runId, identity);
     const workspace = journal.agents.workspace(authority.runId, identity);
+    const packet = journal.reviews.packetForTurn(authority.runId, identity);
     const home = join(
       this.options.root,
       authority.runId,
@@ -65,15 +68,26 @@ export class ControlledLaunches {
       reasoningEffort: agent.contract.effective.reasoningEffort,
       authCachePath: this.options.authCachePath,
       controlDirectory: join(home, "launches", identity.turnId),
+      reviewPacket: packet === null ? null : reviewPacketBinding(packet),
     });
     journal.agents.bindLaunch(authority, identity, manifest);
     // No asynchronous gap before durable dispatch admission.
     const turn = journal.agents.markSubmitting(authority, identity);
-    return { manifest, turn };
+    return { manifest, turn, packet };
   }
 
-  async materialize(manifest: CodexLaunch) {
+  async materialize(manifest: CodexLaunch, packet: string | null) {
     await this.ensureControlDirectory(manifest);
+    if (
+      digestJson(packet === null ? null : reviewPacketBinding(packet)) !==
+      digestJson(manifest.reviewPacket)
+    )
+      throw new Error("Review packet content differs from the reserved launch");
+    if (packet !== null)
+      await writeFile(join(manifest.controlDirectory, "review-evidence.json"), packet, {
+        flag: "wx",
+        mode: 0o400,
+      });
     for (const path of [
       manifest.confinement.providerHome,
       manifest.confinement.scratch,

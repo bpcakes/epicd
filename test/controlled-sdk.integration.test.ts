@@ -445,6 +445,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       reasoningEffort: "high",
       authCachePath: null,
       controlDirectory: join(home, "control"),
+      reviewPacket: null,
     });
     setup.store.orchestration.agents.bindLaunch(setup.authority, prepared.identity, manifest);
     setup.store.orchestration.agents.markSubmitting(setup.authority, prepared.identity);

@@ -51,6 +51,7 @@ describe("native confined Herdr launch", () => {
         {
           confinement,
           controlDirectory,
+          reviewPacket: null,
           model: "gpt-6-astra",
           reasoningEffort: "high",
           authCachePath: await realpath(

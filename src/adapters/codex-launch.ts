@@ -15,6 +15,8 @@ import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { z } from "zod";
 import { codexConfinementConfig } from "./codex-confinement.js";
+import { REVIEW_PACKET_PATH, reviewPacketBinding } from "../domain/review-packet.js";
+import { digestJson } from "../domain/repository-policy.js";
 import {
   CodexLaunchSchema,
   CodexLaunchStopSchema,
@@ -262,6 +264,32 @@ export async function prepareCodexAccessToken(launch: CodexLaunch, signal?: Abor
   await rename(temporary, target);
 }
 
+/** Exact private file, not an arbitrary caller-selected mount. Check again before recording stop. */
+export async function verifyCodexReviewPacket(launch: CodexLaunch) {
+  if (launch.reviewPacket === null) return;
+  const path = join(launch.controlDirectory, "review-evidence.json");
+  await privateDirectory(launch.controlDirectory);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await file.stat();
+    if (
+      !info.isFile() ||
+      info.nlink !== 1 ||
+      info.uid !== process.getuid?.() ||
+      (info.mode & 0o777) !== 0o400 ||
+      info.size !== launch.reviewPacket.byteLength ||
+      (await realpath(path)) !== path
+    )
+      throw new Error("Review packet must be an exact private read-only file");
+    const content = await file.readFile("utf8");
+    if (digestJson(reviewPacketBinding(content)) !== digestJson(launch.reviewPacket))
+      throw new Error("Review packet content differs from the reserved launch");
+    return content;
+  } finally {
+    await file.close();
+  }
+}
+
 /**
  * Build the real outer Codex process boundary. Only Codex's model connection shares
  * the network; its local tools must use the nested no-network permission profile.
@@ -272,6 +300,7 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
   const launch = CodexLaunchSchema.parse(launchInput);
   const spec = launch.confinement;
   const config = codexConfinementConfig(spec);
+  const packet = await verifyCodexReviewPacket(launch);
   for (const path of [spec.workspace, spec.providerHome, spec.scratch, spec.artifacts]) {
     if (overlap(path, launch.controlDirectory))
       throw new Error("Launch control must be outside agent storage");
@@ -375,6 +404,20 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
       throw new Error("A runtime mount would expose launch control or the managed auth cache");
     index += 2;
   }
+  if (launch.reviewPacket !== null) {
+    const path = join(launch.controlDirectory, "review-evidence.json");
+    if (launch.authCachePath && overlap(path, launch.authCachePath))
+      throw new Error("A review packet must not expose the managed auth cache");
+    if (
+      [launch.controlDirectory, launch.authCachePath].some(
+        (entry) => entry && overlap(entry, REVIEW_PACKET_PATH),
+      )
+    )
+      throw new Error("Review packet target overlaps private launch storage");
+    // Copy the verified bytes over the guardian's private input descriptor. The
+    // mount never follows a mutable host pathname after the integrity check.
+    mounts.push("--ro-bind-data", "3", REVIEW_PACKET_PATH);
+  }
   mounts.push("--chdir", spec.workspace, "--", spec.executable, ...args);
   const env: Record<string, string> = {
     PATH: "/usr/bin:/bin",
@@ -385,7 +428,7 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
     TERM: process.env.TERM ?? "xterm-256color",
   };
   // Authentication is a private token-only cache, not argv or environment output.
-  return { command: "/usr/bin/bwrap", args: mounts, env, cwd: spec.workspace };
+  return { command: "/usr/bin/bwrap", args: mounts, env, cwd: spec.workspace, extraInput: packet };
 }
 
 /** Reject transport flags that would override the frozen policy or switch provider. */

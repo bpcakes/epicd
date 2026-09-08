@@ -158,21 +158,15 @@ export class DiagnosticJournal {
       limit > 65536
     )
       throw new DiagnosticRequestError("Invalid diagnostic character range");
-    const row = this.db
-      .prepare("SELECT * FROM diagnostic_artifacts WHERE run_id = ? AND artifact_id = ?")
-      .get(runId, artifactId) as ArtifactRow | undefined;
-    if (!row) throw new DiagnosticRequestError("Diagnostic artifact is not retained in this run");
-    const artifact = this.decode(row);
-    if (artifact.runId !== runId || artifact.artifactId !== artifactId)
-      throw new Error("Diagnostic artifact identity is inconsistent with its journal key");
+    const { artifact, text } = this.retained(runId, artifactId);
     const page = {
       ...artifact,
       evidenceWarning:
         "Diagnostic observation only; never validation, independent approval or proof of process stop. Gaps and omissions cannot be recovered by paging.",
       offsetUnit: "redacted_utf16_characters",
       offset,
-      total: row.content.length,
-      text: row.content.slice(offset, offset + limit),
+      total: text.length,
+      text: text.slice(offset, offset + limit),
       nextOffset: null as number | null,
     };
     // Escaping may make a character page much larger than its UTF-8 content.
@@ -180,6 +174,18 @@ export class DiagnosticJournal {
       page.text = page.text.slice(0, Math.floor(page.text.length / 2));
     page.nextOffset = offset + page.text.length < page.total ? offset + page.text.length : null;
     return page;
+  }
+
+  /** Complete retained content, still redacted and potentially originally truncated. */
+  retained(runId: string, artifactId: string) {
+    const row = this.db
+      .prepare("SELECT * FROM diagnostic_artifacts WHERE run_id = ? AND artifact_id = ?")
+      .get(runId, artifactId) as ArtifactRow | undefined;
+    if (!row) throw new DiagnosticRequestError("Diagnostic artifact is not retained in this run");
+    const artifact = this.decode(row);
+    if (artifact.runId !== runId || artifact.artifactId !== artifactId)
+      throw new Error("Diagnostic artifact identity is inconsistent with its journal key");
+    return { artifact, text: row.content };
   }
 
   usage(runId: string): { count: number; retainedBytes: number } {

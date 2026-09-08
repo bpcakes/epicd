@@ -94,7 +94,7 @@ export class ControlledHerdrRuntime {
     const agent = this.journal.agents.instance(authority.runId, identity);
     if (agent.contract.runtime !== "herdr")
       throw new Error("Controlled Herdr requires a native assignment");
-    const { turn, manifest } = this.launches.reserve(this.journal, authority, identity);
+    const { turn, manifest, packet } = this.launches.reserve(this.journal, authority, identity);
     const request = new AbortController();
     const abort = () => request.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
@@ -151,7 +151,7 @@ export class ControlledHerdrRuntime {
         );
     };
     try {
-      const launcher = await this.launches.materialize(manifest);
+      const launcher = await this.launches.materialize(manifest, packet);
       check();
       const artifacts = new HerdrArtifacts(manifest.confinement.artifacts);
       const artifact = await artifacts.prepare(identity);

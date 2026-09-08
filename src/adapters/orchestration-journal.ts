@@ -77,7 +77,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 38;
+export const ORCHESTRATION_SCHEMA_VERSION = 39;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",

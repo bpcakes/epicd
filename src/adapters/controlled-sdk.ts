@@ -31,7 +31,7 @@ export class ControlledSdkRuntime {
     if (agent.contract.runtime !== "sdk")
       throw new Error("Controlled SDK dispatch requires an SDK assignment");
     const workspace = this.journal.agents.workspace(authority.runId, identity);
-    const { manifest, turn } = this.launches.reserve(this.journal, authority, identity);
+    const { manifest, turn, packet } = this.launches.reserve(this.journal, authority, identity);
     const request = new AbortController();
     const abort = () => request.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
@@ -85,7 +85,7 @@ export class ControlledSdkRuntime {
     let stopWatching: (() => Promise<void>) | undefined;
     let transcriptError: unknown;
     try {
-      const launcher = await this.launches.materialize(manifest);
+      const launcher = await this.launches.materialize(manifest, packet);
       check();
       stopWatching = transcript.watch(sessionId, check, (error) => {
         transcriptError = error;

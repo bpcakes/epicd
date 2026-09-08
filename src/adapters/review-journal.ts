@@ -18,6 +18,7 @@ import type {
   ControllerAuthority,
   ControlState,
   ObservationInput,
+  TurnIdentity,
 } from "../domain/orchestration.js";
 import { digestJson } from "../domain/repository-policy.js";
 import type { AgentJournal } from "./agent-journal.js";
@@ -28,8 +29,14 @@ import type { DiagnosticJournal } from "./diagnostic-journal.js";
 import type { ReviewReference } from "../domain/review-references.js";
 import type { JournalRecordTarget } from "../domain/journal-records.js";
 import type { JournalRecordView } from "./journal-records.js";
+import { buildReviewPacket } from "./review-packet.js";
+import {
+  ReviewPacketSchema,
+  reviewPacketBinding,
+  reviewPacketContext,
+} from "../domain/review-packet.js";
 
-export const REVIEW_TABLES = ["review_evidence", "review_findings"] as const;
+export const REVIEW_TABLES = ["review_evidence", "review_findings", "review_packets"] as const;
 export function createReviewsSchema(db: Database.Database) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS review_evidence (
@@ -55,6 +62,13 @@ export function createReviewsSchema(db: Database.Database) {
       FOREIGN KEY(run_id, review_evidence_id) REFERENCES review_evidence(run_id, evidence_id),
       CHECK(json_extract(record_json, '$.findingId') = finding_id AND json_extract(record_json, '$.runId') = run_id AND
         json_extract(record_json, '$.taskId') = task_id AND json_extract(record_json, '$.reviewEvidenceId') = review_evidence_id)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS review_packets (
+      evidence_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id) ON DELETE CASCADE,
+      content TEXT NOT NULL CHECK(json_valid(content)),
+      FOREIGN KEY(run_id, evidence_id) REFERENCES review_evidence(run_id, evidence_id),
+      CHECK(json_extract(content, '$.evidenceId') = evidence_id AND
+        json_extract(content, '$.runId') = run_id)
     ) STRICT;
   `);
 }
@@ -176,6 +190,7 @@ export class ReviewJournal {
           .evidence.map((entry) => entry.evidenceId),
         findingIds,
         referenceDigest,
+        packetBinding: null,
         createdAt: at(),
         finishedAt: null,
       });
@@ -262,6 +277,45 @@ export class ReviewJournal {
       review.validationEvidenceIds = validation.evidence.map((entry) => entry.evidenceId);
       const findings = this.openFindings(authority.runId, review);
       const epicContext = this.access.delivery.epicReviewContext(authority.runId, review);
+      const targets: JournalRecordTarget[] = [
+        ...review.validationEvidenceIds.map((recordId) => ({
+          recordKind: "validation" as const,
+          recordId,
+        })),
+        ...(epicContext?.closedTasks.flatMap((task) => task.historicalRecords) ?? []),
+        ...(epicContext?.repairs.flatMap((repair) => repair.historicalRecords) ?? []),
+        ...findings.map((finding) => ({
+          recordKind: "review" as const,
+          recordId: finding.reviewEvidenceId,
+        })),
+      ];
+      const taskIds = new Set(
+        epicContext?.requirements.map((issue) => issue.id) ?? [review.taskId],
+      );
+      const unsettledTurnIds: string[] = [];
+      for (const turn of this.access.agents.turns(authority.runId)) {
+        if (
+          !turn.prompt.assignment.taskId ||
+          !taskIds.has(turn.prompt.assignment.taskId) ||
+          this.access.agents.instance(authority.runId, turn.identity).role === "orchestrator"
+        )
+          continue;
+        if (["completed", "failed", "cancelled"].includes(turn.status) && turn.stopEvidence)
+          targets.push({ recordKind: "agent_turn", recordId: turn.identity.turnId });
+        else unsettledTurnIds.push(turn.identity.turnId);
+      }
+      const packet = buildReviewPacket(
+        authority.runId,
+        review.evidenceId,
+        action.references,
+        targets,
+        unsettledTurnIds,
+        this.access,
+      );
+      review.packetBinding = reviewPacketBinding(packet);
+      this.db
+        .prepare("INSERT INTO review_packets VALUES (?, ?, ?)")
+        .run(review.evidenceId, authority.runId, packet);
       const context = {
         ...this.contextScope(review),
         epic: epicContext,
@@ -288,6 +342,7 @@ export class ReviewJournal {
         omittedFindings: findings.length,
         coordinatorRequest: action.instructions,
         primaryRecords: this.referenceRecords(review),
+        primaryEvidence: reviewPacketContext(packet),
         citationRules:
           "validationEvidenceIds may contain only unique evidenceId values from this turn's reviewContext.validation array. Historical diagnostics or results in coordinatorRequest or primaryRecords are not members of that array. resolutions may contain only unique findingId values from this turn's reviewContext.findings array; do not resolve an already-resolved historical finding again. Discuss other historical records in prose, not these authority-bearing ID fields. Empty arrays are valid when there are no applicable entries.",
         evidenceWarning:
@@ -529,6 +584,44 @@ export class ReviewJournal {
     if (digestJson(pages) !== review.referenceDigest)
       throw new Error("Retained review reference content no longer matches its admitted digest");
     return pages;
+  }
+
+  /** Kernel-only dispatch data. A reviewer cannot nominate a packet or a host path. */
+  packetForTurn(runId: string, identity: TurnIdentity): string | null {
+    const review = this.all(
+      ReviewEvidenceSchema,
+      "SELECT record_json FROM review_evidence WHERE run_id = ? AND turn_id = ?",
+      [runId, identity.turnId],
+    )[0];
+    if (!review) return null;
+    if (digestJson(review.turnIdentity) !== digestJson(identity))
+      throw new Error("Review packet turn identity changed");
+    const content = this.packet(review);
+    const context = this.access.agents.turn(runId, identity).prompt.reviewContext;
+    if (
+      !context ||
+      typeof context !== "object" ||
+      Array.isArray(context) ||
+      digestJson(context.primaryEvidence) !== digestJson(reviewPacketContext(content))
+    )
+      throw new Error("Review packet is not bound to the prepared prompt");
+    return content;
+  }
+
+  private packet(review: ReviewEvidence): string {
+    const row = this.db
+      .prepare("SELECT content FROM review_packets WHERE run_id = ? AND evidence_id = ?")
+      .get(review.runId, review.evidenceId) as { content: string } | undefined;
+    if (
+      !row ||
+      !review.packetBinding ||
+      digestJson(reviewPacketBinding(row.content)) !== digestJson(review.packetBinding)
+    )
+      throw new Error("Retained review packet failed its integrity check");
+    const packet = ReviewPacketSchema.parse(JSON.parse(row.content));
+    if (packet.runId !== review.runId || packet.evidenceId !== review.evidenceId)
+      throw new Error("Retained review packet identity changed");
+    return row.content;
   }
   records(runId: string, taskId?: string): ReviewEvidence[] {
     return this.all(
@@ -807,9 +900,12 @@ export class ReviewJournal {
       Array.isArray(context.primaryRecords) &&
       digestJson(context.primaryRecords) === review.referenceDigest &&
       digestJson(this.referenceRecords(review)) === review.referenceDigest &&
+      digestJson(context.primaryEvidence) ===
+        digestJson(reviewPacketContext(this.packet(review))) &&
       turn.prompt.diagnosticContext === undefined &&
       digestJson(turn.outputSchema) === digestJson(ADAPTIVE_REVIEW_OUTPUT_SCHEMA) &&
       launch?.controllerLeaseId === review.controllerLeaseId &&
+      digestJson(launch.manifest.reviewPacket) === digestJson(review.packetBinding) &&
       launch.manifest.confinement.sourceMode === "read-only" &&
       launch.manifest.confinement.workspace ===
         this.access.agents.workspace(review.runId, review).path &&

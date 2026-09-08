@@ -1,5 +1,6 @@
 import { lstat, realpath, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { REVIEW_PACKET_DIRECTORY, REVIEW_PACKET_PATH } from "../domain/review-packet.js";
 
 export const CODEX_PERMISSION_PROFILE = "epicd-isolated";
 const PROTECTED_SOURCE = [".git", ".beads", ".epicd", ".codex", "AGENTS.md"];
@@ -36,6 +37,9 @@ export function codexConfinementConfig(input: CodexConfinement): string {
     [spec.workspace]: spec.sourceMode === "read-only" ? "read" : "write",
     [spec.scratch]: "write",
     [spec.artifacts]: "write",
+    // Codex's nested sandbox needs the parent directory to bind the packet file.
+    // The outer namespace contains only this turn's packet at this virtual path.
+    [REVIEW_PACKET_DIRECTORY]: "read",
   };
   for (const path of PROTECTED_SOURCE) filesystem[join(spec.workspace, path)] = "read";
   return [
@@ -111,6 +115,9 @@ export async function writeCodexConfinement(input: CodexConfinement): Promise<st
 function validatePaths(input: CodexConfinement): CodexConfinement {
   const spec = structuredClone(input);
   const paths = [spec.workspace, spec.providerHome, spec.scratch, spec.artifacts];
+  for (const path of [...paths, spec.executable])
+    if (contains(path, REVIEW_PACKET_PATH) || contains(REVIEW_PACKET_DIRECTORY, path))
+      throw new Error("Codex storage must not overlap the reserved review evidence mount");
   if (
     !isAbsolute(spec.executable) ||
     resolve(spec.executable) !== spec.executable ||

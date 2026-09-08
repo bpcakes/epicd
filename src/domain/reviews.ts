@@ -2,6 +2,7 @@ import { z } from "zod";
 import { TurnIdentitySchema } from "./orchestration.js";
 import { RequiredCheckSchema } from "./repository-policy.js";
 import { agentOutputSchema } from "./types.js";
+import { ReviewPacketBindingSchema } from "./review-packet.js";
 
 const Id = z.string().min(1).max(256);
 export const AdaptiveFindingSchema = z.strictObject({
@@ -104,10 +105,12 @@ export const ReviewEvidenceSchema = z
     validationEvidenceIds: z.array(Id).max(100),
     findingIds: z.array(Id).max(100),
     referenceDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    packetBinding: ReviewPacketBindingSchema.nullable(),
     createdAt: z.iso.datetime(),
     finishedAt: z.iso.datetime().nullable(),
   })
   .refine((review) => (review.status === "finished") === (review.finishedAt !== null))
+  .refine((review) => review.turnIdentity === null || review.packetBinding !== null)
   .refine(
     (review) => review.report === null || (review.status === "finished" && review.sourceIntact),
   );

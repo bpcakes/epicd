@@ -133,12 +133,22 @@ export function epicRequirements(
     )
     .map((commit) => {
       const plan = journal.delivery.plan(runId, commit.validationPlanId);
+      const review = journal.reviews.evidence(runId, commit.reviewEvidenceId);
+      const historicalRecords: JournalRecordTarget[] = [
+        { recordKind: "commit", recordId: commit.commitId },
+        { recordKind: "review", recordId: review.evidenceId },
+        ...review.validationEvidenceIds.map((recordId) => ({
+          recordKind: "validation" as const,
+          recordId,
+        })),
+      ];
       return {
         commitId: commit.commitId,
         revision: commit.revision!,
         validationPlanId: plan.planId,
         acceptanceCriteria: plan.acceptanceCriteria,
         checks: plan.checks,
+        historicalRecords,
       };
     });
   const context = {

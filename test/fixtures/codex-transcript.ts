@@ -13,6 +13,7 @@ export async function transcriptFixture() {
     generation: randomUUID(),
     controlDirectory: join(root, "control"),
     authCachePath: null,
+    reviewPacket: null,
     model: "gpt-6-astra",
     reasoningEffort: "high",
     confinement: {

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { isAbsolute, resolve } from "node:path";
 import { ModelIdSchema, ReasoningEffortSchema } from "./types.js";
+import { ReviewPacketBindingSchema } from "./review-packet.js";
 
 export const LaunchPathSchema = z
   .string()
@@ -24,6 +25,7 @@ export const CodexLaunchSchema = z.strictObject({
   /** Only the cache pathname is persisted, never credentials. */
   authCachePath: LaunchPathSchema.nullable(),
   controlDirectory: LaunchPathSchema,
+  reviewPacket: ReviewPacketBindingSchema.nullable(),
 });
 export type CodexLaunch = z.infer<typeof CodexLaunchSchema>;
 

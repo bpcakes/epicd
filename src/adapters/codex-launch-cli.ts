@@ -9,6 +9,7 @@ import {
   codexLaunchCommand,
   prepareCodexAccessToken,
   writeCodexLaunchStop,
+  verifyCodexReviewPacket,
 } from "./codex-launch.js";
 import { redactSensitiveText } from "../util/redact.js";
 
@@ -80,6 +81,7 @@ async function main() {
       cwd: command.cwd,
       env: command.env,
       stdio: "inherit",
+      ...(command.extraInput === undefined ? {} : { extraInput: command.extraInput }),
     });
     const { child } = namespace;
     const stopChild = namespace.interrupt;
@@ -95,6 +97,7 @@ async function main() {
     abort.signal.removeEventListener("abort", stopChild);
     const error = namespace.failure();
     if (error) throw error;
+    await verifyCodexReviewPacket(launch);
     await terminal({ kind: "stopped", ...result, interrupted: abort.signal.aborted });
     process.exitCode = abort.signal.aborted ? 130 : (result.code ?? 1);
   } catch (error) {
