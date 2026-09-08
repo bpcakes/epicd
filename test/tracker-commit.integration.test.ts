@@ -175,9 +175,13 @@ describe.skipIf(process.platform !== "linux")("tracker-only delivery lineage", (
     if (accepted.kind !== "accepted") throw new Error("Expected early admission");
     s.journal.startAction(s.authority, accepted.action.actionId);
     await reserveTracker(s);
-    expect(() => s.journal.publications.reserve(s.authority, accepted.action.actionId)).toThrow(
-      "pending tracker commit",
-    );
+    expect(() =>
+      s.journal.publications.reserve(
+        s.authority,
+        accepted.action.actionId,
+        s.manager.storageRoot(),
+      ),
+    ).toThrow("pending tracker commit");
     expect(s.journal.publications.pending(s.authority.runId)).toBeNull();
     expect(
       await s.dispatch({

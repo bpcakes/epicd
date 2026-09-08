@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import type Database from "better-sqlite3";
 import {
   DeliveryRepositorySchema,
@@ -8,8 +9,11 @@ import {
   type PublicationRecord,
   type PublicationRepository,
   type PublicationPack,
-  type PublicationRefObservation,
   concurrentWithPublication,
+  PublicationIOAttemptSchema,
+  PublicationIOResultSchema,
+  type PublicationIOAttempt,
+  type PublicationIOResult,
 } from "../domain/publication.js";
 import type { AgentJournal } from "./agent-journal.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
@@ -27,7 +31,13 @@ import type { WorkspaceRecord } from "../domain/agents.js";
 import { RunStateSchema } from "../domain/types.js";
 import { digestJson } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
-import { WorkspaceOperationSchema } from "../domain/workspaces.js";
+import {
+  CommandLifetimeSchema,
+  CommandStopSchema,
+  assertCommandStop,
+  type CommandLifetime,
+  type CommandStop,
+} from "../domain/command-lifetime.js";
 import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
 
 export const PUBLICATION_TABLES = ["delivery_repositories", "publications"] as const;
@@ -64,6 +74,7 @@ type Access = {
   assertTrackerCommitIdle(runId: string): void;
   trackerCommit(runId: string, id: string): TrackerCommitRecord;
   assertTrackerCommitParent(record: TrackerCommitRecord): void;
+  workspaceCreationFailed(runId: string, workspace: WorkspaceRecord): boolean;
 };
 const fail = (code: string, message: string): never => {
   throw new DeliveryError(code, message);
@@ -90,9 +101,19 @@ export class PublicationJournal {
   assertActionAllowed(runId: string, kind: KernelAction["kind"]): void {
     if (!concurrentWithPublication(kind)) this.assertIdle(runId);
   }
-  reserve(authority: ControllerAuthority, actionId: string): PublicationRecord {
+  reserve(
+    authority: ControllerAuthority,
+    actionId: string,
+    workspaceRoot: string,
+  ): PublicationRecord {
     return this.access.transaction(authority, () => {
       this.assertIdle(authority.runId);
+      const configuredRoot = this.run(authority.runId).runtimeConfiguration?.workspaceRoot;
+      if (configuredRoot && configuredRoot !== resolve(workspaceRoot))
+        fail(
+          "publication_root_changed",
+          "Publication storage differs from the frozen run configuration",
+        );
       const action = this.access.action(authority.runId, actionId);
       const control = this.access.control(authority.runId);
       if (
@@ -159,6 +180,23 @@ export class PublicationJournal {
           .run(authority.runId, JSON.stringify(repository));
       }
       if (
+        !repository.workspace &&
+        !repository.canonicalRepository &&
+        !repository.privateRevision &&
+        !repository.publishedRevision &&
+        !repository.lastPublishedId
+      ) {
+        const abandoned = this.access.agents.workspaceForOperation(
+          authority.runId,
+          repository.creationOperationId,
+        );
+        if (abandoned && this.access.workspaceCreationFailed(authority.runId, abandoned)) {
+          // A new model-requested publication may allocate new custody. Never rewrite the failed copy.
+          repository.creationOperationId = randomUUID();
+          this.saveRepository(repository);
+        }
+      }
+      if (
         request.expectedPreviousRevision !==
         (repository.publishedRevision ?? repository.baseRevision)
       )
@@ -199,6 +237,8 @@ export class PublicationJournal {
         reviewEvidenceId: review,
         policyDigest: control.policyDigest,
         workspaceOperations: [operation.operationId],
+        workspaceRoot: resolve(workspaceRoot),
+        ioAttempts: [this.newAttempt(authority, "publish", [operation.operationId])],
         revision,
         expectedPreviousRevision: request.expectedPreviousRevision,
         publicRef: null,
@@ -234,7 +274,14 @@ export class PublicationJournal {
   start(authority: ControllerAuthority, publicationId: string) {
     return this.access.transaction(authority, () => {
       const record = this.record(authority.runId, publicationId);
-      if (record.dispatched)
+      const attempt = record.ioAttempts[0]!;
+      if (
+        record.dispatched ||
+        attempt.settledAt ||
+        attempt.stop ||
+        attempt.result ||
+        !attempt.execution
+      )
         fail(
           "publication_dispatched",
           "Publication dispatch is write-once; reconcile, never replay it",
@@ -247,12 +294,18 @@ export class PublicationJournal {
   assertWritable(authority: ControllerAuthority, publicationId: string): PublicationRecord {
     return this.access.transaction(authority, () => {
       const record = this.record(authority.runId, publicationId);
+      const attempt = record.ioAttempts[0]!;
       const control = this.access.control(authority.runId);
       const action = this.db
         .prepare("SELECT status FROM actions WHERE run_id = ? AND operation_id = ?")
         .get(authority.runId, record.operationId) as { status: string } | undefined;
       if (
         record.outcome ||
+        record.ioAttempts.length !== 1 ||
+        !attempt.execution ||
+        attempt.result ||
+        attempt.stop ||
+        attempt.settledAt ||
         !record.dispatched ||
         record.ioStopped ||
         record.controllerLeaseId !== authority.leaseId ||
@@ -335,20 +388,22 @@ export class PublicationJournal {
       const sameSource =
         workspace.workspaceId === record.workspaceId &&
         workspace.workspaceGeneration === record.workspaceGeneration;
-      const operation = sameSource
-        ? null
-        : this.access.agents.beginWorkspaceOperation(
-            authority,
-            workspace,
-            "publication",
-            this.access.control(authority.runId).controlVersion,
-          );
+      const operation = this.access.agents.activeWorkspaceOperation(authority.runId, workspace);
+      if (
+        !operation ||
+        !record.ioAttempts[0]!.workspaceOperations.includes(operation.operationId) ||
+        operation.controllerLeaseId !== authority.leaseId ||
+        (!sameSource && operation.kind !== "publication")
+      )
+        fail(
+          "publication_custody_unowned",
+          "Canonical custody needs the original publication exclusion",
+        );
       repository.workspace = {
         workspaceId: workspace.workspaceId,
         workspaceGeneration: workspace.workspaceGeneration,
       };
       repository.canonicalRepository = binding;
-      if (operation) record.workspaceOperations.push(operation.operationId);
       record.canonicalRef = PublicationRefIntentSchema.parse({
         schemaVersion: 1,
         publicationId,
@@ -413,91 +468,274 @@ export class PublicationJournal {
       this.save(record);
     });
   }
-  /** Only after all original adapter I/O is awaited; old leases cannot assert their own stop. */
-  stopIO(
+  private newAttempt(
     authority: ControllerAuthority,
-    publicationId: string,
-    failure: string | null,
-    intervention: boolean,
+    phase: PublicationIOAttempt["phase"],
+    operations: string[],
   ) {
-    return this.access.transaction(authority, () => {
-      const record = this.record(authority.runId, publicationId);
-      if (record.outcome) return record;
-      for (const id of record.workspaceOperations) {
-        const operation = this.access.agents.workspaceOperation(authority.runId, id);
-        if (!operation.stopEvidence)
-          this.access.agents.finishWorkspaceOperation(
-            authority,
-            id,
-            failure ? "failed" : "succeeded",
-            "Publication adapter awaited all filesystem operations and nested Git process closures",
-          );
-      }
-      record.ioStopped = true;
-      if (failure) record.failure = redactSensitiveText(failure, 3999);
-      record.intervention ||= intervention;
-      this.save(record);
-      this.changed(authority, "publication.io_stopped", publicationId);
-      return record;
+    return PublicationIOAttemptSchema.parse({
+      attemptId: randomUUID(),
+      phase,
+      controllerLeaseId: authority.leaseId,
+      workspaceOperations: operations,
+      execution: null,
+      stop: null,
+      result: null,
+      settledAt: null,
     });
   }
-  /** Read/cleanup reconciliation gets its own durable exclusion; it never redispatches publication. */
-  cancelUndispatched(authority: ControllerAuthority, publicationId: string) {
+
+  /** Reserve canonical custody before launch; all physical inspection remains inside the worker. */
+  attachCanonicalWorkspace(
+    authority: ControllerAuthority,
+    publicationId: string,
+    workspace: WorkspaceRecord,
+  ) {
     return this.access.transaction(authority, () => {
-      const record = this.record(authority.runId, publicationId);
+      const record = this.record(authority.runId, publicationId),
+        attempt = record.ioAttempts[0]!;
+      const repository = this.repository(authority.runId)!;
+      const registered = this.access.agents.workspace(authority.runId, workspace);
       if (
+        record.ioAttempts.length !== 1 ||
+        attempt.execution ||
+        attempt.settledAt ||
         record.dispatched ||
-        record.outcome ||
-        record.publicRef ||
-        record.canonicalRef ||
-        record.lock ||
-        record.packs.length
+        record.controllerLeaseId !== authority.leaseId ||
+        registered.status !== "ready" ||
+        registered.purpose !== "delivery" ||
+        registered.sourceMode !== "immutable" ||
+        registered.creationOperationId !== repository.creationOperationId ||
+        registered.baselineRevision !== repository.baseRevision ||
+        (repository.workspace &&
+          digestJson(repository.workspace) !==
+            digestJson({
+              workspaceId: workspace.workspaceId,
+              workspaceGeneration: workspace.workspaceGeneration,
+            }))
       )
         fail(
-          "publication_may_be_dispatched",
-          "Only the unused durable publication gate proves no original I/O started",
+          "publication_custody_unowned",
+          "Canonical custody differs from the unused publication intent",
         );
-      for (const id of record.workspaceOperations) {
-        const operation = this.access.agents.workspaceOperation(authority.runId, id);
-        if (operation.stopEvidence) continue;
-        if (
-          operation.kind !== "publication" ||
-          operation.workspaceId !== record.workspaceId ||
-          operation.workspaceGeneration !== record.workspaceGeneration
-        )
-          fail(
-            "publication_io_unsettled",
-            "An unrelated I/O operation cannot use publication's never-started proof",
-          );
-        const stopped = WorkspaceOperationSchema.parse({
-          ...operation,
-          status: "failed",
-          stopEvidence:
-            "Kernel proved publication never started from its durable one-use dispatch gate",
-          updatedAt: now(),
-        });
-        this.db
-          .prepare(
-            "UPDATE workspace_operations SET record_json = ? WHERE run_id = ? AND operation_id = ?",
-          )
-          .run(JSON.stringify(stopped), authority.runId, id);
+      const sameSource =
+        workspace.workspaceId === record.workspaceId &&
+        workspace.workspaceGeneration === record.workspaceGeneration;
+      if (!sameSource) {
+        if (attempt.workspaceOperations.length !== 1)
+          fail("publication_custody_bound", "Canonical publication exclusion is write-once");
+        const operation = this.access.agents.beginWorkspaceOperation(
+          authority,
+          workspace,
+          "publication",
+          this.access.control(authority.runId).controlVersion,
+        );
+        attempt.workspaceOperations.push(operation.operationId);
+        record.workspaceOperations.push(operation.operationId);
       }
-      record.ioStopped = true;
-      record.failure = "Publication was never dispatched";
+      repository.workspace = {
+        workspaceId: workspace.workspaceId,
+        workspaceGeneration: workspace.workspaceGeneration,
+      };
+      this.saveRepository(repository);
       this.save(record);
-      this.changed(authority, "publication.never_dispatched", publicationId);
       return record;
     });
   }
 
-  /** Read/cleanup reconciliation gets its own durable exclusion; it never redispatches publication. */
+  private members(record: PublicationRecord, attempt: PublicationIOAttempt) {
+    return attempt.workspaceOperations.map((id) => {
+      const operation = this.access.agents.workspaceOperation(record.runId, id);
+      if (
+        operation.controllerLeaseId !== attempt.controllerLeaseId ||
+        operation.kind !==
+          (attempt.phase === "publish" ? "publication" : "inspect_materialization") ||
+        operation.execution ||
+        operation.executionStop
+      )
+        fail(
+          "publication_io_conflict",
+          "Publication exclusion has conflicting execution ownership",
+        );
+      return operation;
+    });
+  }
+
+  assertIOOwned(authority: ControllerAuthority, publicationId: string, attemptId: string) {
+    return this.access.transaction(authority, () => {
+      const record = this.record(authority.runId, publicationId);
+      const attempt = record.ioAttempts.at(-1)!;
+      if (
+        record.outcome ||
+        attempt.attemptId !== attemptId ||
+        attempt.controllerLeaseId !== authority.leaseId ||
+        attempt.result ||
+        attempt.stop ||
+        attempt.settledAt ||
+        this.members(record, attempt).some((operation) => operation.stopEvidence)
+      )
+        fail("publication_io_unowned", "Publication worker differs from its live original attempt");
+      if (attempt.phase === "publish") {
+        const action = this.db
+          .prepare("SELECT status FROM actions WHERE run_id=? AND operation_id=?")
+          .get(authority.runId, record.operationId) as { status: string } | undefined;
+        const control = this.access.control(authority.runId);
+        if (
+          action?.status !== "running" ||
+          control.status !== "active" ||
+          control.policyDigest !== record.policyDigest
+        )
+          fail("publication_io_stale", "Publication write admission is no longer current");
+      }
+      return { record, attempt };
+    });
+  }
+
+  bindIO(
+    authority: ControllerAuthority,
+    publicationId: string,
+    attemptId: string,
+    input: CommandLifetime,
+  ) {
+    return this.access.transaction(authority, () => {
+      const { record, attempt } = this.assertIOOwned(authority, publicationId, attemptId);
+      if (attempt.execution) fail("publication_io_bound", "Publication execution is write-once");
+      attempt.execution = CommandLifetimeSchema.parse(input);
+      this.save(record);
+      this.changed(authority, "publication.worker_bound", publicationId);
+      return attempt;
+    });
+  }
+
+  recordIOResult(
+    authority: ControllerAuthority,
+    publicationId: string,
+    attemptId: string,
+    input: PublicationIOResult,
+  ) {
+    return this.access.transaction(authority, () => {
+      const { record, attempt } = this.assertIOOwned(authority, publicationId, attemptId);
+      if (!attempt.execution)
+        fail("publication_io_unbound", "Publication result has no bound worker");
+      const result = PublicationIOResultSchema.parse(input);
+      if (result.failure) result.failure = redactSensitiveText(result.failure, 3999);
+      attempt.result = result;
+      if (result.failure) record.failure = result.failure;
+      record.intervention ||= result.intervention;
+      this.save(record);
+      this.changed(authority, "publication.worker_result", publicationId);
+      return record;
+    });
+  }
+
+  recordIOStop(
+    authority: ControllerAuthority,
+    publicationId: string,
+    attemptId: string,
+    input: CommandStop,
+  ) {
+    return this.access.transaction(authority, () => {
+      const record = this.record(authority.runId, publicationId);
+      const attempt = record.ioAttempts.find((item) => item.attemptId === attemptId);
+      if (!attempt?.execution)
+        return fail("publication_io_unbound", "Publication stop has no bound worker");
+      const stop = CommandStopSchema.parse(input);
+      assertCommandStop(attempt.execution, stop);
+      if (attempt.stop && digestJson(attempt.stop) !== digestJson(stop))
+        fail("publication_stop_conflict", "Publication stop acknowledgement is immutable");
+      attempt.stop = stop;
+      this.save(record);
+      return record;
+    });
+  }
+
+  noteIOFailure(authority: ControllerAuthority, publicationId: string, detail: string) {
+    return this.access.transaction(authority, () => {
+      const record = this.record(authority.runId, publicationId);
+      if (!record.outcome) {
+        record.failure = redactSensitiveText(detail, 3999);
+        this.save(record);
+        this.changed(authority, "publication.worker_error", publicationId);
+      }
+    });
+  }
+
+  /** Atomically settles this attempt's complete group; physical publication is a separate result. */
+  settleIO(authority: ControllerAuthority, publicationId: string, attemptId: string) {
+    return this.access.transaction(authority, () => {
+      const record = this.record(authority.runId, publicationId);
+      const attempt = record.ioAttempts.at(-1)!;
+      if (attempt.attemptId !== attemptId)
+        return fail("publication_io_superseded", "Only the original current attempt can settle");
+      if (attempt.settledAt) return record;
+      if (attempt.execution && !attempt.stop)
+        fail(
+          "publication_io_unsettled",
+          "Independently prove the complete publication worker stopped",
+        );
+      if (
+        !attempt.execution &&
+        (attempt.result ||
+          (attempt.phase === "publish" &&
+            (record.dispatched ||
+              record.publicRef ||
+              record.canonicalRef ||
+              record.lock ||
+              record.packs.length)))
+      )
+        fail("publication_io_conflict", "Unbound publication attempt has unexplained effects");
+      const operations = this.members(record, attempt);
+      attempt.settledAt = now();
+      record.ioStopped = true;
+      if (!attempt.result)
+        record.failure ??=
+          attempt.phase === "publish"
+            ? "Publication worker stopped without a retained completion; inspect its exact effects"
+            : "Inspection stopped without retained observations; a new requested inspection is required";
+      this.save(record);
+      for (const operation of operations)
+        this.access.agents.finishWorkspaceOperation(
+          authority,
+          operation.operationId,
+          attempt.result && !attempt.result.failure ? "succeeded" : "failed",
+          attempt.execution
+            ? "Independent complete publication-worker stop settles this exact operation member"
+            : "Publication attempt atomically fenced before worker binding; delayed launch is forbidden",
+        );
+      this.changed(authority, "publication.io_stopped", publicationId);
+      if (attempt.phase === "inspect" && attempt.result && !attempt.result.failure)
+        return this.finish(authority, publicationId);
+      return record;
+    });
+  }
+
+  /** null = not a member; false = preserve exclusion; true = its exact worker stopped or was fenced. */
+  permitsWorkspaceStop(runId: string, operationId: string): boolean | null {
+    const row = this.db
+      .prepare(
+        "SELECT publication_id FROM publications, json_each(record_json, '$.workspaceOperations') AS member WHERE run_id=? AND member.value=?",
+      )
+      .get(runId, operationId) as { publication_id: string } | undefined;
+    if (!row) return null;
+    const record = this.record(runId, row.publication_id);
+    const attempt = record.ioAttempts.find((item) =>
+      item.workspaceOperations.includes(operationId),
+    )!;
+    this.members(record, attempt);
+    return (
+      attempt.settledAt !== null &&
+      (attempt.execution ? attempt.stop !== null : attempt.result === null)
+    );
+  }
+
+  /** Each explicit inspection has its own one-use execution and source/canonical exclusions. */
   beginInspection(authority: ControllerAuthority, publicationId: string) {
     return this.access.transaction(authority, () => {
       const record = this.record(authority.runId, publicationId);
       if (record.outcome)
         fail("publication_finished", "Publication already has a terminal observation");
       this.assertStopped(record);
-      if (record.workspaceOperations.length > 60)
+      if (record.ioAttempts.length >= 31)
         fail(
           "publication_recovery_budget",
           "Publication inspection budget exhausted; request operator judgment",
@@ -508,6 +746,7 @@ export class PublicationJournal {
           ? [this.repository(authority.runId)!.workspace!]
           : []),
       ];
+      const operations: string[] = [];
       for (const identity of identities.filter(
         (entry, index, all) =>
           all.findIndex(
@@ -522,8 +761,10 @@ export class PublicationJournal {
           "inspect_materialization",
           this.access.control(authority.runId).controlVersion,
         );
+        operations.push(operation.operationId);
         record.workspaceOperations.push(operation.operationId);
       }
+      record.ioAttempts.push(this.newAttempt(authority, "inspect", operations));
       record.ioStopped = false;
       this.save(record);
       return record;
@@ -560,16 +801,18 @@ export class PublicationJournal {
       this.save(record);
     });
   }
-  finish(
-    authority: ControllerAuthority,
-    publicationId: string,
-    canonical: PublicationRefObservation | null,
-    user: PublicationRefObservation | null,
-  ) {
+  private finish(authority: ControllerAuthority, publicationId: string) {
     return this.access.transaction(authority, () => {
       const record = this.record(authority.runId, publicationId);
       if (record.outcome) return record;
       this.assertStopped(record);
+      const attempt = record.ioAttempts.at(-1)!;
+      if (attempt.phase !== "inspect" || !attempt.result || attempt.result.failure)
+        return fail(
+          "publication_observation_missing",
+          "Publication settlement requires retained stopped inspection observations",
+        );
+      const { canonical, user } = attempt.result;
       const repository = this.repository(authority.runId)!;
       record.canonicalApplied = canonical?.outcome === "applied";
       record.publicApplied = user?.outcome === "applied";
@@ -594,6 +837,10 @@ export class PublicationJournal {
     });
   }
   assertInspectionOwned(authority: ControllerAuthority, record: PublicationRecord) {
+    const attempt = record.ioAttempts.at(-1)!;
+    this.assertIOOwned(authority, record.publicationId, attempt.attemptId);
+    if (attempt.phase !== "inspect" || !attempt.execution)
+      fail("publication_inspection_unowned", "Lock cleanup needs a bound inspection worker");
     const operation = this.access.agents.activeWorkspaceOperation(authority.runId, record);
     if (
       !operation ||
@@ -693,6 +940,7 @@ export class PublicationJournal {
       this.repository(runId)?.publishedRevision !== record.revision
     )
       return null;
+    this.assertStopped(record);
     this.objectRecord(runId, record);
     return this.access.reviews.approval(runId, record, "exact_revision");
   }

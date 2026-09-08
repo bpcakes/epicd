@@ -140,6 +140,7 @@ export function createAgentsSchema(db: Database.Database): void {
 }
 
 type Access = {
+  publicationPermitsWorkspaceStop(runId: string, operationId: string): boolean | null;
   creationPermitsWorkspaceStop(runId: string, operationId: string): boolean | null;
   captureInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   validationInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
@@ -562,6 +563,15 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       const operation = this.workspaceOperation(authority.runId, operationId);
       const creationStop = this.access.creationPermitsWorkspaceStop(authority.runId, operationId);
+      const publicationStop = this.access.publicationPermitsWorkspaceStop(
+        authority.runId,
+        operationId,
+      );
+      if (publicationStop === false)
+        throw new AgentCoordinationError(
+          "publication_io_unsettled",
+          "The complete publication worker has not stopped; preserve every publication exclusion",
+        );
       if (creationStop === false)
         throw new AgentCoordinationError(
           "workspace_creation_unsettled",
@@ -585,6 +595,7 @@ export class AgentJournal {
         operation.controllerLeaseId !== authority.leaseId &&
         !independentlyStopped &&
         creationStop !== true &&
+        publicationStop !== true &&
         !unlaunchedValidation &&
         !unlaunchedCapture
       )
@@ -630,6 +641,7 @@ export class AgentJournal {
       if (
         !["validation", "commit", "capture"].includes(operation.kind) ||
         this.access.creationPermitsWorkspaceStop(authority.runId, operationId) !== null ||
+        this.access.publicationPermitsWorkspaceStop(authority.runId, operationId) !== null ||
         operation.controllerLeaseId !== authority.leaseId ||
         operation.stopEvidence ||
         operation.execution ||

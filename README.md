@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 41. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 42. Use a fresh state path; unsupported existing data is left intact.
 
 Persisted ownership fields must be explicit: missing workspace creation bindings, turn launches, native endpoint bindings or decision-attempt turn identities are invalid, not implicitly `null`. Reading incomplete records does not repair them or release their resources.
 
@@ -73,7 +73,11 @@ Candidate capture also has a complete supervised worker: its workspace exclusion
 
 Workspace creation has one supervised lifetime covering source preflight, copying, readiness checks and the review binding. A creation record atomically reserves the destination and, for a managed source, its copy-source exclusion. The same independently observed worker stop settles both; a ready directory, retained review binding or finished nested Git command cannot release either lock alone. Baseline, candidate, diagnostic, retained-commit, coordinator and canonical-delivery copies use this path. Readiness, review binding and successful completion are retained in one transaction. If it fails, files stay preserved but no ready workspace or binding is exposed. A caller crash can recover the original completion without copying again. A never-bound creation can be cancelled atomically; delayed binding is forbidden. `inspect_workspace` exposes creation outcome and stop status without exposing its private launch control files.
 
-These boundaries share the command-lifetime mechanism across SDK and native Herdr runtimes. Fresh format-41 state is required, with no migration or legacy defaults. Later materialization/commit inspection and the overall publication adapter still have separate unresolved controller-I/O gaps; supervising canonical-copy creation does not prove publication stopped. An unbound application-writer reservation or an interrupted inspection can still require unresolved-I/O intervention. No receipt or absent PID is substituted for those operations' own stop proof.
+Publication writing and subsequent inspection/owned-lock release now have separate fixed supervised workers. Each attempt binds its exact source/canonical exclusions, launch, retained result and independent stop proof. A controller crash can recover the original write or inspection acknowledgement without repeating the publication. A stopped inspection with no retained observations requires a new requested inspection; matching refs alone cannot settle unknown worker I/O. Live model-requested reconciliation cannot fence a healthy pending publication or inspection. Canonical-copy preparation uses its own supervised creation before the writer launches; neither worker's receipt substitutes for the other's. A new publication request may allocate fresh canonical custody after a proven failed initial copy, preserving the failed directory and its journal records.
+
+`inspect_publication` shows bounded attempt previews. `inspect_record` retains the complete redacted history through paging; neither view exposes private execution controls. Publication outcome and current independent exact-revision approval remain separate.
+
+These boundaries share the command-lifetime mechanism across SDK and native Herdr runtimes. Fresh format-42 state is required, with no migration or legacy defaults. Standalone materialization/commit inspection still has unresolved controller-I/O gaps. An unbound application-writer reservation or an interrupted standalone inspection can still require unresolved-I/O intervention. No receipt or absent PID is substituted for those operations' own stop proof.
 
 ### Recoverable workspace disposal
 

@@ -2,6 +2,8 @@ import { z } from "zod";
 import { WorkspaceIdentitySchema } from "./agents.js";
 import { CandidateIdentitySchema } from "./delivery.js";
 import type { KernelAction } from "./orchestration.js";
+import { CommandLifetimeSchema, CommandStopSchema, assertCommandStop } from "./command-lifetime.js";
+import { digestJson } from "./repository-policy.js";
 
 const Path = z.string().min(1).max(4096);
 const Oid = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
@@ -62,12 +64,32 @@ export const PublicationPackSchema = z
 export type PublicationPack = z.infer<typeof PublicationPackSchema>;
 
 /** A physical observation only. The caller separately proves old I/O stop and current approval. */
-export type PublicationRefObservation = {
-  outcome: "applied" | "not_applied" | "conflict";
-  branchRevision: string | null;
-  receiptRevision: string | null;
-  detail: string;
-};
+export const PublicationRefObservationSchema = z.strictObject({
+  outcome: z.enum(["applied", "not_applied", "conflict"]),
+  branchRevision: Oid.nullable(),
+  receiptRevision: Oid.nullable(),
+  detail: z.string().max(4000),
+});
+export type PublicationRefObservation = z.infer<typeof PublicationRefObservationSchema>;
+
+export const PublicationIOResultSchema = z.strictObject({
+  failure: z.string().max(4000).nullable(),
+  intervention: z.boolean(),
+  canonical: PublicationRefObservationSchema.nullable(),
+  user: PublicationRefObservationSchema.nullable(),
+});
+export type PublicationIOResult = z.infer<typeof PublicationIOResultSchema>;
+export const PublicationIOAttemptSchema = z.strictObject({
+  attemptId: z.uuid(),
+  phase: z.enum(["publish", "inspect"]),
+  controllerLeaseId: z.string().min(1).max(256),
+  workspaceOperations: z.array(z.uuid()).min(1).max(2),
+  execution: CommandLifetimeSchema.nullable(),
+  stop: CommandStopSchema.nullable(),
+  result: PublicationIOResultSchema.nullable(),
+  settledAt: z.iso.datetime().nullable(),
+});
+export type PublicationIOAttempt = z.infer<typeof PublicationIOAttemptSchema>;
 
 export const DeliveryRepositorySchema = z.strictObject({
   schemaVersion: z.literal(1),
@@ -114,6 +136,8 @@ export const PublicationRecordSchema = CandidateIdentitySchema.extend({
   policyDigest: z.string().min(1).max(256),
   ...WorkspaceIdentitySchema.shape,
   workspaceOperations: z.array(z.string().uuid()).min(1).max(64),
+  workspaceRoot: z.string().startsWith("/"),
+  ioAttempts: z.array(PublicationIOAttemptSchema).min(1).max(31),
   revision: Oid,
   expectedPreviousRevision: Oid,
   publicRef: PublicationRefIntentSchema.nullable(),
@@ -164,8 +188,177 @@ export const PublicationRecordSchema = CandidateIdentitySchema.extend({
           ref.revision === record.revision),
     ),
   )
-  .refine((record) => record.packs.every((pack) => pack.record.revision === record.revision));
+  .refine((record) => record.packs.every((pack) => pack.record.revision === record.revision))
+  .superRefine((record, context) => {
+    try {
+      const members = record.ioAttempts.flatMap((attempt) => attempt.workspaceOperations);
+      if (
+        digestJson(members) !== digestJson(record.workspaceOperations) ||
+        new Set(members).size !== members.length ||
+        new Set(record.ioAttempts.map((attempt) => attempt.attemptId)).size !==
+          record.ioAttempts.length ||
+        record.ioStopped !== (record.ioAttempts.at(-1)!.settledAt !== null)
+      )
+        throw new Error("Publication I/O projection differs from its exact attempts");
+      const writer = record.ioAttempts[0]!;
+      if (record.dispatched && (!writer.execution || writer.stop?.kind === "not_started"))
+        throw new Error("Dispatched publication has no started writer intent");
+      if (
+        !record.dispatched &&
+        (record.publicRef || record.canonicalRef || record.lock || record.packs.length)
+      )
+        throw new Error("Undispatched publication has unexplained physical intents");
+      for (const [index, attempt] of record.ioAttempts.entries()) {
+        if (
+          attempt.phase !== (index === 0 ? "publish" : "inspect") ||
+          (index === 0 && attempt.controllerLeaseId !== record.controllerLeaseId) ||
+          (index < record.ioAttempts.length - 1 && !attempt.settledAt)
+        )
+          throw new Error("Publication attempt ordering or ownership differs");
+        if (attempt.execution) {
+          if (
+            attempt.execution.runId !== record.runId ||
+            attempt.execution.operationId !== attempt.attemptId ||
+            attempt.execution.controllerLeaseId !== attempt.controllerLeaseId ||
+            attempt.execution.scopeDigest !== publicationIOScope(record, attempt)
+          )
+            throw new Error("Publication execution differs from its exact attempt");
+          if (attempt.stop) assertCommandStop(attempt.execution, attempt.stop);
+          if (attempt.settledAt && !attempt.stop)
+            throw new Error("Publication worker stop is unproven");
+        } else if (attempt.stop || attempt.result)
+          throw new Error("Publication result has no bound execution");
+        if (attempt.stop?.kind === "not_started" && attempt.result)
+          throw new Error("An unstarted publication worker cannot have a result");
+        if (attempt.phase === "publish" && (attempt.result?.canonical || attempt.result?.user))
+          throw new Error("Publication writes cannot substitute for independent inspection");
+        if (attempt.phase === "inspect" && attempt.result) {
+          for (const [observation, intent] of [
+            [attempt.result.canonical, record.canonicalRef],
+            [attempt.result.user, record.publicRef],
+          ] as const) {
+            if (!attempt.result.failure && Boolean(observation) !== Boolean(intent))
+              throw new Error("Inspection omitted an exact admitted ref target");
+            if (!observation) continue;
+            if (!intent) throw new Error("Inspection has no matching ref intent");
+            const expected =
+              observation.branchRevision === intent.revision &&
+              observation.receiptRevision === intent.revision
+                ? "applied"
+                : observation.branchRevision === intent.expectedRef &&
+                    observation.receiptRevision === null
+                  ? "not_applied"
+                  : "conflict";
+            if (observation.outcome !== expected)
+              throw new Error("Inspection outcome differs from its exact observed refs");
+          }
+        }
+      }
+      if (record.outcome) {
+        const inspection = record.ioAttempts.at(-1)!;
+        if (
+          inspection.phase !== "inspect" ||
+          !inspection.result ||
+          inspection.result.failure ||
+          record.canonicalApplied !== (inspection.result.canonical?.outcome === "applied") ||
+          record.publicApplied !== (inspection.result.user?.outcome === "applied")
+        )
+          throw new Error("Publication outcome has no matching retained stopped inspection");
+      }
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : "Invalid publication I/O",
+      });
+    }
+  });
 export type PublicationRecord = z.infer<typeof PublicationRecordSchema>;
+
+export function publicationIOScope(
+  record: Pick<
+    PublicationRecord,
+    | "publicationId"
+    | "runId"
+    | "operationId"
+    | "commitId"
+    | "provenance"
+    | "policyDigest"
+    | "reviewEvidenceId"
+    | "revision"
+    | "expectedPreviousRevision"
+    | "workspaceRoot"
+    | "workspaceId"
+    | "workspaceGeneration"
+    | "candidateId"
+    | "candidateGeneration"
+    | "lockNonce"
+  >,
+  attempt: Pick<
+    PublicationIOAttempt,
+    "attemptId" | "phase" | "controllerLeaseId" | "workspaceOperations"
+  >,
+): string {
+  return digestJson({
+    kind: "publication-io",
+    publicationId: record.publicationId,
+    runId: record.runId,
+    operationId: record.operationId,
+    commitId: record.commitId,
+    provenance: record.provenance,
+    policyDigest: record.policyDigest,
+    reviewEvidenceId: record.reviewEvidenceId,
+    revision: record.revision,
+    expectedPreviousRevision: record.expectedPreviousRevision,
+    workspaceRoot: record.workspaceRoot,
+    workspaceId: record.workspaceId,
+    workspaceGeneration: record.workspaceGeneration,
+    candidateId: record.candidateId,
+    candidateGeneration: record.candidateGeneration,
+    lockNonce: record.lockNonce,
+    attemptId: attempt.attemptId,
+    phase: attempt.phase,
+    controllerLeaseId: attempt.controllerLeaseId,
+    workspaceOperations: attempt.workspaceOperations,
+  });
+}
+
+/** Model/reviewer view excludes private execution controls and controller credentials. */
+export function publicationView(record: PublicationRecord) {
+  const { controllerLeaseId: _lease, lockNonce: _nonce, ioAttempts, ...view } = record;
+  return {
+    ...view,
+    ioAttempts: ioAttempts.map(
+      ({ attemptId, phase, workspaceOperations, result, settledAt, stop }) => ({
+        attemptId,
+        phase,
+        workspaceOperations,
+        result,
+        settledAt,
+        stopConfirmed: stop !== null || settledAt !== null,
+      }),
+    ),
+  };
+}
+
+/** Bounded attempt previews; complete redacted history is available through inspect_record paging. */
+export function publicationInspectionView(record: PublicationRecord) {
+  const view = publicationView(record);
+  return {
+    ...view,
+    ioAttempts: view.ioAttempts.map(({ result, ...attempt }) => ({
+      ...attempt,
+      result: result
+        ? {
+            failurePreview: result.failure?.slice(0, 300) ?? null,
+            failureTruncated: (result.failure?.length ?? 0) > 300,
+            intervention: result.intervention,
+            canonicalOutcome: result.canonical?.outcome ?? null,
+            userOutcome: result.user?.outcome ?? null,
+          }
+        : null,
+    })),
+  };
+}
 
 /** Evidence-changing capabilities wait; the coordinator can still observe and communicate. */
 export function concurrentWithPublication(kind: KernelAction["kind"]): boolean {

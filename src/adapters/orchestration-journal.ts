@@ -81,7 +81,7 @@ import {
   createWorkspaceCreationSchema,
 } from "./workspace-creation-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 41;
+export const ORCHESTRATION_SCHEMA_VERSION = 42;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -307,6 +307,8 @@ export class OrchestrationJournal {
       turn: (runId, identity) => this.agents.turn(runId, identity),
     });
     this.agents = new AgentJournal(db, {
+      publicationPermitsWorkspaceStop: (runId, operationId) =>
+        this.publications.permitsWorkspaceStop(runId, operationId),
       creationPermitsWorkspaceStop: (runId, operationId) =>
         this.workspaceCreations.permitsMemberStop(runId, operationId),
       captureInterruptedBeforeLaunch: (runId, operationId) => {
@@ -420,6 +422,8 @@ export class OrchestrationJournal {
       },
     });
     this.publications = new PublicationJournal(db, {
+      workspaceCreationFailed: (runId, workspace) =>
+        this.workspaceCreations.forWorkspace(runId, workspace)?.outcome === "failed",
       transaction: (authority, body) => this.transaction(authority, body),
       control: (runId) => this.control(runId),
       action: (runId, actionId) => this.action(runId, actionId),

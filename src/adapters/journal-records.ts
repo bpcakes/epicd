@@ -3,6 +3,7 @@ import type { JournalRecordTarget } from "../domain/journal-records.js";
 import { redactDiagnosticValue } from "../util/redact.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { DeliveryError } from "./delivery-journal.js";
+import { publicationView } from "../domain/publication.js";
 
 export class JournalRecordError extends Error {
   constructor(
@@ -95,7 +96,7 @@ export function journalRecordView(
       const publication = required(
         journal.publications.records(runId).find((item) => item.publicationId === id),
       );
-      record = publication;
+      record = publicationView(publication);
       settled = publication.outcome !== null && publication.ioStopped;
       break;
     }

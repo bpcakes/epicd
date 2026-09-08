@@ -1,13 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fixture, check, git, resource, success, target, waitFor } from "./fixtures/review.js";
 import { PublicationAdapter } from "../src/adapters/publication.js";
-import { PublicationGitError, PUBLICATION_LOCK_REF } from "../src/adapters/publication-git.js";
+import { PUBLICATION_LOCK_REF } from "../src/adapters/publication-git.js";
+import * as lifetime from "../src/adapters/command-lifetime.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import Database from "better-sqlite3";
 import type { CandidateIdentity } from "../src/domain/delivery.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 async function verified(s: Awaited<ReturnType<typeof fixture>>) {
   const candidate = await s.capture(await s.define());
@@ -30,6 +33,9 @@ const request = (candidate: CandidateIdentity, revision: string, previous: strin
   revision,
   expectedPreviousRevision: previous,
 });
+const worker = (launch: lifetime.CommandLaunch, phase: "publish" | "inspect") =>
+  launch.args.some((arg) => arg.endsWith("/publication-io-cli.js")) &&
+  JSON.parse(launch.extraInput!).phase === phase;
 
 describe.skipIf(process.platform !== "linux")("durable verified publication capability", () => {
   it.each(["sha1", "sha256"] as const)(
@@ -158,10 +164,12 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const original = s.publication.git.updateRefs.bind(s.publication.git);
-    vi.spyOn(s.publication.git, "updateRefs").mockImplementation(async (...args) => {
-      entered = true;
-      await gate;
+    const original = lifetime.prepareCommandLifetime;
+    vi.spyOn(lifetime, "prepareCommandLifetime").mockImplementation(async (...args) => {
+      if (worker(args[1], "publish")) {
+        entered = true;
+        await gate;
+      }
       return original(...args);
     });
     const operation = s.dispatch(request(candidate, commit.revision!, s.head));
@@ -275,17 +283,21 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     expect(readFileSync(join(s.source, ".git/index"))).toEqual(userIndex);
   }, 20000);
 
-  it("recognizes a lost Git result after confirmed I/O stop without a second publication write", async () => {
+  it("recognizes a lost publication-worker result after confirmed I/O stop without a second publication write", async () => {
     const s = await fixture();
     const { candidate, commit } = await verified(s);
-    const original = s.publication.git.updateRefs.bind(s.publication.git);
+    const original = lifetime.startDurableCommand;
     let publicWrites = 0;
-    vi.spyOn(s.publication.git, "updateRefs").mockImplementation(async (...args) => {
-      await original(...args);
-      if (args[0].repository.root.path === s.source) {
-        publicWrites++;
-        throw new Error("Lost result after ref commit");
-      }
+    vi.spyOn(lifetime, "startDurableCommand").mockImplementation((...args) => {
+      const handle = original(...args);
+      if (!worker(args[1], "publish")) return handle;
+      return {
+        ...handle,
+        result: handle.result.then(() => {
+          publicWrites++;
+          throw new Error("Lost result after ref commit");
+        }),
+      };
     });
     const decision = s.decision(request(candidate, commit.revision!, s.head));
     const running = await s.kernel.execute(decision, s.authority);
@@ -326,11 +338,12 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     async (replacement) => {
       const s = await fixture();
       const { candidate, commit } = await verified(s);
-      const original = s.publication.git.releaseLock.bind(s.publication.git);
-      vi.spyOn(s.publication.git, "releaseLock").mockImplementation(async (...args) => {
+      const original = s.publication.reconcile.bind(s.publication);
+      vi.spyOn(s.publication, "reconcile").mockImplementationOnce(async (...args) => {
+        const lock = s.journal.publications.record(s.authority.runId, args[1]).lock!;
         if (replacement === "absent")
-          git(s.source, "update-ref", "--no-deref", "-d", PUBLICATION_LOCK_REF, args[1]);
-        else git(s.source, "update-ref", "--no-deref", PUBLICATION_LOCK_REF, s.head, args[1]);
+          git(s.source, "update-ref", "--no-deref", "-d", PUBLICATION_LOCK_REF, lock.revision);
+        else git(s.source, "update-ref", "--no-deref", PUBLICATION_LOCK_REF, s.head, lock.revision);
         return original(...args);
       });
       expect((await s.dispatch(request(candidate, commit.revision!, s.head))).status).toBe(
@@ -358,13 +371,18 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
   it("recovers a lost lock-release acknowledgement without replaying publication", async () => {
     const s = await fixture();
     const { candidate, commit } = await verified(s);
-    const original = s.publication.git.releaseLock.bind(s.publication.git);
-    vi.spyOn(s.publication.git, "releaseLock").mockImplementationOnce(async (...args) => {
-      await original(...args);
-      throw new Error("Lost release acknowledgement after stopped Git process");
-    });
-    const writes = vi.spyOn(s.publication.git, "updateRefs");
-    await s.dispatch(request(candidate, commit.revision!, s.head));
+    const db = new Database(s.path);
+    const writes = vi.spyOn(lifetime, "startDurableCommand");
+    try {
+      // Ref removal is real; SQLite refuses the following acknowledgement in the child.
+      db.exec(
+        "CREATE TRIGGER deny_publication_release BEFORE UPDATE ON publications WHEN json_extract(NEW.record_json,'$.lock.released')=1 AND json_extract(OLD.record_json,'$.lock.released')=0 BEGIN SELECT RAISE(ABORT, 'Lost release acknowledgement after stopped Git process'); END",
+      );
+      await s.dispatch(request(candidate, commit.revision!, s.head));
+    } finally {
+      db.exec("DROP TRIGGER deny_publication_release");
+      db.close();
+    }
     const pending = s.journal.publications.pending(s.authority.runId)!;
     expect(pending).toMatchObject({
       outcome: null,
@@ -379,7 +397,10 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
       outcome: "published",
       lock: { released: true, releaseDisposition: "absent" },
     });
-    expect(writes).toHaveBeenCalledTimes(2);
+    expect(writes.mock.calls.filter(([, launch]) => worker(launch, "publish"))).toHaveLength(1);
+    expect(git(s.source, "rev-parse", `refs/heads/epicd/${s.authority.runId}`)).toBe(
+      commit.revision,
+    );
   }, 20000);
 
   it("creates subsequent implementation work from canonical custody and never assigns that custody to an agent", async () => {
@@ -453,7 +474,11 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     );
     if (accepted.kind === "rejected") throw new Error("Expected admission");
     s.journal.startAction(s.authority, accepted.action.actionId);
-    const record = s.journal.publications.reserve(s.authority, accepted.action.actionId);
+    const record = s.journal.publications.reserve(
+      s.authority,
+      accepted.action.actionId,
+      s.manager.storageRoot(),
+    );
     expect(record).toMatchObject({ dispatched: false, ioStopped: false });
     s.newLease();
     const result = resource(
@@ -471,10 +496,15 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
   it("lets the orchestrator retry a settled inspection failure and settles the original action without a second write", async () => {
     const s = await fixture();
     const { candidate, commit } = await verified(s);
-    const writes = vi.spyOn(s.publication.git, "updateRefs");
-    vi.spyOn(s.publication.git, "observeRefs").mockRejectedValueOnce(
-      new Error("Transient inspection failure"),
-    );
+    const start = lifetime.startDurableCommand;
+    let failed = false;
+    const writes = vi.spyOn(lifetime, "startDurableCommand").mockImplementation((...args) => {
+      if (worker(args[1], "inspect") && !failed) {
+        failed = true;
+        throw new Error("Transient inspection failure");
+      }
+      return start(...args);
+    });
     const decision = s.decision(request(candidate, commit.revision!, s.head));
     const running = await s.kernel.execute(decision, s.authority);
     if (running.status !== "running") throw new Error("Expected publication dispatch");
@@ -488,22 +518,44 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
       "published",
     );
     expect((await s.kernel.execute(decision, s.authority)).status).toBe("succeeded");
-    expect(writes).toHaveBeenCalledTimes(2); // one private transaction, one user transaction
+    expect(writes.mock.calls.filter(([, launch]) => worker(launch, "publish"))).toHaveLength(1);
+    expect(git(s.source, "rev-parse", `refs/heads/epicd/${s.authority.runId}`)).toBe(
+      commit.revision,
+    );
   }, 20000);
 
   it("never infers unknown old I/O stopped from the absence of a branch or a replacement lease", async () => {
     const s = await fixture();
     const { candidate, commit } = await verified(s);
+    s.preserveArtifacts();
+    process.stdout.write(`Retained unknown publication stop fixture: ${s.root}\n`);
+    // The real writer cannot lock the user's HEAD. Its receipt exists privately, but
+    // is unavailable to reconciliation; neither branch absence nor a new lease proves stop.
+    writeFileSync(join(s.source, ".git/HEAD.lock"), "test-owned publication barrier\n", {
+      flag: "wx",
+    });
     let release!: () => void;
     let entered = false;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const original = s.publication.git.updateRefs.bind(s.publication.git);
-    vi.spyOn(s.publication.git, "updateRefs").mockImplementation(async (...args) => {
-      entered = true;
-      await gate;
-      return original(...args);
+    const original = lifetime.startDurableCommand;
+    vi.spyOn(lifetime, "startDurableCommand").mockImplementation((...args) => {
+      const handle = original(...args);
+      if (!worker(args[1], "publish")) return handle;
+      return {
+        ...handle,
+        result: handle.result.then(async (result) => {
+          entered = true;
+          await gate;
+          return result;
+        }),
+      };
+    });
+    const recover = lifetime.recoverCommandStop;
+    vi.spyOn(lifetime, "recoverCommandStop").mockImplementation((intent) => {
+      const write = s.journal.publications.pending(s.authority.runId)?.ioAttempts[0];
+      return write?.execution?.ioId === intent.ioId ? Promise.resolve(null) : recover(intent);
     });
     const operation = s
       .dispatch(request(candidate, commit.revision!, s.head))
@@ -531,16 +583,10 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
   it("retries a known non-publication using retained objects without replacing the earlier pack owner", async () => {
     const s = await fixture();
     const { candidate, commit } = await verified(s);
-    const original = s.publication.git.updateRefs.bind(s.publication.git);
-    let failed = false;
-    vi.spyOn(s.publication.git, "updateRefs").mockImplementation(async (...args) => {
-      if (args[0].repository.root.path === s.source && !failed) {
-        failed = true;
-        throw new Error("Settled transient ref command failure");
-      }
-      return original(...args);
-    });
+    const headLock = join(s.source, ".git/HEAD.lock");
+    writeFileSync(headLock, "test-owned transient Git lock\n", { flag: "wx" });
     expect((await s.dispatch(request(candidate, commit.revision!, s.head))).status).toBe("failed");
+    unlinkSync(headLock);
     const earlier = s.journal.publications.records(s.authority.runId)[0]!;
     expect(earlier).toMatchObject({
       outcome: "not_published",
@@ -565,15 +611,29 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     async (fault) => {
       const s = await fixture();
       const { candidate, commit } = await verified(s);
-      const original = s.publication.git.updateRefs.bind(s.publication.git);
-      vi.spyOn(s.publication.git, "updateRefs").mockImplementation(async (...args) => {
-        if (args[0].repository.root.path !== s.source) return original(...args);
+      const original = s.publication.reconcile.bind(s.publication);
+      vi.spyOn(s.publication, "reconcile").mockImplementationOnce(async (...args) => {
+        const record = s.journal.publications.record(s.authority.runId, args[1]);
+        // Inject physical interference after the original writer stopped, before inspection.
         if (fault === "partial") {
-          git(s.source, "update-ref", `refs/heads/epicd/${s.authority.runId}`, commit.revision!);
-          throw new Error("Crash between ref writes");
-        }
-        await original(...args);
-        throw new PublicationGitError("publication_conflict", "Late user worktree intervention");
+          git(
+            s.source,
+            "update-ref",
+            "--no-deref",
+            "-d",
+            `refs/epicd/publications/${record.publicationId}`,
+            commit.revision!,
+          );
+        } else
+          git(
+            s.source,
+            "update-ref",
+            "--no-deref",
+            PUBLICATION_LOCK_REF,
+            s.head,
+            record.lock!.revision,
+          );
+        return original(...args);
       });
       expect((await s.dispatch(request(candidate, commit.revision!, s.head))).status).toBe(
         "failed",

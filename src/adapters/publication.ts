@@ -7,6 +7,7 @@ import { PublicationGit, PublicationGitError } from "./publication-git.js";
 import { WorkspaceError, type WorkspaceManager } from "./workspaces.js";
 import { KernelGit } from "./kernel-git.js";
 import { DeliveryError } from "./delivery-journal.js";
+import { reconcilePublicationIO, runPublicationIO } from "./publication-io.js";
 
 const lockContent = (record: PublicationRecord) =>
   `${JSON.stringify({ runId: record.runId, publicationId: record.publicationId, nonce: record.lockNonce })}\n`;
@@ -16,6 +17,7 @@ const detail = (error: unknown) =>
 /** Executes one journaled capability; every external write is preceded by its durable intent. */
 export class PublicationAdapter {
   readonly git = new PublicationGit();
+  private readonly active = new Set<string>();
   constructor(
     readonly journal: OrchestrationJournal,
     readonly workspaces: WorkspaceManager,
@@ -27,7 +29,124 @@ export class PublicationAdapter {
     signal: AbortSignal,
   ): Promise<void> {
     const publications = this.journal.publications;
+    const initial = publications.record(authority.runId, publicationId);
+    if (
+      this.active.has(publicationId) ||
+      initial.dispatched ||
+      initial.ioAttempts[0]!.execution ||
+      initial.ioAttempts[0]!.settledAt
+    )
+      throw new DeliveryError(
+        "publication_dispatched",
+        "Publication dispatch is write-once; reconcile, never replay it",
+      );
+    this.active.add(publicationId);
+    try {
+      const repository = publications.repository(authority.runId)!;
+      let workspace = this.journal.agents.workspaceForOperation(
+        authority.runId,
+        repository.creationOperationId,
+      );
+      if (workspace) {
+        const creation = await this.workspaces.reconcileCreation(authority, workspace);
+        if (!creation || creation.outcome !== "created")
+          throw new WorkspaceError(
+            "publication_custody_incomplete",
+            "Canonical creation did not retain completion; preserve its files",
+          );
+      } else {
+        workspace = await this.workspaces.create(
+          authority,
+          publications.run(authority.runId).repoPath,
+          repository.baseRevision,
+          "delivery",
+          signal,
+          repository.creationOperationId,
+        );
+      }
+      const prepared = publications.attachCanonicalWorkspace(authority, publicationId, workspace);
+      await runPublicationIO(
+        this.journal,
+        authority,
+        publicationId,
+        prepared.ioAttempts[0]!,
+        signal,
+      );
+    } catch (error) {
+      this.journal.assertAuthority(authority);
+      publications.noteIOFailure(authority, publicationId, detail(error));
+      await reconcilePublicationIO(
+        this.journal,
+        authority,
+        publicationId,
+        initial.ioAttempts[0]!.attemptId,
+      );
+    } finally {
+      this.active.delete(publicationId);
+    }
+  }
+
+  /** Recover original execution before a new bounded inspection; never rerun the writer. */
+  async reconcile(authority: ControllerAuthority, publicationId: string, signal?: AbortSignal) {
+    if (this.active.has(publicationId))
+      throw new DeliveryError(
+        "publication_io_live",
+        "Independently prove the active publication operation stopped before reconciliation",
+      );
+    this.active.add(publicationId);
+    try {
+      const publications = this.journal.publications;
+      let record = publications.record(authority.runId, publicationId);
+      if (record.outcome) return record;
+      const previous = record.ioAttempts.at(-1)!;
+      if (!previous.settledAt) {
+        record = await reconcilePublicationIO(
+          this.journal,
+          authority,
+          publicationId,
+          previous.attemptId,
+        );
+        if (record.outcome) return record;
+        if (previous.phase === "inspect")
+          throw new Error(
+            "Original inspection stopped without complete retained observations; request a new inspection",
+          );
+      }
+      const repository = publications.repository(authority.runId)!;
+      const workspace = this.journal.agents.workspaceForOperation(
+        authority.runId,
+        repository.creationOperationId,
+      );
+      // Copy preparation has its own supervisor. A publication receipt cannot settle that child intent.
+      if (workspace) await this.workspaces.reconcileCreation(authority, workspace);
+      record = publications.beginInspection(authority, publicationId);
+      const settled = await runPublicationIO(
+        this.journal,
+        authority,
+        publicationId,
+        record.ioAttempts.at(-1)!,
+        signal,
+      );
+      if (!settled.outcome)
+        throw new Error(
+          `Publication inspection remains unsettled: ${settled.failure ?? "no retained observation"}`,
+        );
+      return settled;
+    } finally {
+      this.active.delete(publicationId);
+    }
+  }
+
+  /** Trusted worker body: all source reads, object imports and ref writes share this lifetime. */
+  async executePublication(
+    authority: ControllerAuthority,
+    publicationId: string,
+    attemptId: string,
+  ): Promise<void> {
+    const publications = this.journal.publications;
+    this.journal.publications.assertIOOwned(authority, publicationId, attemptId);
     publications.start(authority, publicationId);
+    const signal = new AbortController().signal;
     let failure: string | null = null;
     let intervention = false;
     const guard = async (currentSignal: AbortSignal) => {
@@ -46,27 +165,12 @@ export class PublicationAdapter {
         signal,
       );
       const repository = publications.repository(authority.runId)!;
-      let workspace = this.journal.agents.workspaceForOperation(
-        authority.runId,
-        repository.creationOperationId,
-      );
-      if (!workspace)
-        workspace = await this.workspaces.create(
-          authority,
-          run.repoPath,
-          repository.baseRevision,
-          "delivery",
-          signal,
-          repository.creationOperationId,
-        );
-      else if (
-        workspace.workspaceId !== source.workspaceId &&
-        (await this.workspaces.inspectMaterialization(authority, workspace, signal)) !== "ready"
-      )
+      if (!repository.workspace)
         throw new WorkspaceError(
           "publication_custody_incomplete",
-          "Preserve and reconcile the reserved canonical delivery workspace",
+          "Canonical custody was not reserved before worker launch",
         );
+      const workspace = this.journal.agents.workspace(authority.runId, repository.workspace);
       const canonical = await this.git.bind(workspace.path, signal);
       publications.bindCanonical(authority, publicationId, workspace, canonical);
       await this.workspaces.inspectPublicationWorkspace(authority, workspace, signal);
@@ -101,19 +205,24 @@ export class PublicationAdapter {
       failure = detail(error);
       intervention = error instanceof PublicationGitError || error instanceof WorkspaceError;
     } finally {
-      // All invoked methods have settled their handles, including nested prepared Git guards.
-      // A lease loss deliberately leaves every durable exclusion and ownership ref held.
-      publications.stopIO(authority, publicationId, failure, intervention);
+      publications.recordIOResult(authority, publicationId, attemptId, {
+        failure,
+        intervention,
+        canonical: null,
+        user: null,
+      });
     }
   }
 
   /** Requires independently stopped old I/O; never calls publish/import/updateRefs again. */
-  async reconcile(authority: ControllerAuthority, publicationId: string) {
+  async executeInspection(
+    authority: ControllerAuthority,
+    publicationId: string,
+    attemptId: string,
+  ) {
     const publications = this.journal.publications;
     const initial = publications.record(authority.runId, publicationId);
-    if (initial.outcome) return initial;
-    if (!initial.dispatched) publications.cancelUndispatched(authority, publicationId);
-    publications.beginInspection(authority, publicationId);
+    publications.assertInspectionOwned(authority, initial);
     const signal = new AbortController().signal;
     let canonical: Awaited<ReturnType<PublicationGit["observeRefs"]>> | null = null;
     let user: Awaited<ReturnType<PublicationGit["observeRefs"]>> | null = null;
@@ -141,10 +250,13 @@ export class PublicationAdapter {
         error instanceof WorkspaceError ||
         error instanceof DeliveryError;
     } finally {
-      publications.stopIO(authority, publicationId, failure, intervention);
+      publications.recordIOResult(authority, publicationId, attemptId, {
+        failure,
+        intervention,
+        canonical,
+        user,
+      });
     }
-    if (failure) throw new Error(`Publication inspection remains unsettled: ${failure}`);
-    return publications.finish(authority, publicationId, canonical, user);
   }
 
   private async import(
