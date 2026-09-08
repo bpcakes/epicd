@@ -438,6 +438,10 @@ The ordinary full suite at `ee9eb30` recorded 923 passes, one failure and 24 ski
 
 The subsequent full suite at `047404b` passed 943 tests with 24 skips and no failures across 77 files. It predates the typed primary-record change. That change separately passed 274 tests across 16 files with no skips, covering original record paging, reference binding and tampering, whole-epic proof indexing, real fixture/grant history, current-evidence gates, cold recovery, context bounds and SDK/Herdr interface contracts. Its first regression run exposed the serialized-redaction data loss described above; the failing assertions remain and pass after the product fix. These results do not establish live native browser recovery or complete release readiness.
 
+The fresh SDK browser attempt at `d13079c` completed delivery in about 24 minutes: 112 decisions, 20 Astra/high coordinator conversations, three independent approvals, real authentication failure and authorized fixture recovery, task/root closure, final tracker publication and repository ownership release. All 108 turns and seven complete validation workers have stop evidence; the test-owned PostgreSQL server is stopped and its data retained. Source, evaluator and compiled output stayed frozen throughout.
+
+That attempt still **failed the unchanged acceptance test** at `model-led-delivery.integration.test.ts:460`: the lead did not issue another implementer continuation after receiving the completed-code/failed-browser report. It used the kernel evidence to diagnose and repair the environment. Postmortem inspection also found no direct orchestrator read of `playwright.config.cjs`, which a later, unexecuted assertion requires. Completed delivery does not replace those prescribed-action requirements; changing them needs an explicit contract decision. No evaluator or deadline was relaxed, no live native parity is implied, and full acceptance remains open.
+
 The original dispatcher and its dedicated tests have been removed. Their history remains in Git; old state, user repositories, and user-owned Herdr resources are not deleted by this hard cut.
 
 ## License
