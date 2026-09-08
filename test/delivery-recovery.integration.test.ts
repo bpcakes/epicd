@@ -21,6 +21,7 @@ type Kind =
   | "create_review_workspace"
   | "create_implementation_workspace"
   | "run_validation"
+  | "run_diagnostic_check"
   | "run_review"
   | "request_commit";
 
@@ -34,6 +35,10 @@ async function request(s: Setup, kind: Kind): Promise<KernelAction> {
   const copy = await s.copy(candidate);
   if (kind === "run_validation")
     return { kind, ...candidate, ...target(copy), validationPlanId, checkId: check.id };
+  if (kind === "run_diagnostic_check") {
+    const { stage: _stage, ...diagnostic } = check;
+    return { kind, ...candidate, ...target(copy), validationPlanId, check: diagnostic };
+  }
   await s.validate(candidate, copy);
   if (kind === "run_review") {
     s.response(s.report(candidate));
@@ -124,6 +129,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     "create_review_workspace",
     "create_implementation_workspace",
     "run_validation",
+    "run_diagnostic_check",
     "run_review",
     "request_commit",
   ] as const)(
@@ -146,7 +152,12 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
       expect(inspection(result)).toMatchObject({
         actionId: parent.actionId,
         status: "succeeded",
-        result: { kind: kind === "run_validation" ? "validation" : "resource" },
+        result: {
+          kind:
+            kind === "run_validation" || kind === "run_diagnostic_check"
+              ? "validation"
+              : "resource",
+        },
       });
       expect(recovered.journal.action(run, parent.actionId)?.status).toBe("succeeded");
       expect(await recovered.kernel.execute(decision, s.authority)).toEqual(result);

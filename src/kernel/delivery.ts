@@ -1,4 +1,4 @@
-import type { ActionKernel } from "./actions.js";
+import type { ActionContext, ActionKernel } from "./actions.js";
 import { CapabilityRejected, OperationFailed } from "./guards.js";
 import { WorkspaceError, type WorkspaceManager } from "../adapters/workspaces.js";
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
@@ -53,6 +53,10 @@ export function registerDeliveryCapabilities(
     );
     const content = {
       ...evidence,
+      evidenceWarning:
+        evidence.purpose === "diagnostic"
+          ? "Kernel-observed diagnostic command on this snapshot. Never satisfies a required delivery check or independent approval."
+          : "Kernel validation evidence; current check eligibility is reported separately, not independent approval.",
       outcome: evidence.outcome
         ? {
             ...evidence.outcome,
@@ -144,7 +148,7 @@ export function registerDeliveryCapabilities(
       };
     },
   );
-  kernel.registerExternal("run_validation", async ({ authority, record, signal }) => {
+  const runCheck = async ({ authority, record, signal }: ActionContext) => {
     let intent;
     try {
       intent = journal.delivery.beginValidation(authority, record.actionId);
@@ -155,10 +159,12 @@ export function registerDeliveryCapabilities(
     }
     const evidence = await runCandidateValidation(journal, workspaces, authority, intent, signal);
     return {
-      kind: "validation",
+      kind: "validation" as const,
       evidenceId: evidence.evidenceId,
       outcome: evidence.outcome!.status,
       satisfiesCheck: journal.delivery.satisfiesCheck(authority.runId, evidence.evidenceId),
     };
-  });
+  };
+  kernel.registerExternal("run_validation", runCheck);
+  kernel.registerExternal("run_diagnostic_check", runCheck);
 }

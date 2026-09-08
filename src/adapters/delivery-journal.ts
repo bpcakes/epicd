@@ -581,7 +581,13 @@ export class DeliveryJournal {
 
   beginValidation(authority: ControllerAuthority, actionId: string): ValidationEvidence {
     return this.access.transaction(authority, () => {
-      const { record, action } = this.action(authority, actionId, "run_validation");
+      const kind = this.access.action(authority.runId, actionId)?.request.action.kind;
+      if (kind !== "run_validation" && kind !== "run_diagnostic_check")
+        throw new DeliveryError(
+          "validation_action",
+          "A check requires its admitted validation or diagnostic action",
+        );
+      const { record, action } = this.action(authority, actionId, kind);
       if (
         this.byOperation(
           ValidationEvidenceSchema,
@@ -618,7 +624,10 @@ export class DeliveryJournal {
           "validation_target",
           "Validation target, plan, and candidate do not match",
         );
-      const check = plan.checks.find((item) => item.id === action.checkId);
+      const check =
+        action.kind === "run_diagnostic_check"
+          ? RequiredCheckSchema.parse({ ...action.check, stage: binding.phase })
+          : plan.checks.find((item) => item.id === action.checkId);
       if (!check || (check.stage !== "both" && check.stage !== binding.phase))
         throw new DeliveryError(
           "validation_stage",
@@ -668,6 +677,8 @@ export class DeliveryJournal {
         candidateGeneration: candidate.candidateGeneration,
         validationPlanId: plan.planId,
         checkId: check.id,
+        purpose: action.kind === "run_diagnostic_check" ? "diagnostic" : "delivery",
+        check,
         commandDigest: digestJson(check),
         policyDigest: record.policyDigest,
         phase: binding.phase,
@@ -865,11 +876,41 @@ export class DeliveryJournal {
     );
   }
   evidence(runId: string, evidenceId: string): ValidationEvidence {
-    return this.read(
+    const evidence = this.read(
       ValidationEvidenceSchema,
       "SELECT record_json FROM validation_evidence WHERE run_id = ? AND evidence_id = ?",
       [runId, evidenceId],
     );
+    const row = this.db
+      .prepare("SELECT action_id FROM actions WHERE run_id = ? AND operation_id = ?")
+      .get(runId, evidence.operationId) as { action_id: string } | undefined;
+    const action = row ? this.access.action(runId, row.action_id)?.request.action : undefined;
+    if (!action || (action.kind !== "run_validation" && action.kind !== "run_diagnostic_check"))
+      throw new DeliveryError(
+        "validation_provenance",
+        "Check evidence has no matching admitted action",
+      );
+    const diagnostic = action.kind === "run_diagnostic_check";
+    const expected = diagnostic
+      ? RequiredCheckSchema.parse({ ...action.check, stage: evidence.phase })
+      : this.plan(runId, action.validationPlanId).checks.find(
+          (check) => check.id === action.checkId,
+        );
+    if (
+      evidence.purpose !== (diagnostic ? "diagnostic" : "delivery") ||
+      !expected ||
+      digestJson(expected) !== evidence.commandDigest ||
+      action.validationPlanId !== evidence.validationPlanId ||
+      action.candidateId !== evidence.candidateId ||
+      action.candidateGeneration !== evidence.candidateGeneration ||
+      action.workspaceId !== evidence.workspaceId ||
+      action.workspaceGeneration !== evidence.workspaceGeneration
+    )
+      throw new DeliveryError(
+        "validation_provenance",
+        "Check purpose, command or target differs from its admitted action",
+      );
+    return evidence;
   }
   candidateForOperation(runId: string, operationId: string): CandidateRecord | null {
     return this.byOperation(CandidateRecordSchema, "candidates", runId, operationId);
@@ -968,13 +1009,14 @@ export class DeliveryJournal {
   }
   satisfiesCheck(runId: string, evidenceId: string, activeTrackerOperationId?: string): boolean {
     const evidence = this.evidence(runId, evidenceId);
+    if (evidence.purpose !== "delivery") return false;
     const candidate = this.candidate(runId, evidence);
     const check = this.plan(runId, evidence.validationPlanId).checks.find(
       (item) => item.id === evidence.checkId,
     );
     const latest = this.all(
       ValidationEvidenceSchema,
-      "SELECT record_json FROM validation_evidence WHERE run_id = ? AND candidate_id = ? AND json_extract(record_json, '$.checkId') = ? AND json_extract(record_json, '$.phase') = ? AND json_extract(record_json, '$.revision') = ? ORDER BY rowid DESC LIMIT 1",
+      "SELECT record_json FROM validation_evidence WHERE run_id = ? AND candidate_id = ? AND json_extract(record_json, '$.purpose') = 'delivery' AND json_extract(record_json, '$.checkId') = ? AND json_extract(record_json, '$.phase') = ? AND json_extract(record_json, '$.revision') = ? ORDER BY rowid DESC LIMIT 1",
       [runId, evidence.candidateId, evidence.checkId, evidence.phase, evidence.revision],
     )[0];
     let revision: string;
@@ -1064,6 +1106,7 @@ export class DeliveryJournal {
         evidenceId: evidence.evidenceId,
         candidateId: evidence.candidateId,
         checkId: evidence.checkId,
+        purpose: evidence.purpose,
         status: evidence.outcome?.status ?? "running",
         phase: evidence.phase,
         satisfiesCheck: this.satisfiesCheck(runId, evidence.evidenceId),

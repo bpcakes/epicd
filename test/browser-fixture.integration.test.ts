@@ -12,7 +12,6 @@ import {
 } from "../src/adapters/fixtures.js";
 import { PostgreSqlFixtureCreator } from "../src/adapters/fixture-creation.js";
 import { registerFixtureCapabilities } from "../src/kernel/fixtures.js";
-import { startConfinedCommand } from "../src/adapters/sandbox.js";
 
 const bin = process.env.EPICD_TEST_PG_BINDIR,
   broker = process.env.EPICD_TEST_PGBOUNCER,
@@ -69,15 +68,32 @@ describe.runIf(process.platform === "linux" && Boolean(bin && broker && toolchai
         expect(pg.sql("SELECT count(*) FROM pg_database WHERE datname='browser_fixture'")).toBe(
           "0",
         );
-        const failure = await (
-          await startConfinedCommand({
-            workspace: s.source,
-            sourceMode: "read-only",
-            command: check.command,
-            args: check.args,
-            timeoutMs: 30000,
-          })
-        ).result;
+        const plan = await s.define(),
+          candidate = await s.capture(plan),
+          copy = await s.copy(candidate);
+        const { stage: _stage, ...diagnosticCheck } = check;
+        const diagnostic = success(
+          await s.dispatch({
+            kind: "run_diagnostic_check",
+            ...candidate,
+            ...target(copy),
+            validationPlanId: plan,
+            check: { ...diagnosticCheck, environmentBindings: [] },
+          }),
+        );
+        if (diagnostic.kind !== "validation") throw new Error("Expected diagnostic command result");
+        expect(diagnostic.satisfiesCheck).toBe(false);
+        const observed = s.journal.delivery.evidence(s.authority.runId, diagnostic.evidenceId);
+        expect(observed).toMatchObject({
+          purpose: "diagnostic",
+          sourceUnchanged: true,
+          environmentVerified: true,
+          fixtureAccessIds: [],
+        });
+        expect(
+          s.journal.delivery.preCommitEvidence(s.authority.runId, candidate).missingCheckIds,
+        ).toContain(check.id);
+        const failure = observed.outcome!;
         expect(failure.status, failure.stderr).toBe("failed");
         expect(failure.stdout).toContain("1 failed");
         expect(failure.stderr).toContain("Browser fixture authentication failed");
@@ -111,9 +127,6 @@ describe.runIf(process.platform === "linux" && Boolean(bin && broker && toolchai
             expectedGeneration: 0,
           }),
         );
-        const plan = await s.define(),
-          candidate = await s.capture(plan),
-          copy = await s.copy(candidate);
         const payload = success(
           await s.dispatch({
             kind: "run_validation",

@@ -32,6 +32,7 @@ async function setup(
     query?: string;
     timeoutMs?: number;
     localService?: boolean;
+    diagnostic?: boolean;
   } = {},
 ) {
   const { root, sockets, manager, role, admin, sql, cleanup } = startFixturePostgreSql(bin!);
@@ -133,13 +134,22 @@ async function setup(
     const planId = await s.define(),
       candidate = await s.capture(planId),
       copy = await s.copy(candidate);
-    const action: KernelAction = {
-      kind: "run_validation",
-      ...candidate,
-      ...target(copy),
-      validationPlanId: planId,
-      checkId: check.id,
-    };
+    const { stage: _stage, ...diagnosticCheck } = check;
+    const action: KernelAction = options.diagnostic
+      ? {
+          kind: "run_diagnostic_check",
+          ...candidate,
+          ...target(copy),
+          validationPlanId: planId,
+          check: diagnosticCheck,
+        }
+      : {
+          kind: "run_validation",
+          ...candidate,
+          ...target(copy),
+          validationPlanId: planId,
+          checkId: check.id,
+        };
     const validate = async () => {
       const result = success(await s.dispatch(action));
       if (result.kind !== "validation") throw new Error("Expected validation payload");
@@ -174,6 +184,54 @@ async function setup(
 describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
   "granted fixture SQL through the real validation kernel",
   () => {
+    it("uses the same restricted fixture and stop proofs for diagnostics without satisfying delivery", async () => {
+      const f = await setup({ diagnostic: true });
+      try {
+        const { result, evidence, use } = await f.validate();
+        expect(result, JSON.stringify(evidence.outcome)).toMatchObject({
+          outcome: "succeeded",
+          satisfiesCheck: false,
+        });
+        expect(evidence).toMatchObject({
+          purpose: "diagnostic",
+          sourceUnchanged: true,
+          environmentVerified: true,
+        });
+        expect(use).toMatchObject({ localStopped: true, remoteStopped: true });
+        expect(f.sql("SELECT value FROM proof", "browser_fixture")).toBe("green");
+      } finally {
+        f.cleanup();
+      }
+    });
+    it("does not grant diagnostic SQL through declaration, creation authority or a pre-existing database", async () => {
+      const f = await setup({ diagnostic: true, create: false, grant: false });
+      try {
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_grant_required",
+        });
+        f.grant();
+        f.sql(`CREATE DATABASE browser_fixture OWNER ${f.role}`);
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_not_owned",
+        });
+        expect(f.s.journal.fixtures.validation.uses(f.s.authority.runId)).toEqual([]);
+      } finally {
+        f.cleanup();
+      }
+    });
+    it("rejects an unsafe validation role for diagnostics before starting the repository command", async () => {
+      const f = await setup({ diagnostic: true });
+      try {
+        f.sql(`ALTER ROLE ${f.role} SUPERUSER`);
+        const { result, evidence } = await f.validate();
+        expect(result).toMatchObject({ outcome: "not_started", satisfiesCheck: false });
+        expect(evidence.outcome?.exitCode).toBeNull();
+      } finally {
+        f.cleanup();
+      }
+    });
     it("uses the operator CLI to grant and revoke SQL access separately from creation", async () => {
       const f = await setup({ grant: false });
       try {

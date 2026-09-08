@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { WorkspaceIdentitySchema } from "./agents.js";
 import { WorkspaceSnapshotSchema } from "./workspaces.js";
-import { RequiredCheckSchema } from "./repository-policy.js";
+import { digestJson, RequiredCheckSchema } from "./repository-policy.js";
 import { FixtureExecutableSchema } from "./fixtures.js";
 
 export const ValidationServiceRuntimeSchema = z.strictObject({
@@ -115,6 +115,8 @@ export const ValidationEvidenceSchema = WorkspaceIdentitySchema.extend({
   ...CandidateIdentitySchema.shape,
   validationPlanId: Id,
   checkId: Id,
+  purpose: z.enum(["delivery", "diagnostic"]),
+  check: RequiredCheckSchema,
   commandDigest: Id,
   policyDigest: Id,
   phase: z.enum(["pre_commit", "exact_revision"]),
@@ -128,8 +130,13 @@ export const ValidationEvidenceSchema = WorkspaceIdentitySchema.extend({
   outcome: ValidationOutcomeSchema.nullable(),
   sourceUnchanged: z.boolean(),
   createdAt: At,
-}).refine(
-  (value) => (value.status === "finished") === (value.outcome !== null),
-  "Terminal validation needs an observed process outcome",
-);
+})
+  .refine(
+    (value) => (value.status === "finished") === (value.outcome !== null),
+    "Terminal validation needs an observed process outcome",
+  )
+  .refine(
+    (value) => value.checkId === value.check.id && value.commandDigest === digestJson(value.check),
+    "Validation command identity differs from its frozen check",
+  );
 export type ValidationEvidence = z.infer<typeof ValidationEvidenceSchema>;

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { AgentRoleSchema, AgentRoleSettingsSchema } from "./types.js";
+import { RequiredCheckSchema } from "./repository-policy.js";
 
 // These identities originate in durable controller records, never in agent output.
 const IdentityPartSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
@@ -209,6 +210,16 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
     ...CandidateTarget,
     validationPlanId: Id,
     checkId: Id,
+  }),
+  z.strictObject({
+    kind: z.literal("run_diagnostic_check"),
+    ...WorkspaceTarget,
+    ...CandidateTarget,
+    validationPlanId: Id,
+    check: RequiredCheckSchema.omit({ stage: true }).refine(
+      (check) => Buffer.byteLength(JSON.stringify(check)) <= 16384,
+      "Diagnostic command exceeds its 16 KiB inspection budget",
+    ),
   }),
   z.strictObject({
     kind: z.literal("run_review"),

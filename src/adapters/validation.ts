@@ -23,8 +23,7 @@ export async function runCandidateValidation(
   signal: AbortSignal,
 ): Promise<ValidationEvidence> {
   const candidate = journal.delivery.candidate(authority.runId, evidence);
-  const plan = journal.delivery.plan(authority.runId, evidence.validationPlanId);
-  const check = plan.checks.find((item) => item.id === evidence.checkId)!;
+  const check = evidence.check;
   const writablePaths = journal.policy(authority.runId).writableScratch;
   const fixtureJournal = journal.fixtures.validation;
   const fixtureUses = evidence.fixtureAccessIds.map((id) =>

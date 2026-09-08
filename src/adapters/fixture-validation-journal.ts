@@ -239,7 +239,7 @@ export class FixtureValidationJournal {
       const evidence = ValidationEvidenceSchema.parse(row ? JSON.parse(row.record_json) : null);
       if (
         action?.status !== "running" ||
-        action.request.action.kind !== "run_validation" ||
+        !["run_validation", "run_diagnostic_check"].includes(action.request.action.kind) ||
         action.operationId !== evidence.operationId ||
         evidence.controllerLeaseId !== authority.leaseId ||
         evidence.status !== "running"

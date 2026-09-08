@@ -15,6 +15,7 @@ const supported = new Set<ActionRecord["request"]["action"]["kind"]>([
   "create_review_workspace",
   "create_implementation_workspace",
   "run_validation",
+  "run_diagnostic_check",
   "run_review",
   "request_commit",
   "reconcile_action",
@@ -150,7 +151,7 @@ export async function reconcileDeliveryAction(
             review.failure ?? "Review did not durably establish independently inspected evidence",
           );
     }
-    if (action.kind === "run_validation") {
+    if (action.kind === "run_validation" || action.kind === "run_diagnostic_check") {
       const evidence = journal.delivery.validationForOperation(run, record.operationId);
       if (!evidence) return failed("No validation intent exists; no check command was admitted");
       const operation = journal.agents.workspaceOperation(run, evidence.workspaceOperationId);
