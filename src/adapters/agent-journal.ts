@@ -196,12 +196,34 @@ function redactResult(value: JsonValue): JsonValue {
 const safeText = (value: string, max = 16000) =>
   redactSensitiveText(z.string().min(1).max(max).parse(value), max - 1);
 
+/** Parsed JSON is acyclic. Readers cannot alter another predicate's cached turn witness. */
+function freezeReadRecords(value: unknown): void {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
+  for (const child of Object.values(value)) freezeReadRecords(child);
+  Object.freeze(value);
+}
+
 /** Durable coordination only. Provider calls and filesystem effects occur outside these transactions. */
 export class AgentJournal {
+  private snapshotTurns: Map<string, TurnRecord[]> | null = null;
+
   constructor(
     private readonly db: Database.Database,
     private readonly access: Access,
   ) {}
+
+  /** Internal read-side scope; the owning journal must establish a read-only SQL snapshot. */
+  withReadSnapshot<T>(read: () => T): T {
+    if (!this.db.inTransaction || this.db.pragma("query_only", { simple: true }) !== 1)
+      throw new Error("Turn read snapshots require a read-only database transaction");
+    if (this.snapshotTurns !== null) return read();
+    this.snapshotTurns = new Map();
+    try {
+      return read();
+    } finally {
+      this.snapshotTurns = null;
+    }
+  }
 
   reserveWorkspace(
     authority: ControllerAuthority,
@@ -520,11 +542,18 @@ export class AgentJournal {
     );
   }
   turns(runId: string): TurnRecord[] {
-    return this.all(
+    const cached = this.snapshotTurns?.get(runId);
+    if (cached) return cached;
+    const turns = this.all(
       TurnRecordSchema,
       "SELECT record_json FROM agent_turns WHERE run_id = ? ORDER BY rowid",
       [runId],
     ).map((turn) => this.validateTurn(turn));
+    if (this.snapshotTurns !== null) {
+      freezeReadRecords(turns);
+      this.snapshotTurns.set(runId, turns);
+    }
+    return turns;
   }
   turn(runId: string, identity: TurnIdentity): TurnRecord {
     const turn = this.validateTurn(

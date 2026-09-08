@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 33. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 36. Use a fresh state path; unsupported existing data is left intact.
 
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Restricted validation access to run-created PostgreSQL fixtures is implemented under separate operator grants. Host-fixture reset/cleanup, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
 
@@ -173,6 +173,8 @@ Whole-epic `closedTasks` context supplies `historicalRecords` pointing to each a
 Structured action and domain-record views redact values before JSON serialization. This preserves adjacent fields and multiline output after credential lines; applying text redaction to the serialized object could consume that evidence along with a secret. Redaction remains best effort, not a secret detector, and retained diagnostic text is not independently verified evidence.
 
 Each decision snapshot stays within 64 KiB. Observations are delivered as an ordered prefix with an explicit backlog flag; admission acknowledges only the delivered cursor. Large event metadata causes another page, not skipped events or an increased limit. Shortened observations remain in SQLite and can be retrieved with the read-only, run-scoped `inspect_observation` capability. Its pages contain retained JSON text with UTF-16 offsets and `nextOffset`; reading every retained character does not turn diagnostic claims into verification evidence. Current authority/evidence summaries and the latest action outcome remain in context. When request arguments are too large, `latestActionOutcome` retains the action identity and result while explicitly omitting those arguments from the preview; the journaled request is unchanged. A mandatory snapshot that cannot fit still fails explicitly.
+
+Orchestrator context and `inspect_run` use one read-only SQLite snapshot. Complete turn history is validated once and reused only during that synchronous read. The temporary records are immutable; later reads and action admission validate fresh state. Review approval and authority are never cached across actions. Both SDK and native Herdr use this shared journal boundary.
 
 The run outlives any one Astra conversation. Between decisions, the controller retires a confirmed-stopped coordinator when its recorded history reaches 12 turns, 512 KiB of serialized prompts/schemas/results, or 196,608 reported SDK input tokens. These are conservative rollover thresholds, not exact context occupancy or monetary limits. SDK usage is retained against the exact acknowledged launch; native Herdr uses the same byte/turn guards without inventing token counts from terminal text.
 

@@ -49,6 +49,10 @@ export type OrchestratorContext = {
 
 /** No lease tokens or private provider reasoning enter the bounded working context. */
 export function buildOrchestratorContext(kernel: ActionKernel, runId: string): OrchestratorContext {
+  return kernel.journal.readSnapshot(() => buildSnapshotContext(kernel, runId));
+}
+
+function buildSnapshotContext(kernel: ActionKernel, runId: string): OrchestratorContext {
   const control = kernel.journal.control(runId);
   const pending = kernel.journal.observations(runId, control.observationCursor, 101);
   const observations = pending.slice(0, 100);

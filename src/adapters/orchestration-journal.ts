@@ -617,6 +617,18 @@ export class OrchestrationJournal {
       this.db.prepare("INSERT INTO tracker_roots VALUES (?, NULL)").run(runId);
   }
 
+  /** One synchronous, immutable read view. Never carries eligibility across an action boundary. */
+  readSnapshot<T>(read: () => T): T {
+    this.assertStorage();
+    const previous = this.db.pragma("query_only", { simple: true });
+    try {
+      this.db.pragma("query_only = ON");
+      return this.db.transaction(() => this.agents.withReadSnapshot(read))();
+    } finally {
+      this.db.pragma(previous === 1 ? "query_only = ON" : "query_only = OFF");
+    }
+  }
+
   control(runId: string): ControlState {
     const row = this.db.prepare("SELECT * FROM orchestration_runs WHERE run_id = ?").get(runId) as
       ControlRow | undefined;

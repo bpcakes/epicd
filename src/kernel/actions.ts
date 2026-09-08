@@ -232,35 +232,37 @@ export class ActionKernel {
         delivery: message.status === "acknowledged" ? "acknowledged" : "queued",
       };
     });
-    this.registerLocal("inspect_run", ({ authority }) => {
-      const content = {
-        objective: journal.runObjective(authority.runId),
-        control: journal.control(authority.runId),
-        agents: journal.agents.summaries(authority.runId),
-        delivery: journal.delivery.summaries(authority.runId),
-        reviews: journal.reviews.summaries(authority.runId),
-        commits: journal.commits.summaries(authority.runId),
-        trackerCommits: journal.trackerCommits.summaries(authority.runId),
-        publications: journal.publications.summaries(authority.runId),
-        tracker: journal.tracker.summary(authority.runId),
-        diagnostics: journal.diagnostics.summary(authority.runId),
-        fixtures: journal.fixtures.summary(authority.runId),
-        memory: journal
-          .memory(authority.runId)
-          .slice(-20)
-          .map((entry) => ({ ...entry, content: redactSensitiveText(entry.content, 500) })),
-        actions: journal
-          .actions(authority.runId)
-          .slice(-10)
-          .map((record) => actionContextRecord(record, false)),
-        omittedActions: 0,
-      };
-      while (Buffer.byteLength(JSON.stringify(content)) > 64000 && content.actions.length) {
-        content.actions.shift();
-        content.omittedActions += 1;
-      }
-      return { kind: "inspection", text: JSON.stringify(content), artifactIds: [] };
-    });
+    this.registerLocal("inspect_run", ({ authority }) =>
+      journal.readSnapshot(() => {
+        const content = {
+          objective: journal.runObjective(authority.runId),
+          control: journal.control(authority.runId),
+          agents: journal.agents.summaries(authority.runId),
+          delivery: journal.delivery.summaries(authority.runId),
+          reviews: journal.reviews.summaries(authority.runId),
+          commits: journal.commits.summaries(authority.runId),
+          trackerCommits: journal.trackerCommits.summaries(authority.runId),
+          publications: journal.publications.summaries(authority.runId),
+          tracker: journal.tracker.summary(authority.runId),
+          diagnostics: journal.diagnostics.summary(authority.runId),
+          fixtures: journal.fixtures.summary(authority.runId),
+          memory: journal
+            .memory(authority.runId)
+            .slice(-20)
+            .map((entry) => ({ ...entry, content: redactSensitiveText(entry.content, 500) })),
+          actions: journal
+            .actions(authority.runId)
+            .slice(-10)
+            .map((record) => actionContextRecord(record, false)),
+          omittedActions: 0,
+        };
+        while (Buffer.byteLength(JSON.stringify(content)) > 64000 && content.actions.length) {
+          content.actions.shift();
+          content.omittedActions += 1;
+        }
+        return { kind: "inspection", text: JSON.stringify(content), artifactIds: [] };
+      }),
+    );
     this.registerLocal("record_memory", ({ authority }, action) => ({
       kind: "memory",
       memoryId: journal.recordMemory(authority, action.entry).memoryId,
