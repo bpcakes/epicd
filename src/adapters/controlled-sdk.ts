@@ -4,6 +4,7 @@ import type { ControllerAuthority, TurnIdentity } from "../domain/orchestration.
 import type { TurnRecord } from "../domain/agents.js";
 import type { CodexLaunchStop } from "../domain/codex-launch.js";
 import { ControlledLaunches, type ControlledLaunchOptions } from "./controlled-launch.js";
+import { ControlledTranscript } from "./controlled-transcript.js";
 import { normalizeCodexEvent } from "./codex.js";
 import { redactSensitiveText } from "../util/redact.js";
 
@@ -72,9 +73,24 @@ export class ControlledSdkRuntime {
     let diagnostic: string | null = null;
     let sequence = 0;
     let onStreamAbort: (() => void) | undefined;
+    const transcript = new ControlledTranscript(
+      this.journal,
+      authority,
+      identity,
+      manifest,
+      JSON.stringify(turn.prompt),
+    );
+    const sessionId = () =>
+      this.journal.agents.instance(authority.runId, identity).provider?.sessionId ?? null;
+    let stopWatching: (() => Promise<void>) | undefined;
+    let transcriptError: unknown;
     try {
       const launcher = await this.launches.materialize(manifest);
       check();
+      stopWatching = transcript.watch(sessionId, check, (error) => {
+        transcriptError = error;
+        request.abort(error);
+      });
       const client = new Codex({
         codexPathOverride: launcher.executable,
         env: { PATH: "/usr/bin:/bin" },
@@ -184,12 +200,14 @@ export class ControlledSdkRuntime {
         interrupted,
       ]);
     } catch (error) {
+      error = transcriptError ?? error;
       diagnostic = redactSensitiveText(
         error instanceof Error ? error.message : "Agent execution failed",
         7999,
       );
       request.abort(error);
     } finally {
+      await stopWatching?.();
       clearInterval(health);
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
@@ -217,6 +235,21 @@ export class ControlledSdkRuntime {
     // Its stored outcome wins; late stream output cannot replace it.
     const settled = this.journal.agents.turn(authority.runId, identity);
     if (settled.stopEvidence) return settled;
+    if (stop && invoked) {
+      try {
+        // Provider exit flushes the last transcript records. Diagnostics can be
+        // recovered here, but never stand in for the SDK result or supervisor stop.
+        await transcript.finish(sessionId(), () => this.journal.assertAuthority(authority));
+      } catch (error) {
+        this.journal.assertAuthority(authority);
+        const detail = redactSensitiveText(
+          error instanceof Error ? error.message : "Transcript capture failed",
+          7999,
+        );
+        transcript.gap(detail);
+        diagnostic ??= detail;
+      }
+    }
     if (diagnostic)
       this.journal.appendObservation(authority, {
         source: "controlled-sdk",
@@ -278,6 +311,21 @@ export class ControlledSdkRuntime {
         identity,
         "Recorded launcher is still running or has unknown stop state",
       );
+    const transcript = new ControlledTranscript(
+      this.journal,
+      authority,
+      identity,
+      manifest,
+      JSON.stringify(turn.prompt),
+    );
+    try {
+      const session =
+        this.journal.agents.instance(authority.runId, identity).provider?.sessionId ?? null;
+      await transcript.finish(session, () => this.journal.assertAuthority(authority));
+    } catch (error) {
+      this.journal.assertAuthority(authority);
+      transcript.gap(error instanceof Error ? error.message : "Cold transcript capture failed");
+    }
     this.journal.agents.recordLaunchStop(authority, identity, stop);
     this.journal.appendObservation(authority, {
       source: "controlled-sdk",

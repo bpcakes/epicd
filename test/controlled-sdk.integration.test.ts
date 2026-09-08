@@ -504,6 +504,50 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
   });
 
   it.runIf(process.env.EPICD_LIVE_ORCHESTRATOR === "1")(
+    "retains an actual failed tool diagnostic from the real SDK provider transcript",
+    async () => {
+      const setup = await fixture("live");
+      const marker = `epicd-sdk-diagnostic-${randomUUID()}`;
+      const prepared = setup.prepare(
+        `Run exactly one shell command: printf '%s\\n' '${marker}'; exit 17. This is a deliberate diagnostic test; the nonzero exit is expected. Display the actual tool result without hiding it inside a boolean or replacing it with a summary. Do not modify source or run Git. After inspecting the failure, return JSON with status set to observed.`,
+      );
+      const result = await setup.driver().run(setup.authority, prepared.identity);
+      const journal = setup.store.orchestration;
+      const observations = journal.observations(setup.authority.runId, 0, 1000);
+      expect(
+        result,
+        JSON.stringify(observations.filter((row) => row.kind === "runtime.problem")),
+      ).toMatchObject({
+        status: "completed",
+        resultEligible: true,
+        result: { status: "observed" },
+        launch: {
+          manifest: { model: "gpt-6-astra", reasoningEffort: "high" },
+          stop: { code: 0, processTreeStopped: true },
+        },
+      });
+      const output = observations
+        .filter((row) => row.kind === "runtime.transcript_tool_result")
+        .map(
+          (row) =>
+            JSON.parse(
+              journal.diagnostics.read(setup.authority.runId, row.artifactIds[0]!, 0, 65536).text,
+            ).output,
+        )
+        .join("\n");
+      expect(output).toContain(marker);
+      expect(output).toMatch(/(?:code|exit_code)[\s"':=]+17/i);
+      expect(observations.some((row) => row.kind === "runtime.transcript_turn_bound")).toBe(true);
+      expect(journal.delivery.summaries(setup.authority.runId)).toMatchObject({
+        candidates: [],
+        validation: [],
+      });
+      expect(await readFile(join(setup.workspace.path, "source.txt"), "utf8")).toBe("red\n");
+    },
+    100_000,
+  );
+
+  it.runIf(process.env.EPICD_LIVE_ORCHESTRATOR === "1")(
     "delivers a real Astra file change through the durable SDK turn",
     async () => {
       const setup = await fixture("live");

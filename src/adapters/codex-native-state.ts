@@ -11,6 +11,7 @@ const NativeSessionSchema = z.object({
   model: z.string().nullable(),
   reasoning_effort: z.string().nullable(),
   cli_version: z.string(),
+  rollout_path: z.string().min(1),
 });
 
 /** Pinned Codex 0.153.4 private-state adapter. Never infer session identity from terminal text. */
@@ -37,7 +38,9 @@ export async function readNativeCodexSession(launch: CodexLaunch, expected: stri
       { type: string } | undefined;
     if (type?.type !== "table") throw new Error("Unsupported private Codex thread store");
     const rows = db
-      .prepare("SELECT id, cwd, model, reasoning_effort, cli_version FROM threads LIMIT 2")
+      .prepare(
+        "SELECT id, cwd, model, reasoning_effort, cli_version, rollout_path FROM threads LIMIT 2",
+      )
       .all();
     if (rows.length === 0) return null;
     if (rows.length !== 1) throw new Error("Private native agent has ambiguous provider sessions");

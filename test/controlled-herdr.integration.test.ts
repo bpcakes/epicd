@@ -278,12 +278,13 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === 
     it("resumes the real native conversation in a fresh confined terminal without a host-shell fallback", async () => {
       const setup = await fixture();
       const secret = `memory-${randomUUID().slice(0, 8)}`;
+      const marker = `epicd-native-diagnostic-${randomUUID()}`;
       const first = await setup
         .runtime()
         .run(
           setup.authority,
           setup.prepare(
-            `Remember the exact secret ${secret} for the next turn. Do not modify source. Write the required result envelope with result.status set to remembered.`,
+            `Remember the exact secret ${secret} for the next turn. Run this shell command once: printf '%s\\n' '${marker}'; exit 17. This expected failure tests diagnostic capture. Display the actual tool result without replacing it with a summary. Do not modify source. Write the required result envelope with result.status set to remembered.`,
           ).identity,
         );
       expect(
@@ -304,6 +305,23 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === 
       });
       await setup.terminalStopped(first.launch!.native!);
       const observations = setup.store.orchestration.observations(setup.authority.runId);
+      const transcriptOutput = observations
+        .filter((row) => row.kind === "runtime.transcript_tool_result")
+        .map(
+          (row) =>
+            JSON.parse(
+              setup.store.orchestration.diagnostics.read(
+                setup.authority.runId,
+                row.artifactIds[0]!,
+                0,
+                65536,
+              ).text,
+            ).output,
+        )
+        .join("\n");
+      expect(transcriptOutput).toContain(marker);
+      expect(transcriptOutput).toMatch(/(?:code|exit_code)[\s"':=]+17/i);
+      expect(observations.some((row) => row.kind === "runtime.transcript_turn_bound")).toBe(true);
       const terminal = observations.find((row) => row.kind === "runtime.native_terminal");
       expect(terminal?.artifactIds).toHaveLength(1);
       const diagnostic = setup.store.orchestration.diagnostics.read(
@@ -348,6 +366,15 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === 
       ).toBe(sessionId);
       expect(next.launch!.native!.terminalId).not.toBe(first.launch!.native!.terminalId);
       expect(next.launch!.manifest.generation).not.toBe(first.launch!.manifest.generation);
+      expect(
+        setup.store.orchestration
+          .observations(setup.authority.runId, 0, 1000)
+          .filter(
+            (row) =>
+              row.kind === "runtime.transcript_turn_bound" &&
+              row.identity?.turnId === next.identity.turnId,
+          ),
+      ).toHaveLength(1);
       expect(await readFile(join(setup.workspace.path, "source.txt"), "utf8")).toBe("red\n");
     }, 200_000);
 

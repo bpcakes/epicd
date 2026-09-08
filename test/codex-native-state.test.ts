@@ -41,16 +41,17 @@ async function fixture() {
     model: launch.model,
     reasoning_effort: launch.reasoningEffort,
     cli_version: "0.153.4",
+    rollout_path: join(providerHome, "sessions", "unused.jsonl"),
   };
   function database(rows: object[] = [session], view = false) {
     const db = new Database(path);
     try {
       db.exec(
-        "CREATE TABLE records(id TEXT, cwd TEXT, model TEXT, reasoning_effort TEXT, cli_version TEXT)",
+        "CREATE TABLE records(id TEXT, cwd TEXT, model TEXT, reasoning_effort TEXT, cli_version TEXT, rollout_path TEXT)",
       );
       for (const row of rows)
         db.prepare(
-          "INSERT INTO records VALUES (@id,@cwd,@model,@reasoning_effort,@cli_version)",
+          "INSERT INTO records VALUES (@id,@cwd,@model,@reasoning_effort,@cli_version,@rollout_path)",
         ).run(row);
       db.exec(
         view
@@ -73,9 +74,9 @@ describe("pinned native provider identity and input acceptance", () => {
     expect(await readNativeCodexSession(setup.launch, null)).toBeNull();
     const db = new Database(setup.path);
     try {
-      db.prepare("INSERT INTO threads VALUES (@id,@cwd,@model,@reasoning_effort,@cli_version)").run(
-        setup.session,
-      );
+      db.prepare(
+        "INSERT INTO threads VALUES (@id,@cwd,@model,@reasoning_effort,@cli_version,@rollout_path)",
+      ).run(setup.session);
     } finally {
       db.close();
     }

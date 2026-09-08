@@ -7,6 +7,7 @@ import type { ControllerAuthority, TurnIdentity } from "../domain/orchestration.
 import type { TurnRecord } from "../domain/agents.js";
 import { NativeLaunchEndpointSchema, type NativeLaunchEndpoint } from "../domain/codex-launch.js";
 import { ControlledLaunches, type ControlledLaunchOptions } from "./controlled-launch.js";
+import { ControlledTranscript } from "./controlled-transcript.js";
 import { HerdrArtifacts, herdrResultContract } from "./herdr-artifacts.js";
 import { HerdrObserver, type NativeHerdrIdentity } from "./herdr-observer.js";
 import { nativeCodexAcceptedPrompt, readNativeCodexSession } from "./codex-native-state.js";
@@ -106,6 +107,11 @@ export class ControlledHerdrRuntime {
     let dispatched = false;
     let successfulExit = false;
     let sequence = 0;
+    let transcript: ControlledTranscript | undefined;
+    let stopWatching: (() => Promise<void>) | undefined;
+    let transcriptError: unknown;
+    const sessionId = () =>
+      this.journal.agents.instance(authority.runId, identity).provider?.sessionId ?? null;
     const observe = (kind: string, summary: string, sourceTruncated = false) => {
       const retained = this.journal.diagnostics.append(
         authority,
@@ -131,6 +137,11 @@ export class ControlledHerdrRuntime {
       const artifacts = new HerdrArtifacts(manifest.confinement.artifacts);
       const artifact = await artifacts.prepare(identity);
       const prompt = herdrResultContract(JSON.stringify(turn.prompt), turn.outputSchema, artifact);
+      transcript = new ControlledTranscript(this.journal, authority, identity, manifest, prompt);
+      stopWatching = transcript.watch(sessionId, check, (error) => {
+        transcriptError = error;
+        request.abort(error);
+      });
       const previous = await readNativeCodexSession(manifest, agent.provider?.sessionId ?? null);
       if (agent.provider?.sessionId && !previous)
         throw new Error("The recorded native conversation is missing");
@@ -346,6 +357,7 @@ export class ControlledHerdrRuntime {
         await delay(250, undefined, { signal: request.signal });
       }
     } catch (error) {
+      error = transcriptError ?? error;
       diagnostic = redactSensitiveText(
         error instanceof CommandError
           ? error.result.stderr || error.message
@@ -356,6 +368,7 @@ export class ControlledHerdrRuntime {
       );
       request.abort(error);
     } finally {
+      await stopWatching?.();
       signal?.removeEventListener("abort", abort);
     }
     const stop = !dispatched
@@ -372,6 +385,19 @@ export class ControlledHerdrRuntime {
     this.journal.assertAuthority(authority);
     const settled = this.journal.agents.turn(authority.runId, identity);
     if (settled.stopEvidence) return settled;
+    if (stop && dispatched && transcript) {
+      try {
+        await transcript.finish(sessionId(), () => this.journal.assertAuthority(authority));
+      } catch (error) {
+        this.journal.assertAuthority(authority);
+        const detail = redactSensitiveText(
+          error instanceof Error ? error.message : "Native transcript capture failed",
+          7999,
+        );
+        transcript.gap(detail);
+        diagnostic ??= detail;
+      }
+    }
     if (diagnostic) observe("runtime.problem", diagnostic);
     if (!stop)
       return this.journal.agents.markIndeterminate(
@@ -419,6 +445,25 @@ export class ControlledHerdrRuntime {
         identity,
         "Native supervisor stop is unknown; do not release its workspace",
       );
+    const manifest = turn.launch.manifest;
+    const artifact = new HerdrArtifacts(manifest.confinement.artifacts).locate(identity);
+    const transcript = new ControlledTranscript(
+      this.journal,
+      authority,
+      identity,
+      manifest,
+      herdrResultContract(JSON.stringify(turn.prompt), turn.outputSchema, artifact),
+    );
+    try {
+      const session =
+        this.journal.agents.instance(authority.runId, identity).provider?.sessionId ?? null;
+      await transcript.finish(session, () => this.journal.assertAuthority(authority));
+    } catch (error) {
+      this.journal.assertAuthority(authority);
+      transcript.gap(
+        error instanceof Error ? error.message : "Cold native transcript capture failed",
+      );
+    }
     this.journal.agents.recordLaunchStop(authority, identity, stop);
     this.journal.appendObservation(authority, {
       source: "controlled-herdr",
