@@ -72,7 +72,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 32;
+export const ORCHESTRATION_SCHEMA_VERSION = 33;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -359,6 +359,7 @@ export class OrchestrationJournal {
       observe: (authority, input) => this.appendObservation(authority, input),
       agents: this.agents,
       delivery: this.delivery,
+      diagnostics: this.diagnostics,
     });
     this.commits = new CommitJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),

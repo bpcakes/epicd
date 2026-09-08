@@ -312,6 +312,7 @@ describe.skipIf(process.platform !== "linux")("private commit and actual-SHA ver
     expect(
       await s.dispatch({
         kind: "run_review",
+        references: [],
         ...candidate,
         ...target(exact),
         agent: {

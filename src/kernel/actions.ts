@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   DispatchConflictError,
   MemoryReferenceError,
@@ -15,12 +15,13 @@ import {
   type ObservationInput,
   type OrchestratorDecision,
 } from "../domain/orchestration.js";
-import { redactDiagnosticText, redactSensitiveText } from "../util/redact.js";
+import { redactSensitiveText } from "../util/redact.js";
 import { assertCurrentDispatch, CapabilityRejected, OperationFailed } from "./guards.js";
 import { actionContextRecord } from "./action-context.js";
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import { DeliveryError } from "../adapters/delivery-journal.js";
 import { DiagnosticRequestError } from "../adapters/diagnostic-journal.js";
+import { actionRecordView } from "../adapters/journal-references.js";
 
 type ActionKind = KernelAction["kind"];
 export type ActionContext = {
@@ -52,8 +53,7 @@ export class ActionKernel {
       if (!target) throw new CapabilityRejected("unknown_action", "No such action in this run");
       // Read the retained request/result, not the lossy context preview. Redact
       // before paging so splitting a credential cannot evade the redactor.
-      const retained = redactDiagnosticText(JSON.stringify(target));
-      const digest = createHash("sha256").update(retained).digest("hex");
+      const { text: retained, digest } = actionRecordView(target);
       if (action.offset !== 0 && action.expectedDigest === null)
         throw new CapabilityRejected(
           "action_view_required",

@@ -44,6 +44,7 @@ async function request(s: Setup, kind: Kind): Promise<KernelAction> {
     s.response(s.report(candidate));
     return {
       kind,
+      references: [],
       ...candidate,
       ...target(copy),
       agent: null,

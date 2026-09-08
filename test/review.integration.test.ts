@@ -70,6 +70,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
       success(
         await s.dispatch({
           kind: "run_review",
+          references: [],
           ...candidate,
           ...target(reviewed.reviewCopy),
           agent: { agentId: agent.agentId, agentGeneration: agent.agentGeneration },
@@ -408,6 +409,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     s.response(s.report(candidate));
     const action = {
       kind: "run_review" as const,
+      references: [],
       ...candidate,
       ...target(copy),
       agent: null,
@@ -444,6 +446,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     s.response(s.report(candidate, { verdict: "changes_requested", findings: [finding] }));
     const input = s.decision({
       kind: "run_review",
+      references: [],
       ...candidate,
       ...target(copy),
       agent: null,
@@ -469,6 +472,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     s.response(s.report(candidate), [], agent.provider.sessionId);
     const action: KernelAction = {
       kind: "run_review",
+      references: [],
       ...candidate,
       ...target(first.reviewCopy),
       agent: { agentId: agent.agentId, agentGeneration: agent.agentGeneration },
@@ -588,6 +592,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     };
     const result = await s.dispatch({
       kind: "run_review",
+      references: [],
       ...candidate,
       ...target(copy),
       agent: null,
@@ -617,6 +622,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     const running = await s.kernel.execute(
       s.decision({
         kind: "run_review",
+        references: [],
         ...candidate,
         ...target(copy),
         agent: null,
@@ -645,6 +651,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     const running = await s.kernel.execute(
       s.decision({
         kind: "run_review",
+        references: [],
         ...candidate,
         ...target(copy),
         agent: null,

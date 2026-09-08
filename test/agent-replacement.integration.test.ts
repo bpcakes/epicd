@@ -172,6 +172,7 @@ describe.runIf(process.platform === "linux")("orchestrator-chosen agent replacem
       (
         await f.dispatch({
           kind: "run_review",
+          references: [],
           ...candidate,
           ...target(ws),
           agent: { agentId: replacement.resourceId, agentGeneration: replacement.generation },

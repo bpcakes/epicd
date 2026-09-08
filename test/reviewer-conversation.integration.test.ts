@@ -95,6 +95,7 @@ describe.runIf(process.platform === "linux")("diagnostic reviewer conversations"
         (
           await s.dispatch({
             kind: "run_review",
+            references: [],
             ...candidate,
             ...target(reviewed.reviewCopy),
             agent: identity(agent),

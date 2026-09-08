@@ -114,6 +114,7 @@ describe.runIf(process.platform === "linux")("isolated specialist workspaces", (
         },
         {
           kind: "run_review",
+          references: [],
           ...candidate,
           ...target(ws),
           agent: null,

@@ -103,6 +103,7 @@ export const ReviewEvidenceSchema = z
     failure: z.string().max(8000).nullable(),
     validationEvidenceIds: z.array(Id).max(100),
     findingIds: z.array(Id).max(100),
+    referenceDigest: z.string().regex(/^[a-f0-9]{64}$/),
     createdAt: z.iso.datetime(),
     finishedAt: z.iso.datetime().nullable(),
   })

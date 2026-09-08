@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { AgentRoleSchema, AgentRoleSettingsSchema } from "./types.js";
 import { RequiredCheckSchema } from "./repository-policy.js";
+import { ReviewReferencesSchema } from "./review-references.js";
 
 // These identities originate in durable controller records, never in agent output.
 const IdentityPartSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
@@ -237,6 +238,7 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
     ...WorkspaceTarget,
     agent: z.strictObject(AgentTarget).nullable(),
     instructions: z.string().min(1).max(8000),
+    references: ReviewReferencesSchema,
   }),
   z.strictObject({
     kind: z.literal("request_commit"),

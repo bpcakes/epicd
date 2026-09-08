@@ -326,6 +326,7 @@ export async function fixture(
     );
     const action: KernelAction = {
       kind: "run_review",
+      references: [],
       ...candidate,
       ...target(reviewCopy),
       agent: null,

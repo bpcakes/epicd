@@ -321,6 +321,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     },
     {
       kind: "run_review",
+      references: [],
       candidateId: "candidate",
       candidateGeneration: 1,
       workspaceId: "copy",
