@@ -3,10 +3,11 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../dist/adapters/store.js";
-import { createRun, resolveExecutable } from "../dist/bootstrap.js";
+import { createRun, resolveExecutable, selectedCodexExecutable } from "../dist/bootstrap.js";
 import { OrchestratorController, controlledDriver } from "../dist/controller.js";
 import { receiptProject, receiptFaultDriver, RECEIPT_FILES } from "./fixtures/receipt-incident.js";
 import { buildBrowserBundle, browserProject } from "./fixtures/browser-incident.js";
+import { probeBrowserWorker, requireBrowserWorker } from "./fixtures/browser-worker-preflight.js";
 import { startFixturePostgreSql } from "./fixtures/postgresql-fixture.js";
 import { FixtureDefinitionSchema } from "../dist/domain/repository-policy.js";
 import { ImplementationResultSchema } from "../dist/domain/types.js";
@@ -34,6 +35,8 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
     it(
       `delivers a real one-task Beads epic with Astra and independent exact-revision review (${scenario})`,
       async () => {
+        if (scenario === "browser")
+          requireBrowserWorker(await probeBrowserWorker(await selectedCodexExecutable(runtime)));
         if (runtime === "herdr") {
           expect(process.env.HERDR_ENV).toBe("1");
           expect(process.env.EPICD_EXPECT_HERDR_SESSION).toMatch(/^epicd-delivery-[a-f0-9]{8}$/);

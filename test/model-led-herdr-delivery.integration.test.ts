@@ -7,6 +7,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { runCommand, runJson } from "../src/util/command.js";
+import { selectedCodexExecutable } from "../dist/bootstrap.js";
+import { probeBrowserWorker, requireBrowserWorker } from "./fixtures/browser-worker-preflight.js";
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR_DELIVERY === "1")(
@@ -16,6 +18,8 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR_DELI
       "delivers through real native Herdr agents from an owned caller pane",
       async () => {
         expect(process.env.HERDR_ENV).toBe("1");
+        if (process.env.EPICD_LIVE_DELIVERY_SCENARIO === "browser")
+          requireBrowserWorker(await probeBrowserWorker(await selectedCodexExecutable("herdr")));
         const root = await mkdtemp("/var/tmp/epicd-native-delivery-");
         // Retain the logs, child report and native run even when this assertion fails.
         process.stderr.write(`Native delivery harness: ${root}\n`);

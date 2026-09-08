@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-epicd_browser_dir=$(mktemp -d /tmp/epicd-browser-check-XXXXXX)
+epicd_browser_dir=$(mktemp -d "${TMPDIR:-/tmp}/epicd-browser-check-XXXXXX")
 cat vendor/toolchain.part-* | tar -xz -C "$epicd_browser_dir"
 export EPICD_BROWSER_SOURCE_ROOT="$PWD"
 export EPICD_PLAYWRIGHT_ROOT="$epicd_browser_dir/node_modules"
