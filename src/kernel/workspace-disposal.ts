@@ -14,8 +14,31 @@ export function registerWorkspaceDisposalCapabilities(
   kernel.registerLocal("inspect_workspace", ({ authority }, action) => {
     const workspace = journal.agents.workspace(authority.runId, action);
     const disposals = journal.workspaceDisposals.forWorkspace(authority.runId, action);
+    const creation = journal.workspaceCreations.forWorkspace(authority.runId, action);
     const view = {
       workspace,
+      creation: creation
+        ? {
+            creationId: creation.creationId,
+            operationId: creation.creationOperationId,
+            outcome: creation.outcome,
+            workerResult: creation.workerResult,
+            stopConfirmed:
+              creation.stop !== null ||
+              (creation.execution === null && creation.outcome === "failed"),
+            workspaceOperationId: creation.workspaceOperationId,
+            sourceOperationId: creation.sourceOperationId,
+            source:
+              creation.source.kind === "repository"
+                ? { kind: "repository" }
+                : {
+                    kind: creation.source.kind,
+                    workspaceId: creation.source.workspaceId,
+                    workspaceGeneration: creation.source.workspaceGeneration,
+                  },
+            detail: creation.detail,
+          }
+        : null,
       disposals: disposals.slice(-20).map((record) => ({
         disposalId: record.disposalId,
         operationId: record.operationId,

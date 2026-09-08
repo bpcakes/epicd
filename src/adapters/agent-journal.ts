@@ -140,6 +140,7 @@ export function createAgentsSchema(db: Database.Database): void {
 }
 
 type Access = {
+  creationPermitsWorkspaceStop(runId: string, operationId: string): boolean | null;
   captureInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   validationInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   transaction<T>(authority: ControllerAuthority, body: () => T): T;
@@ -560,6 +561,12 @@ export class AgentJournal {
   ): WorkspaceOperation {
     return this.access.transaction(authority, () => {
       const operation = this.workspaceOperation(authority.runId, operationId);
+      const creationStop = this.access.creationPermitsWorkspaceStop(authority.runId, operationId);
+      if (creationStop === false)
+        throw new AgentCoordinationError(
+          "workspace_creation_unsettled",
+          "The complete creation worker has not stopped; preserve every copy exclusion",
+        );
       const independentlyStopped = operation.execution !== null && operation.executionStop !== null;
       const unlaunchedValidation =
         operation.kind === "validation" &&
@@ -577,6 +584,7 @@ export class AgentJournal {
       if (
         operation.controllerLeaseId !== authority.leaseId &&
         !independentlyStopped &&
+        creationStop !== true &&
         !unlaunchedValidation &&
         !unlaunchedCapture
       )
@@ -621,6 +629,7 @@ export class AgentJournal {
       const execution = CommandLifetimeSchema.parse(input);
       if (
         !["validation", "commit", "capture"].includes(operation.kind) ||
+        this.access.creationPermitsWorkspaceStop(authority.runId, operationId) !== null ||
         operation.controllerLeaseId !== authority.leaseId ||
         operation.stopEvidence ||
         operation.execution ||

@@ -129,7 +129,6 @@ export function registerDeliveryCapabilities(
         record.operationId,
         action.revision === null ? "review" : "verification",
       );
-      journal.delivery.bindReviewCopy(authority, record.actionId, workspace);
       return {
         kind: "resource",
         resourceId: workspace.workspaceId,

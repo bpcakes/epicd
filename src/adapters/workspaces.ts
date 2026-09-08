@@ -31,6 +31,9 @@ import type { CommitRecord } from "../domain/commits.js";
 import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
 import { runCommitIO } from "./commit-io.js";
 import type { CandidateIdentity } from "../domain/delivery.js";
+import type { WorkspaceCreationSource } from "../domain/workspace-creation.js";
+import { runWorkspaceCreationIO, reconcileWorkspaceCreationIO } from "./workspace-creation-io.js";
+import { redactSensitiveText } from "../util/redact.js";
 
 const FILE_LIMIT = 64 * 1024 * 1024;
 const CHECKOUT_LIMIT = 512 * 1024 * 1024;
@@ -91,29 +94,104 @@ export class WorkspaceManager {
     signal?: AbortSignal,
     creationOperationId?: string,
   ): Promise<WorkspaceRecord> {
-    this.journal.assertAuthority(authority);
-    await mkdir(this.root, { recursive: true, mode: 0o700 });
-    const canonicalRoot = await realpath(this.root);
-    const source = new KernelGit(await realpath(sourcePath));
-    const format = await this.preflight(source, revision, signal);
-    const control = this.journal.control(authority.runId);
-    const workspace = this.journal.agents.reserveWorkspace(
+    return this.createFromSource(
       authority,
-      {
-        root: canonicalRoot,
-        purpose,
-        sourceMode: ["coordinator", "review", "verification", "delivery"].includes(purpose)
-          ? "immutable"
-          : "mutable",
-        baselineRevision: revision,
-        ...(creationOperationId ? { creationOperationId } : {}),
-      },
-      control.controlVersion,
+      revision,
+      purpose,
+      { kind: "repository", path: sourcePath },
+      signal,
+      creationOperationId,
     );
-    await this.exclusive(authority, workspace, "materialize", () =>
-      this.materialize(authority, workspace, source, format, signal),
-    );
-    return this.journal.agents.workspace(authority.runId, workspace);
+  }
+
+  private async createFromSource(
+    authority: ControllerAuthority,
+    revision: string,
+    purpose: WorkspaceRecord["purpose"],
+    source: WorkspaceCreationSource,
+    signal?: AbortSignal,
+    creationOperationId?: string,
+  ): Promise<WorkspaceRecord> {
+    const intent = this.journal.workspaceCreations.reserve(authority, {
+      root: this.root,
+      revision,
+      purpose,
+      source,
+      creationOperationId: creationOperationId ?? null,
+    });
+    const outcome = await runWorkspaceCreationIO(this.journal, authority, intent, signal);
+    if (outcome.outcome !== "created")
+      throw new WorkspaceError(
+        outcome.workerResult?.status === "failed"
+          ? outcome.workerResult.code
+          : "workspace_creation_failed",
+        outcome.detail ?? "Workspace creation did not retain completion",
+      );
+    return this.journal.agents.workspace(authority.runId, intent);
+  }
+
+  /** Trusted worker entrypoint: one namespace covers source reads, all destination writes and binding. */
+  async executeWorkspaceCreation(authority: ControllerAuthority, creationId: string) {
+    const record = this.journal.workspaceCreations.assertWritable(authority, creationId);
+    if (!record.execution)
+      throw new WorkspaceError("creation_execution_missing", "Creation has no bound worker");
+    try {
+      await mkdir(this.root, { recursive: true, mode: 0o700 });
+      if ((await realpath(this.root)) !== record.workspaceRoot)
+        throw new WorkspaceError(
+          "workspace_path_changed",
+          "Managed workspace root is not canonical",
+        );
+      const source = new KernelGit(
+        record.source.kind === "repository"
+          ? await realpath(record.source.path)
+          : (await this.owned(authority, record.source)).path,
+      );
+      if (record.source.kind !== "repository") await this.assertPrivateGit(source);
+      if (
+        record.source.kind === "commit" &&
+        (await source.text(["cat-file", "commit", record.revision])) !== record.source.objectContent
+      )
+        throw new WorkspaceError(
+          "commit_object_conflict",
+          "Implementation base differs from its retained commit intent",
+        );
+      const format = await this.preflight(source, record.revision);
+      const fingerprint = await this.materialize(
+        authority,
+        this.journal.agents.workspace(authority.runId, record),
+        source,
+        format,
+      );
+      const workspace = this.journal.agents.workspace(authority.runId, record);
+      if (record.source.kind === "snapshot") {
+        const tree = (
+          await new KernelGit(workspace.path).text(["rev-parse", "HEAD^{tree}"])
+        ).trim();
+        if (tree !== record.source.fullTree || fingerprint !== record.source.fingerprint)
+          throw new WorkspaceError(
+            "candidate_copy_mismatch",
+            "Workspace copy does not match the captured candidate",
+          );
+      }
+      this.journal.workspaceCreations.complete(authority, creationId, fingerprint);
+    } catch (error) {
+      this.journal.workspaceCreations.recordWorkerResult(authority, creationId, {
+        status: "failed",
+        code: error instanceof WorkspaceError ? error.code : "workspace_creation_failed",
+        detail: redactSensitiveText(
+          error instanceof Error ? error.message : "Workspace creation failed",
+          3999,
+        ),
+      });
+      throw error;
+    }
+  }
+
+  /** The caller must already have excluded a live in-memory creation action. No I/O is repeated. */
+  async reconcileCreation(authority: ControllerAuthority, identity: WorkspaceIdentity) {
+    const record = this.journal.workspaceCreations.forWorkspace(authority.runId, identity);
+    return record ? reconcileWorkspaceCreationIO(this.journal, authority, record.creationId) : null;
   }
 
   /** An interrupted reservation remains preserved. Only a complete, matching copy may be adopted. */
@@ -289,25 +367,20 @@ export class WorkspaceManager {
     const snapshot = WorkspaceSnapshotSchema.parse(snapshotInput);
     if (snapshot.runId !== authority.runId)
       throw new WorkspaceError("wrong_run", "Candidate belongs to another run");
-    return this.exclusive(authority, snapshot, "copy_source", async () => {
-      const source = await this.owned(authority, snapshot);
-      const copy = await this.create(
-        authority,
-        source.path,
-        snapshot.snapshotRevision,
-        purpose,
-        signal,
-        creationOperationId,
-      );
-      const git = new KernelGit(copy.path);
-      const tree = (await git.text(["rev-parse", "HEAD^{tree}"], optionalSignal(signal))).trim();
-      if (tree !== snapshot.fullTree || copy.baselineFingerprint !== snapshot.fingerprint)
-        throw new WorkspaceError(
-          "candidate_copy_mismatch",
-          "Workspace copy does not match the captured candidate",
-        );
-      return copy;
-    });
+    return this.createFromSource(
+      authority,
+      snapshot.snapshotRevision,
+      purpose,
+      {
+        kind: "snapshot",
+        workspaceId: snapshot.workspaceId,
+        workspaceGeneration: snapshot.workspaceGeneration,
+        fullTree: snapshot.fullTree,
+        fingerprint: snapshot.fingerprint,
+      },
+      signal,
+      creationOperationId,
+    );
   }
 
   /** New writable files at the retained private tip; never reset or amend an older assignment. */
@@ -318,28 +391,24 @@ export class WorkspaceManager {
     signal?: AbortSignal,
     sourceIdentity: WorkspaceIdentity = commit,
   ) {
-    return this.exclusive(authority, sourceIdentity, "copy_source", async () => {
-      const source = await this.owned(authority, sourceIdentity);
-      const git = new KernelGit(source.path);
-      await this.assertPrivateGit(git, signal);
-      if (
-        !commit.revision ||
-        (await git.text(["cat-file", "commit", commit.revision], optionalSignal(signal))) !==
-          commit.objectContent
-      )
-        throw new WorkspaceError(
-          "commit_object_conflict",
-          "Implementation base differs from its retained commit intent",
-        );
-      return this.create(
-        authority,
-        source.path,
-        commit.revision,
-        "implementation",
-        signal,
-        creationOperationId,
+    if (!commit.revision || !commit.objectContent)
+      throw new WorkspaceError(
+        "commit_object_conflict",
+        "Implementation base has no retained revision",
       );
-    });
+    return this.createFromSource(
+      authority,
+      commit.revision,
+      "implementation",
+      {
+        kind: "commit",
+        workspaceId: sourceIdentity.workspaceId,
+        workspaceGeneration: sourceIdentity.workspaceGeneration,
+        objectContent: commit.objectContent,
+      },
+      signal,
+      creationOperationId,
+    );
   }
 
   /** Publication owns an existing exclusion; never create a nested operation or trust a model path. */
@@ -1022,7 +1091,7 @@ export class WorkspaceManager {
     source: KernelGit,
     format: ObjectFormat,
     signal?: AbortSignal,
-  ): Promise<void> {
+  ): Promise<string> {
     await mkdir(dirname(workspace.path), { recursive: true, mode: 0o700 });
     if ((await realpath(dirname(workspace.path))) !== dirname(workspace.path))
       throw new WorkspaceError(
@@ -1102,7 +1171,7 @@ export class WorkspaceManager {
     if (digestJson(actual) !== digestJson(manifest))
       throw new WorkspaceError("workspace_changed", "Materialized files changed before readiness");
     this.journal.assertAuthority(authority);
-    this.journal.agents.markWorkspaceReady(authority, workspace, digestJson(manifest));
+    return digestJson(manifest);
   }
 
   private async preflight(

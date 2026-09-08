@@ -76,8 +76,12 @@ import {
   REPOSITORY_ADMISSION_TABLES,
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
+import {
+  WorkspaceCreationJournal,
+  createWorkspaceCreationSchema,
+} from "./workspace-creation-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 40;
+export const ORCHESTRATION_SCHEMA_VERSION = 41;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -89,6 +93,7 @@ export const ORCHESTRATION_TABLES = [
   ...DECISION_SOURCE_TABLES,
   ...AGENT_TABLES,
   "workspace_disposals",
+  "workspace_creations",
   ...DELIVERY_TABLES,
   ...REVIEW_TABLES,
   ...COMMIT_TABLES,
@@ -160,6 +165,7 @@ export function createOrchestrationSchema(db: Database.Database): void {
   `);
   createAgentsSchema(db);
   createWorkspaceDisposalSchema(db);
+  createWorkspaceCreationSchema(db);
   createDeliverySchema(db);
   createReviewsSchema(db);
   createCommitsSchema(db);
@@ -224,6 +230,7 @@ export class MemoryReferenceError extends Error {
 export class OrchestrationJournal {
   readonly agents: AgentJournal;
   readonly workspaceDisposals: WorkspaceDisposalJournal;
+  readonly workspaceCreations: WorkspaceCreationJournal;
   readonly delivery: DeliveryJournal;
   readonly reviews: ReviewJournal;
   readonly commits: CommitJournal;
@@ -300,6 +307,8 @@ export class OrchestrationJournal {
       turn: (runId, identity) => this.agents.turn(runId, identity),
     });
     this.agents = new AgentJournal(db, {
+      creationPermitsWorkspaceStop: (runId, operationId) =>
+        this.workspaceCreations.permitsMemberStop(runId, operationId),
       captureInterruptedBeforeLaunch: (runId, operationId) => {
         const candidate = this.delivery.candidateForWorkspaceOperation(runId, operationId);
         return (
@@ -486,6 +495,9 @@ export class OrchestrationJournal {
       this.transaction(authority, body),
     );
     this.workspaceDisposals = new WorkspaceDisposalJournal(db, this, (authority, body) =>
+      this.transaction(authority, body),
+    );
+    this.workspaceCreations = new WorkspaceCreationJournal(db, this, (authority, body) =>
       this.transaction(authority, body),
     );
   }

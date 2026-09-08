@@ -466,6 +466,11 @@ export class OrchestratorController {
     const operation = `coordinator-${digestJson([this.runId, prior.length, contract]).slice(0, 40)}`;
     let workspace = journal.agents.workspaceForOperation(this.runId, operation);
     if (workspace) {
+      const creation = await workspaces.reconcileCreation(authority, workspace);
+      if (creation?.outcome === "failed")
+        throw new Error(
+          creation.detail ?? "Coordinator workspace creation failed; preserved for inspection",
+        );
       if ((await workspaces.inspectMaterialization(authority, workspace, signal)) !== "ready")
         throw new Error(
           "The reserved coordinator workspace is incomplete; it was preserved for inspection",

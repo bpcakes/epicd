@@ -77,6 +77,19 @@ export async function reconcileDiagnosticWorkspace(
     detail: `Diagnostic copy for ${record.actionId} is not proven intact and stopped. Preserve the recorded resources; no copy was recreated.`,
   });
   const workspace = journal.agents.workspaceForOperation(authority.runId, record.operationId);
+  if (workspace) {
+    try {
+      const creation = await workspaces.reconcileCreation(authority, workspace);
+      if (creation?.outcome === "failed")
+        return {
+          status: "failed",
+          detail: creation.detail ?? "Diagnostic creation failed without replay",
+        };
+    } catch {
+      journal.assertAuthority(authority);
+      return unresolved();
+    }
+  }
   if (
     !workspace ||
     workspace.activeTurnId ||

@@ -491,10 +491,17 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     const s = await fixture(),
       run = s.authority.runId;
     const action = await request(s, "create_review_workspace");
-    vi.spyOn(s.journal.delivery, "bindReviewCopy").mockImplementation(() => {
-      throw new Error("Binding not persisted");
-    });
-    const lost = await s.dispatch(action);
+    // Binding is now retained by the real creation worker, not the parent process.
+    const db = new Database(s.path);
+    let lost;
+    try {
+      db.exec(
+        "CREATE TRIGGER deny_review_binding BEFORE INSERT ON candidate_workspaces BEGIN SELECT RAISE(ABORT, 'Binding not persisted'); END",
+      );
+      lost = await s.dispatch(action);
+    } finally {
+      db.close();
+    }
     expect(lost.status).toBe("indeterminate");
     const parent = s.journal.action(run, lost.actionId)!;
     const copy = s.journal.agents.workspaceForOperation(run, parent.operationId)!;
@@ -504,6 +511,11 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
         .status,
     ).toBe("failed");
     expect(recovered.journal.delivery.reviewCopyForOperation(run, parent.operationId)).toBeNull();
+    expect(recovered.journal.agents.workspace(run, copy)).toMatchObject({
+      status: "reserved",
+      directory: null,
+      baselineFingerprint: null,
+    });
     expect(readFileSync(join(copy.path, "app.txt"), "utf8")).toBe("green\n");
   });
 

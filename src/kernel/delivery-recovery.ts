@@ -217,6 +217,11 @@ export async function reconcileDeliveryAction(
       action.kind === "create_implementation_workspace"
     ) {
       const workspace = journal.agents.workspaceForOperation(run, record.operationId);
+      if (workspace) {
+        const creation = await workspaces.reconcileCreation(authority, workspace);
+        if (creation?.outcome === "failed")
+          return failed(creation.detail ?? "Workspace creation failed without replay");
+      }
       if (
         !workspace ||
         workspace.activeTurnId ||

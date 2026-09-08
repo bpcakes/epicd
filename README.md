@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 40. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 41. Use a fresh state path; unsupported existing data is left intact.
 
 Persisted ownership fields must be explicit: missing workspace creation bindings, turn launches, native endpoint bindings or decision-attempt turn identities are invalid, not implicitly `null`. Reading incomplete records does not repair them or release their resources.
 
@@ -71,7 +71,9 @@ An unused tracker Git dispatch gate is not a substitute for a bound host worker'
 
 Candidate capture also has a complete supervised worker: its workspace exclusion and candidate intent are reserved in one transaction before preflight, scanning, object/tree/ref writes and snapshot retention. The worker durably retains the snapshot without making it available for review. Live or cold reconciliation promotes those exact bytes only after the original independent stop receipt; it never rescans the source or reconstructs a manifest from a surviving ref. Missing stop proof retains exclusion. Proven stop without a retained snapshot fails the capture and preserves any private objects. An unbound intent can be cancelled atomically, forbidding later binding or launch. Concurrent source edits are never restored by capture recovery, and a recovered snapshot is not review approval.
 
-These boundaries share the workspace execution mechanism across SDK and native Herdr runtimes. The candidate intent requires fresh format-40 state, with no migration or legacy defaults. Workspace materialization and later read-only commit inspection remain outside whole-operation supervision. An unbound application-writer reservation or an interrupted inspection can still require unresolved-I/O intervention. No receipt or absent PID is substituted for those operations' own stop proof.
+Workspace creation has one supervised lifetime covering source preflight, copying, readiness checks and the review binding. A creation record atomically reserves the destination and, for a managed source, its copy-source exclusion. The same independently observed worker stop settles both; a ready directory, retained review binding or finished nested Git command cannot release either lock alone. Baseline, candidate, diagnostic, retained-commit, coordinator and canonical-delivery copies use this path. Readiness, review binding and successful completion are retained in one transaction. If it fails, files stay preserved but no ready workspace or binding is exposed. A caller crash can recover the original completion without copying again. A never-bound creation can be cancelled atomically; delayed binding is forbidden. `inspect_workspace` exposes creation outcome and stop status without exposing its private launch control files.
+
+These boundaries share the command-lifetime mechanism across SDK and native Herdr runtimes. Fresh format-41 state is required, with no migration or legacy defaults. Later materialization/commit inspection and the overall publication adapter still have separate unresolved controller-I/O gaps; supervising canonical-copy creation does not prove publication stopped. An unbound application-writer reservation or an interrupted inspection can still require unresolved-I/O intervention. No receipt or absent PID is substituted for those operations' own stop proof.
 
 ### Recoverable workspace disposal
 
