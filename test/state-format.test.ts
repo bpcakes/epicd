@@ -139,7 +139,7 @@ describe("hard-cut state format", () => {
     expect(reopened.get(run.runId)).toEqual(run);
     expect(reopened.orchestration.policy(run.runId).coordinator.model).toBe("gpt-6-astra");
     expect(db.prepare("SELECT * FROM runs").all()).toEqual(before);
-    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 37 }]);
+    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 38 }]);
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE name = 'diagnostic_artifacts'").get(),
     ).toBeDefined();
@@ -161,7 +161,8 @@ describe("hard-cut state format", () => {
     { label: "previous format without typed primary record references", versions: [34] },
     { label: "previous format without independent fixture-command stop receipts", versions: [35] },
     { label: "previous format without complete validation-worker proof", versions: [36] },
-    { label: "newer format", versions: [38] },
+    { label: "previous format without recoverable workspace disposal", versions: [37] },
+    { label: "newer format", versions: [39] },
     { label: "previous format without evidence-preserving retirement", versions: [25] },
     { label: "multiple format markers", versions: [26, 27] },
   ])("refuses $label without migration, backups or deletion", ({ versions }) => {

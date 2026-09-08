@@ -463,7 +463,12 @@ describe("managed independent Git workspaces", () => {
       database
         .prepare("UPDATE workspaces SET record_json = ? WHERE workspace_id = ?")
         .run(
-          JSON.stringify({ ...work, status: "reserved", baselineFingerprint: null }),
+          JSON.stringify({
+            ...work,
+            status: "reserved",
+            directory: null,
+            baselineFingerprint: null,
+          }),
           work.workspaceId,
         );
       mkdirSync(join(work.path, "ignored"));

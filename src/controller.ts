@@ -16,6 +16,7 @@ import { PublicationGit } from "./adapters/publication-git.js";
 import { ActionKernel } from "./kernel/actions.js";
 import { registerAgentCapabilities, type ControlledAgentDriver } from "./kernel/agents.js";
 import { registerDeliveryCapabilities } from "./kernel/delivery.js";
+import { registerWorkspaceDisposalCapabilities } from "./kernel/workspace-disposal.js";
 import {
   registerInspectionCapabilities,
   reconcileRepositoryInspection,
@@ -136,6 +137,7 @@ export class OrchestratorController {
       const contractFor = (role: AgentRole) => agentContract(this.store.get(this.runId)!, role);
       registerAgentCapabilities(kernel, driver, contractFor);
       registerDeliveryCapabilities(kernel, workspaces);
+      registerWorkspaceDisposalCapabilities(kernel, workspaces);
       registerInspectionCapabilities(kernel, workspaces);
       registerReviewCapabilities(kernel, workspaces, driver, () => contractFor("review"));
       registerCommitCapabilities(kernel, workspaces);

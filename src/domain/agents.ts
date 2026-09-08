@@ -3,6 +3,7 @@ import { TurnIdentitySchema } from "./orchestration.js";
 import { AgentRoleSchema, AgentSessionContractSchema } from "./types.js";
 import { TurnLaunchSchema } from "./codex-launch.js";
 import { TaskClaimBindingSchema, EpicRepairBindingSchema } from "./tracker.js";
+import { StateFileIdentitySchema } from "./state-file-identity.js";
 
 const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
 const Generation = z.number().int().positive();
@@ -20,6 +21,7 @@ export const WorkspaceRecordSchema = WorkspaceIdentitySchema.extend({
   schemaVersion: z.literal(1),
   runId: Id,
   path: z.string().min(1).max(4096),
+  directory: StateFileIdentitySchema.nullable(),
   purpose: z.enum([
     "delivery",
     "implementation",
@@ -32,11 +34,16 @@ export const WorkspaceRecordSchema = WorkspaceIdentitySchema.extend({
   baselineRevision: z.string().min(1).max(256),
   baselineFingerprint: z.string().min(1).max(256).nullable(),
   creationOperationId: Id.nullable(),
-  status: z.enum(["reserved", "ready", "quarantined", "disposed"]),
+  status: z.enum(["reserved", "ready", "quarantined", "retired", "disposed"]),
   activeTurnId: Id.nullable(),
   createdAt: At,
   updatedAt: At,
-});
+}).refine(
+  (record) =>
+    (record.status === "reserved") === (record.directory === null) &&
+    (record.directory === null || record.directory.path === record.path),
+  "Materialized workspace identity must be explicit and match its registration path",
+);
 export type WorkspaceRecord = z.infer<typeof WorkspaceRecordSchema>;
 
 export const AgentAssignmentSchema = z

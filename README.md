@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 37. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 38. Use a fresh state path; unsupported existing data is left intact.
 
 Persisted ownership fields must be explicit: missing workspace creation bindings, turn launches, native endpoint bindings or decision-attempt turn identities are invalid, not implicitly `null`. Reading incomplete records does not repair them or release their resources.
 
@@ -64,6 +64,14 @@ A retained result can settle its historical acknowledgement; current review and 
 An interrupted `interrupt_action` acknowledgment can be settled as failed by `reconcile_action` or current-format restart recovery. The signal may already have been sent. Recovery never sends it again, changes the target's result, or clears its resource exclusions; the original target still needs its own outcome and stop evidence.
 
 This works through the shared kernel for both SDK and native Herdr runtimes. It is current-format restart recovery, not migration support. Abandoned controller I/O for these delivery actions and retained-resource cleanup remain unfinished; repository ownership has the separate recovery boundary below.
+
+### Recoverable workspace disposal
+
+`dispose_workspace` retires a stopped independent review, verification or diagnostic copy and moves its complete directory into run-private `.disposed` storage. Already-retired coordinator copies can also be disposed. Implementation and delivery repositories remain protected object sources. Every exact turn and launch must have confirmed stop, workspace I/O must be settled, and pending instructions must be resolved first. A native `not_started` receipt does not prove that its host shell stopped, so that case is refused. No Herdr pane, tab or session is closed.
+
+The original workspace identity can never be reused. All contents—including ignored files, receipts and symlinks—remain recoverable; this is not permanent disk reclamation. `inspect_workspace` reports the retained location and disposal outcome. `inspect_repo` resolves the original retained copy by identity and keeps its usual redaction and read-only limits. Historical approval survives healthy retirement; later evidence revocation cannot reactivate a retired workspace. Retention is not new validation evidence.
+
+The fixed operation requires GNU `mv` with `--no-copy` support (tested with coreutils 9.4). It uses pinned parent descriptors, no-clobber rename and no copy/delete fallback. [GNU implementation](https://raw.githubusercontent.com/coreutils/coreutils/v9.4/src/copy.c) A whole-operation supervisor supplies one-use dispatch and independent stop receipts. `reconcile_action` and cold bootstrap inspect the original stopped move without repeating it. Replaced directories, occupied destinations and unproven stop preserve their records and files. Any new occupant at the original name is not adopted or removed. Empty private directories allocated before rejected admission may remain; permanent retention cleanup and native endpoint cleanup are still separate unfinished work.
 
 ### Repository ownership after a controller crash
 
@@ -170,7 +178,7 @@ Every `run_review` request includes `references` (use `[]` when none are needed)
 
 `inspect_record({ recordKind, recordId, offset, limit, expectedDigest })` reads the same retained record view directly, without rerunning an inspection or nesting its output inside another action envelope. Record kinds are `validation`, `review`, `agent_turn`, `commit`, `publication`, `tracker_operation`, `fixture_creation`, `fixture_access`, `fixture_grant` and `fixture_sql_grant`. Start at offset zero with `expectedDigest: null`; continue with the returned digest and `nextOffset`. Changed views require restarting at zero. Reads can diagnose unfinished records, but review references require settled ones. Content is redacted before paging; private control leases/nonces and worker prompts/launch manifests are excluded, and coordinator turns are unavailable. This is retained history, not a new SQL observation, current grant, passing-check claim or approval calculation.
 
-Whole-epic `closedTasks` context supplies `historicalRecords` pointing to each actual closure's commit, publication, independent candidate/exact reviews and their validation records. The orchestrator chooses which records to inspect or attach. This index does not replace the records or establish final-revision approval, and preexisting closed tasks do not acquire invented run-owned proof. Storage is hard-cut to format 37 without migration; the SDK and native Herdr runtimes share the same kernel-resolved context.
+Whole-epic `closedTasks` context supplies `historicalRecords` pointing to each actual closure's commit, publication, independent candidate/exact reviews and their validation records. The orchestrator chooses which records to inspect or attach. This index does not replace the records or establish final-revision approval, and preexisting closed tasks do not acquire invented run-owned proof. Storage is hard-cut to format 38 without migration; the SDK and native Herdr runtimes share the same kernel-resolved context.
 
 Validation preflight, the confined check, service handling and postinspection run in one independently supervised kernel worker. Its one-use launch and exact stop receipt are journal-bound. A replacement controller can reconcile that original execution without replay; a stopped worker with no retained check outcome becomes `interrupted`, never a synthetic pass or command result. Approval still requires the actual result, exact source/environment evidence and successful complete-worker stop. The required check keeps its exact timeout; the enclosing worker has a bounded additional two minutes for admission and postinspection. Local stop never substitutes for current fixture authority or remote PostgreSQL quiescence.
 

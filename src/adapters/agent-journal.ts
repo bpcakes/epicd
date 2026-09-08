@@ -285,6 +285,7 @@ export class AgentJournal {
         workspaceId,
         workspaceGeneration: 1,
         path: join(resolve(input.root), authority.runId, workspaceId),
+        directory: null,
         purpose: input.purpose,
         sourceMode: input.sourceMode,
         baselineRevision: input.baselineRevision,
@@ -323,6 +324,12 @@ export class AgentJournal {
           "Workspace is not a reserved canonical directory",
         );
       workspace.status = "ready";
+      const directory = lstatSync(workspace.path, { bigint: true });
+      workspace.directory = {
+        path: workspace.path,
+        device: directory.dev.toString(),
+        inode: directory.ino.toString(),
+      };
       workspace.baselineFingerprint = z.string().min(1).max(256).parse(fingerprint);
       this.saveWorkspace(workspace);
       this.changed(authority, "workspace.ready", workspace.workspaceId);
@@ -355,6 +362,90 @@ export class AgentJournal {
       "SELECT record_json FROM workspaces WHERE run_id = ? ORDER BY workspace_id",
       [runId],
     );
+  }
+
+  /** Retire a disposable copy atomically with its cleanup intent, without revoking historical evidence. */
+  retireWorkspace(authority: ControllerAuthority, identity: WorkspaceIdentity): WorkspaceRecord {
+    return this.access.transaction(authority, () => {
+      this.active(authority);
+      this.access.assertTrackerCommitIdle(authority.runId);
+      if (this.access.publicationPending(authority.runId))
+        throw new AgentCoordinationError(
+          "publication_unsettled",
+          "Settle publication before workspace disposal",
+        );
+      const workspace = this.workspace(authority.runId, identity);
+      if (["delivery", "implementation"].includes(workspace.purpose))
+        throw new AgentCoordinationError(
+          "workspace_dependency",
+          "Delivery and implementation object sources must remain available; dispose only independent copies",
+        );
+      if (!["ready", "quarantined", "retired"].includes(workspace.status) || !workspace.directory)
+        throw new AgentCoordinationError(
+          "workspace_unavailable",
+          "Disposal requires a registered materialized copy",
+        );
+      if (workspace.activeTurnId || this.activeWorkspaceOperation(authority.runId, identity))
+        throw new AgentCoordinationError(
+          "workspace_busy",
+          "Reconcile every workspace writer before disposal",
+        );
+      const agents = this.instances(authority.runId).filter(
+        (agent) =>
+          agent.workspaceId === workspace.workspaceId &&
+          agent.workspaceGeneration === workspace.workspaceGeneration,
+      );
+      if (
+        workspace.purpose === "coordinator" &&
+        agents.some((agent) => agent.status !== "released")
+      )
+        throw new AgentCoordinationError(
+          "coordinator_owned",
+          "Only already-retired coordinator copies may be disposed",
+        );
+      for (const turn of this.turns(authority.runId)) {
+        if (
+          turn.identity.workspaceId !== workspace.workspaceId ||
+          turn.identity.workspaceGeneration !== workspace.workspaceGeneration
+        )
+          continue;
+        if (!turn.stopEvidence || (turn.launch !== null && turn.launch.stop === null))
+          throw new AgentCoordinationError(
+            "workspace_busy",
+            "Every exact turn and launch needs confirmed stop before disposal",
+          );
+        if (turn.launch?.native && turn.launch.stop?.kind === "not_started")
+          throw new AgentCoordinationError(
+            "native_shell_unsettled",
+            "A native launch that never started may leave its host shell alive; preserve the workspace and resolve terminal ownership separately",
+          );
+      }
+      for (const agent of agents)
+        this.retireStoppedAgent(
+          authority,
+          agent,
+          "Workspace disposal; provider and evidence records retained",
+        );
+      workspace.status = "retired";
+      this.saveWorkspace(workspace);
+      this.changed(authority, "workspace.retired", workspace.workspaceId);
+      return workspace;
+    });
+  }
+
+  /** Called only with a journaled disposal outcome; the historical registration path is immutable. */
+  finishWorkspaceDisposal(authority: ControllerAuthority, identity: WorkspaceIdentity): void {
+    this.access.transaction(authority, () => {
+      const workspace = this.workspace(authority.runId, identity);
+      if (workspace.status !== "retired" && workspace.status !== "disposed")
+        throw new AgentCoordinationError(
+          "workspace_not_retired",
+          "Retire workspace authority before settling disposal",
+        );
+      workspace.status = "disposed";
+      this.saveWorkspace(workspace);
+      this.changed(authority, "workspace.disposed", workspace.workspaceId);
+    });
   }
 
   /** Synchronous admission shares the same transaction as agent turn admission. */
@@ -1607,7 +1698,8 @@ export class AgentJournal {
       agent.revokedReason = safeText(reason, 4000);
       this.saveAgent(agent);
       const workspace = this.workspace(authority.runId, agent);
-      workspace.status = "quarantined";
+      // Evidence revocation cannot restore a retired directory to an active namespace.
+      if (!["retired", "disposed"].includes(workspace.status)) workspace.status = "quarantined";
       this.saveWorkspace(workspace);
       for (const turn of this.turns(authority.runId)) {
         if (

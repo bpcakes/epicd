@@ -9,6 +9,7 @@ import { reconcileCommit } from "./commits.js";
 import { reconcileReview } from "./reviews.js";
 import { CapabilityRejected } from "./guards.js";
 import { reconcileValidationIO } from "../adapters/validation-io.js";
+import { reconcileWorkspaceDisposal } from "../adapters/workspace-disposal-io.js";
 import { settleRecoveryObservation, type RecoveryObservation } from "./reconcile.js";
 
 const supported = new Set<ActionRecord["request"]["action"]["kind"]>([
@@ -22,6 +23,7 @@ const supported = new Set<ActionRecord["request"]["action"]["kind"]>([
   "reconcile_action",
   "reconcile_fixture_access",
   "interrupt_action",
+  "dispose_workspace",
 ]);
 const failed = (detail: string): RecoveryObservation => ({ status: "failed", detail });
 const unresolved = (detail: string): RecoveryObservation => ({ status: "unresolved", detail });
@@ -114,6 +116,15 @@ export async function reconcileDeliveryAction(
     signal?.throwIfAborted();
     const run = authority.runId,
       action = record.request.action;
+    if (action.kind === "dispose_workspace") {
+      const disposal = journal.workspaceDisposals.forOperation(run, record.operationId);
+      if (!disposal)
+        return failed("No disposal intent was admitted; no workspace move was replayed");
+      const outcome = await reconcileWorkspaceDisposal(journal, authority, disposal.disposalId);
+      return outcome.outcome === "retained"
+        ? resource(outcome.workspaceId, outcome.workspaceGeneration)
+        : failed(outcome.detail ?? "Workspace disposal did not establish retained files");
+    }
     if (action.kind === "interrupt_action")
       return failed(
         "Interrupted cancellation request lost its acknowledgement. It may already have signalled its target. No signal was replayed, no target result was changed, and no process stop or released resource exclusion was inferred. Inspect the original target and reconcile its resources separately.",

@@ -32,6 +32,10 @@ import {
 import { redactSensitiveText } from "../util/redact.js";
 import { AgentJournal, AGENT_TABLES, createAgentsSchema } from "./agent-journal.js";
 import {
+  WorkspaceDisposalJournal,
+  createWorkspaceDisposalSchema,
+} from "./workspace-disposal-journal.js";
+import {
   DecisionJournal,
   DECISION_SOURCE_TABLES,
   createDecisionSourceSchema,
@@ -73,7 +77,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 37;
+export const ORCHESTRATION_SCHEMA_VERSION = 38;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -84,6 +88,7 @@ export const ORCHESTRATION_TABLES = [
   "escalations",
   ...DECISION_SOURCE_TABLES,
   ...AGENT_TABLES,
+  "workspace_disposals",
   ...DELIVERY_TABLES,
   ...REVIEW_TABLES,
   ...COMMIT_TABLES,
@@ -154,6 +159,7 @@ export function createOrchestrationSchema(db: Database.Database): void {
     ) STRICT;
   `);
   createAgentsSchema(db);
+  createWorkspaceDisposalSchema(db);
   createDeliverySchema(db);
   createReviewsSchema(db);
   createCommitsSchema(db);
@@ -217,6 +223,7 @@ export class MemoryReferenceError extends Error {
 
 export class OrchestrationJournal {
   readonly agents: AgentJournal;
+  readonly workspaceDisposals: WorkspaceDisposalJournal;
   readonly delivery: DeliveryJournal;
   readonly reviews: ReviewJournal;
   readonly commits: CommitJournal;
@@ -470,6 +477,9 @@ export class OrchestrationJournal {
     this.repositoryAdmission = new RepositoryAdmissionJournal(db, this, (authority, body) =>
       this.transaction(authority, body),
     );
+    this.workspaceDisposals = new WorkspaceDisposalJournal(db, this, (authority, body) =>
+      this.transaction(authority, body),
+    );
   }
 
   hasRun(runId: string): boolean {
@@ -532,6 +542,8 @@ export class OrchestrationJournal {
     const workspaces = this.db
       .prepare("SELECT workspace_id FROM workspaces WHERE run_id = ? ORDER BY workspace_id")
       .all(runId) as { workspace_id: string }[];
+    if (this.workspaceDisposals.records(runId).some((record) => record.outcome === null))
+      unfinished("Workspace disposal needs confirmed stop and physical reconciliation");
     if (
       this.db
         .prepare(
@@ -561,6 +573,9 @@ export class OrchestrationJournal {
     return {
       disposition: "retained_for_inspection",
       workspaceIds: workspaces.map((workspace) => workspace.workspace_id),
+      workspaceDisposalIds: this.workspaceDisposals
+        .records(runId)
+        .map((record) => record.disposalId),
       workspaceOperationIds: (
         this.db
           .prepare(

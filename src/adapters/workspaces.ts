@@ -26,6 +26,7 @@ import {
   type WorkspaceSnapshot,
 } from "../domain/workspaces.js";
 import { digestJson } from "../domain/repository-policy.js";
+import { assertWorkspaceDirectory, retainedWorkspacePath } from "./workspace-disposal-files.js";
 import type { CommitRecord } from "../domain/commits.js";
 import type { TrackerCommitRecord } from "../domain/tracker-commits.js";
 
@@ -59,6 +60,24 @@ export class WorkspaceManager {
   /** Configuration for fixed trusted worker attachment; callers never reconstruct storage layout. */
   storageRoot(): string {
     return this.root;
+  }
+
+  /** Validate the existing private copy before reserving recoverable disposal. */
+  async disposalSource(authority: ControllerAuthority, identity: WorkspaceIdentity) {
+    const workspace = this.journal.agents.workspace(authority.runId, identity);
+    const expected = join(await realpath(this.root), authority.runId, workspace.workspaceId);
+    if (
+      workspace.path !== expected ||
+      !workspace.directory ||
+      workspace.directory.path !== expected
+    )
+      throw new WorkspaceError(
+        "workspace_path_changed",
+        "Disposal requires the original registered directory",
+      );
+    await assertWorkspaceDirectory(workspace.directory);
+    this.journal.assertAuthority(authority);
+    return workspace;
   }
 
   /** Reads only the selected repository's committed baseline; never its index or dirty files. */
@@ -1297,21 +1316,33 @@ export class WorkspaceManager {
     this.journal.assertAuthority(authority);
     const workspace = this.journal.agents.workspace(authority.runId, identity);
     const expected = join(await realpath(this.root), authority.runId, workspace.workspaceId);
-    if (workspace.path !== expected || (await realpath(workspace.path)) !== expected)
+    const disposals =
+      access === "diagnostic" && ["retired", "disposed"].includes(workspace.status)
+        ? this.journal.workspaceDisposals.forWorkspace(authority.runId, identity)
+        : [];
+    if (disposals.some((record) => record.outcome === null))
+      throw new WorkspaceError(
+        "disposal_unsettled",
+        "Reconcile disposal before inspecting this copy",
+      );
+    const retained = disposals.findLast((record) => record.outcome === "retained");
+    const path = retained ? retainedWorkspacePath(retained) : workspace.path;
+    if (workspace.path !== expected || (await realpath(path)) !== path)
       throw new WorkspaceError(
         "workspace_path_changed",
         "Managed workspace path changed; preserve it",
       );
+    if (workspace.directory) await assertWorkspaceDirectory(workspace.directory, path);
     if (!(
       workspace.status === "ready" ||
       (access === "reserved" && workspace.status === "reserved") ||
-      (access === "diagnostic" && workspace.status === "quarantined")
+      (access === "diagnostic" && ["quarantined", "retired", "disposed"].includes(workspace.status))
     ))
       throw new WorkspaceError(
         "workspace_unavailable",
         "Workspace is not ready for this operation",
       );
-    if (workspace.status === "quarantined") {
+    if (["quarantined", "retired", "disposed"].includes(workspace.status)) {
       // Read-only diagnosis does not release quarantine or prove ownership of
       // unexpected changes. Unknown old turns/I/O must be reconciled first.
       this.assertStopped(workspace);
@@ -1332,7 +1363,7 @@ export class WorkspaceManager {
         );
     }
     this.journal.assertAuthority(authority);
-    return workspace;
+    return { ...workspace, path };
   }
   private assertStopped(workspace: WorkspaceRecord): void {
     if (workspace.activeTurnId !== null)

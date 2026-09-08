@@ -312,6 +312,33 @@ describe("coordinator conversation accounting", () => {
 });
 
 describe("durable agent coordination", () => {
+  it.each(["missing", "null", "different_path"] as const)(
+    "rejects a %s materialized workspace identity without changing its stored record",
+    (kind) => {
+      const setup = fixture();
+      const workspace = setup.workspace();
+      expect(workspace.directory?.path).toBe(workspace.path);
+      const invalid: Record<string, unknown> = { ...workspace };
+      if (kind === "missing") delete invalid.directory;
+      else if (kind === "null") invalid.directory = null;
+      else
+        invalid.directory = { ...workspace.directory, path: join(workspace.path, "replacement") };
+      setup.db
+        .prepare("UPDATE workspaces SET record_json = ? WHERE workspace_id = ?")
+        .run(JSON.stringify(invalid), workspace.workspaceId);
+      const raw = () =>
+        setup.db
+          .prepare("SELECT record_json FROM workspaces WHERE workspace_id = ?")
+          .get(workspace.workspaceId);
+      const before = raw();
+      const control = setup.journal.control(setup.authority.runId);
+      expect(() => setup.agents.workspace(setup.authority.runId, workspace)).toThrow();
+      expect(() => setup.agents.workspaces(setup.authority.runId)).toThrow();
+      expect(raw()).toEqual(before);
+      expect(setup.journal.control(setup.authority.runId)).toEqual(control);
+    },
+  );
+
   it("rejects a missing workspace creation binding without normalizing persisted data", () => {
     const setup = fixture();
     const workspace = setup.workspace();

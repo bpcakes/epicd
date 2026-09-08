@@ -44,6 +44,8 @@ export function assertRuntimeHandoffReady(
       throw new Error(
         "Runtime handoff cannot infer workspace I/O stop from controller replacement",
       );
+  if (journal.workspaceDisposals.records(runId).some((record) => record.outcome === null))
+    throw new Error("Reconcile pending workspace disposal before runtime handoff");
   for (const agent of journal.agents.instances(runId))
     if (
       agent.activeTurnId ||

@@ -231,6 +231,7 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
     expectedFingerprint: Id,
   }),
   z.strictObject({ kind: z.literal("dispose_workspace"), ...WorkspaceTarget }),
+  z.strictObject({ kind: z.literal("inspect_workspace"), ...WorkspaceTarget }),
   z.strictObject({
     kind: z.literal("run_validation"),
     ...WorkspaceTarget,
