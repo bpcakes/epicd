@@ -25,6 +25,7 @@ import { startFixturePostgreSql } from "./fixtures/postgresql-fixture.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
 import type { OrchestrationJournal } from "../src/adapters/orchestration-journal.js";
 import type { ControllerAuthority } from "../src/domain/orchestration.js";
+import type { JournalRecordTarget } from "../src/domain/journal-records.js";
 
 const bin = process.env.EPICD_TEST_PG_BINDIR;
 const broker = process.env.EPICD_TEST_PGBOUNCER;
@@ -230,6 +231,89 @@ function accessRecovery(journal: OrchestrationJournal, authority: ControllerAuth
 describe.runIf(process.platform === "linux" && Boolean(bin) && Boolean(broker))(
   "granted fixture SQL through the real validation kernel",
   () => {
+    it("reads original fixture and grant records without running SQL or renewing revoked authority", async () => {
+      const f = await setup();
+      try {
+        const { evidence, use } = await f.validate(),
+          { journal, authority } = f.s,
+          run = authority.runId;
+        const creation = journal.fixtures
+          .creations(run)
+          .find((item) => item.creationId === use.creationId)!;
+        const records: JournalRecordTarget[] = [
+          { recordKind: "fixture_creation", recordId: creation.creationId },
+          { recordKind: "fixture_access", recordId: use.accessId },
+          { recordKind: "fixture_grant", recordId: creation.grantId },
+          { recordKind: "fixture_sql_grant", recordId: use.grantId },
+        ];
+        const originalGrants = journal.fixtures.grants(run),
+          originalSqlGrants = journal.fixtures.validation.grants(run),
+          originalUses = journal.fixtures.validation.uses(run);
+        for (const record of records) {
+          let offset: number | null = 0,
+            expectedDigest: string | null = null,
+            retained = "";
+          do {
+            const result = success(
+              await f.s.dispatch({
+                kind: "inspect_record",
+                ...record,
+                offset,
+                limit: 4000,
+                expectedDigest,
+              }),
+            );
+            if (result.kind !== "inspection") throw new Error("Expected fixture record inspection");
+            const page = JSON.parse(result.text);
+            expect(page).toMatchObject({ ...record, settled: true });
+            offset = page.nextOffset;
+            expectedDigest = page.digest;
+            retained += page.content;
+          } while (offset !== null);
+          const viewed = JSON.parse(retained);
+          expect(viewed).toMatchObject({
+            ...record,
+            record: { runId: run, fixtureId: f.definition.id },
+          });
+          expect(viewed.record).not.toHaveProperty("controllerLeaseId");
+          expect(viewed.record).not.toHaveProperty("ownerToken");
+        }
+        expect(journal.fixtures.grants(run)).toEqual(originalGrants);
+        expect(journal.fixtures.validation.grants(run)).toEqual(originalSqlGrants);
+        expect(journal.fixtures.validation.uses(run)).toEqual(originalUses);
+        expect(f.sql("SELECT count(*) FROM proof", "browser_fixture")).toBe("1");
+        const request = {
+          kind: "inspect_record" as const,
+          recordKind: "fixture_sql_grant" as const,
+          recordId: use.grantId,
+          offset: 0,
+          limit: 4000,
+          expectedDigest: null,
+        };
+        const oldView = success(await f.s.dispatch(request));
+        if (oldView.kind !== "inspection") throw new Error("Expected original grant view");
+        journal.fixtures.validation.revoke(run, journal.control(run).controlVersion, use.grantId);
+        expect(
+          await f.s.dispatch({
+            ...request,
+            offset: 1,
+            expectedDigest: JSON.parse(oldView.text).digest,
+          }),
+        ).toMatchObject({ status: "rejected", code: "record_view_changed" });
+        expect((await f.s.dispatch(request)).status).toBe("succeeded");
+        expect(journal.fixtures.validation.grants(run).at(-1)?.revokedAt).not.toBeNull();
+        expect(await f.s.dispatch(f.action)).toMatchObject({
+          status: "rejected",
+          code: "fixture_access_grant_required",
+        });
+        expect(journal.fixtures.validation.uses(run)).toEqual(originalUses);
+        expect(journal.delivery.satisfiesCheck(run, evidence.evidenceId)).toBe(true);
+        expect(f.sql("SELECT count(*) FROM proof", "browser_fixture")).toBe("1");
+      } finally {
+        f.cleanup();
+      }
+    });
+
     it.each([
       { diagnostic: false, preflight: false, replacement: false, revoked: false },
       { diagnostic: false, preflight: true, replacement: true, revoked: true },

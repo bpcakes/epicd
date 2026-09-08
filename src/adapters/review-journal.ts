@@ -26,6 +26,8 @@ import { redactSensitiveText } from "../util/redact.js";
 import { JournalReferenceError, readReviewReferences } from "./journal-references.js";
 import type { DiagnosticJournal } from "./diagnostic-journal.js";
 import type { ReviewReference } from "../domain/review-references.js";
+import type { JournalRecordTarget } from "../domain/journal-records.js";
+import type { JournalRecordView } from "./journal-records.js";
 
 export const REVIEW_TABLES = ["review_evidence", "review_findings"] as const;
 export function createReviewsSchema(db: Database.Database) {
@@ -64,6 +66,7 @@ type Access = {
   agents: AgentJournal;
   delivery: DeliveryJournal;
   diagnostics: DiagnosticJournal;
+  recordView(runId: string, target: JournalRecordTarget): JournalRecordView;
 };
 const at = () => new Date().toISOString();
 const REVIEW_INSTRUCTIONS =

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { JournalRecordTargetSchema } from "./journal-records.js";
 
 const Window = {
   offset: z.number().int().nonnegative(),
@@ -13,6 +14,8 @@ export const ReviewReferenceSchema = z.discriminatedUnion("kind", [
     ...Window,
   }),
   z.strictObject({ kind: z.literal("artifact"), artifactId: z.uuid(), ...Window }),
+  z.strictObject({ kind: z.literal("record"), ...JournalRecordTargetSchema.shape, ...Window }),
 ]);
 export type ReviewReference = z.infer<typeof ReviewReferenceSchema>;
-export const ReviewReferencesSchema = z.array(ReviewReferenceSchema).max(8);
+// Allow many small records without increasing the aggregate 32-KiB content budget.
+export const ReviewReferencesSchema = z.array(ReviewReferenceSchema).max(32);

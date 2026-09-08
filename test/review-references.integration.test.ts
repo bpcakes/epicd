@@ -58,10 +58,10 @@ describe("review reference contract", () => {
     expect(KernelActionSchema.safeParse(request).success).toBe(false);
     expect(KernelActionSchema.safeParse({ ...request, references: [] }).success).toBe(true);
     expect(
-      ReviewReferencesSchema.safeParse(Array.from({ length: 8 }, () => reference)).success,
+      ReviewReferencesSchema.safeParse(Array.from({ length: 32 }, () => reference)).success,
     ).toBe(true);
     expect(
-      ReviewReferencesSchema.safeParse(Array.from({ length: 9 }, () => reference)).success,
+      ReviewReferencesSchema.safeParse(Array.from({ length: 33 }, () => reference)).success,
     ).toBe(false);
     for (const altered of [
       { ...reference, offset: -1 },
@@ -83,6 +83,38 @@ describe("review reference contract", () => {
 // Real journals, private Git copies, supervised processes and prompt transport.
 // Provider judgments are scripted; these tests do not establish model competence.
 describe.runIf(process.platform === "linux")("kernel-supplied primary review records", () => {
+  it("retains action output after credential lines and keeps the redacted JSON readable", async () => {
+    const { s } = await setup();
+    s.kernel.registerLocal("inspect_fixture", () => ({
+      kind: "inspection",
+      text: "password=private-value\n" + "x".repeat(10000) + "\nEND",
+      artifactIds: [],
+    }));
+    const original = await s.dispatch({ kind: "inspect_fixture", fixtureId: "primary-output" });
+    let offset: number | null = 0,
+      expectedDigest: string | null = null,
+      retained = "";
+    do {
+      const result = success(
+        await s.dispatch({
+          kind: "inspect_action",
+          actionId: original.actionId,
+          offset,
+          limit: 4000,
+          expectedDigest,
+        }),
+      );
+      if (result.kind !== "inspection") throw new Error("Expected action page");
+      const page = JSON.parse(result.text);
+      offset = page.nextOffset;
+      expectedDigest = page.digest;
+      retained += page.content;
+    } while (offset !== null);
+    expect(JSON.parse(retained).result.result.text).toBe(
+      "password=[REDACTED]\n" + "x".repeat(10000) + "\nEND",
+    );
+  });
+
   it.each(["pre_commit", "exact_revision"] as const)(
     "delivers selected original pages to a %s reviewer and retains their binding after restart",
     async (phase) => {

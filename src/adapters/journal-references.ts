@@ -1,27 +1,50 @@
 import { createHash } from "node:crypto";
 import type { ActionRecord } from "../domain/orchestration.js";
 import type { ReviewReference } from "../domain/review-references.js";
-import { redactDiagnosticText } from "../util/redact.js";
+import { redactDiagnosticValue } from "../util/redact.js";
 import { DiagnosticRequestError, type DiagnosticJournal } from "./diagnostic-journal.js";
+import {
+  JournalRecordError,
+  journalRecordPage,
+  type JournalRecordView,
+} from "./journal-records.js";
+import type { JournalRecordTarget } from "../domain/journal-records.js";
 
 /** The same redacted view is used by the lead and by kernel-supplied review context. */
 export function actionRecordView(record: ActionRecord) {
-  const text = redactDiagnosticText(JSON.stringify(record));
+  const text = JSON.stringify(redactDiagnosticValue(record));
   return { text, digest: createHash("sha256").update(text).digest("hex") };
 }
 
 export class JournalReferenceError extends Error {}
 
-/** All content is resolved from this run's immutable records, never from model prose. */
+/** All content is resolved from this run's retained records, never from model prose. */
 export function readReviewReferences(
   runId: string,
   references: readonly ReviewReference[],
   port: {
     action(runId: string, actionId: string): ActionRecord | null;
     diagnostics: DiagnosticJournal;
+    recordView(runId: string, target: JournalRecordTarget): JournalRecordView;
   },
 ) {
   const pages = references.map((reference) => {
+    if (reference.kind === "record") {
+      try {
+        const view = port.recordView(runId, {
+          recordKind: reference.recordKind,
+          recordId: reference.recordId,
+        });
+        if (!view.settled)
+          throw new JournalReferenceError(
+            "Review context can reference only settled records; inspect unfinished history without treating it as final evidence",
+          );
+        return { reference, record: journalRecordPage(view, reference.offset, reference.limit) };
+      } catch (error) {
+        if (error instanceof JournalRecordError) throw new JournalReferenceError(error.message);
+        throw error;
+      }
+    }
     if (reference.kind === "action") {
       const record = port.action(runId, reference.actionId);
       if (!record || record.runId !== runId)

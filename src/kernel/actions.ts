@@ -22,6 +22,11 @@ import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import { DeliveryError } from "../adapters/delivery-journal.js";
 import { DiagnosticRequestError } from "../adapters/diagnostic-journal.js";
 import { actionRecordView } from "../adapters/journal-references.js";
+import {
+  journalRecordView,
+  journalRecordPage,
+  JournalRecordError,
+} from "../adapters/journal-records.js";
 
 type ActionKind = KernelAction["kind"];
 export type ActionContext = {
@@ -91,6 +96,33 @@ export class ActionKernel {
         }),
         artifactIds: [],
       };
+    });
+    this.registerLocal("inspect_record", ({ authority }, action) => {
+      try {
+        const view = journalRecordView(journal, authority.runId, {
+          recordKind: action.recordKind,
+          recordId: action.recordId,
+        });
+        if (action.offset !== 0 && action.expectedDigest === null)
+          throw new CapabilityRejected(
+            "record_view_required",
+            "Continuation pages require the digest returned by offset zero",
+          );
+        if (action.expectedDigest !== null && action.expectedDigest !== view.digest)
+          throw new CapabilityRejected(
+            "record_view_changed",
+            "The record changed; read offset zero again instead of splicing different outcomes",
+          );
+        return {
+          kind: "inspection",
+          text: JSON.stringify(journalRecordPage(view, action.offset, action.limit)),
+          artifactIds: [],
+        };
+      } catch (error) {
+        if (error instanceof JournalRecordError)
+          throw new CapabilityRejected(error.code, error.message);
+        throw error;
+      }
     });
     this.registerLocal("inspect_observation", ({ authority }, action) => {
       const observation = journal.observations(authority.runId, action.observationId - 1, 1)[0];

@@ -28,3 +28,22 @@ export function redactDiagnosticText(value: string): string {
     Infinity,
   );
 }
+
+/** Redact JSON-compatible values before serialization so escaped newlines and quotes
+ * cannot make a credential pattern consume another field or innocent output. */
+export function redactDiagnosticValue(value: unknown): unknown {
+  if (typeof value === "string") return redactDiagnosticText(value);
+  if (Array.isArray(value)) return value.map(redactDiagnosticValue);
+  if (value !== null && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        /^(?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|session[_-]?token|token|password|client[_-]?secret|secret|authorization|cookie|set-cookie|private[_-]?key)$/i.test(
+          key,
+        )
+          ? "[REDACTED]"
+          : redactDiagnosticValue(item),
+      ]),
+    );
+  return value;
+}

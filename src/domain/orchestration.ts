@@ -2,6 +2,7 @@ import { z } from "zod";
 import { AgentRoleSchema, AgentRoleSettingsSchema } from "./types.js";
 import { RequiredCheckSchema } from "./repository-policy.js";
 import { ReviewReferencesSchema } from "./review-references.js";
+import { JournalRecordTargetSchema } from "./journal-records.js";
 
 // These identities originate in durable controller records, never in agent output.
 const IdentityPartSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
@@ -95,6 +96,16 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("inspect_candidate"), ...CandidateTarget }),
   z.strictObject({ kind: z.literal("inspect_validation_plan"), validationPlanId: Id }),
   z.strictObject({ kind: z.literal("inspect_evidence"), evidenceId: Id }),
+  z.strictObject({
+    kind: z.literal("inspect_record"),
+    ...JournalRecordTargetSchema.shape,
+    offset: Version,
+    limit: z.number().int().min(1).max(4000),
+    expectedDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .nullable(),
+  }),
   z.strictObject({ kind: z.literal("inspect_review"), evidenceId: Id }),
   z.strictObject({ kind: z.literal("inspect_commit"), commitId: Id }),
   z.strictObject({

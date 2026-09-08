@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { journalRecordView } from "./journal-records.js";
 import { RunStateSchema } from "../domain/types.js";
 import type { RuntimeHandoffTarget } from "../domain/runtime-handoff.js";
 import { commitRuntimeHandoff } from "./runtime-handoff.js";
@@ -72,7 +73,7 @@ import {
   createRepositoryAdmissionSchema,
 } from "./repository-admission-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 34;
+export const ORCHESTRATION_SCHEMA_VERSION = 35;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -361,6 +362,7 @@ export class OrchestrationJournal {
       agents: this.agents,
       delivery: this.delivery,
       diagnostics: this.diagnostics,
+      recordView: (runId, target) => journalRecordView(this, runId, target),
     });
     this.commits = new CommitJournal(db, {
       transaction: (authority, body) => this.transaction(authority, body),
@@ -986,6 +988,7 @@ export class OrchestrationJournal {
           "record_memory",
           "inspect_run",
           "inspect_action",
+          "inspect_record",
           "inspect_observation",
           "inspect_repo",
           "inspect_agent",

@@ -3,6 +3,7 @@ import { digestJson } from "../domain/repository-policy.js";
 import type { ValidationPlan } from "../domain/delivery.js";
 import type { WorkspaceSnapshot } from "../domain/workspaces.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
+import type { JournalRecordTarget } from "../domain/journal-records.js";
 import { DeliveryError } from "./delivery-journal.js";
 type RequiredCheck = ValidationPlan["checks"][number];
 type CheckBinding = { taskId: string; checkId: string; finalCheckId: string };
@@ -86,6 +87,21 @@ function epicContext(
       const publication = journal.publications.record(runId, closure.closure!.publicationId);
       const candidate = journal.delivery.candidate(runId, publication);
       const plan = journal.delivery.plan(runId, candidate.validationPlanId);
+      const commit = journal.commits.record(runId, publication.commitId);
+      const reviews = [commit.reviewEvidenceId, closure.closure!.reviewEvidenceId].map(
+        (evidenceId) => journal.reviews.evidence(runId, evidenceId),
+      );
+      const validationIds = [...new Set(reviews.flatMap((review) => review.validationEvidenceIds))];
+      const historicalRecords: JournalRecordTarget[] = [
+        { recordKind: "tracker_operation", recordId: closure.trackerOperationId },
+        { recordKind: "commit", recordId: commit.commitId },
+        { recordKind: "publication", recordId: publication.publicationId },
+        ...reviews.map((review) => ({
+          recordKind: "review" as const,
+          recordId: review.evidenceId,
+        })),
+        ...validationIds.map((recordId) => ({ recordKind: "validation" as const, recordId })),
+      ];
       return {
         taskId: closure.taskId!,
         closureOperationId: closure.trackerOperationId,
@@ -94,6 +110,7 @@ function epicContext(
         validationPlanId: plan.planId,
         acceptanceCriteria: plan.acceptanceCriteria,
         checks: plan.checks,
+        historicalRecords,
       };
     }),
     warning:

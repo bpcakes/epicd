@@ -7,7 +7,10 @@ export function actionContextRecord(record: ActionRecord, preservePage: boolean)
   if (
     copy.result?.status === "succeeded" &&
     copy.result.result.kind === "inspection" &&
-    !(preservePage && ["inspect_observation", "inspect_action"].includes(copy.request.action.kind))
+    !(
+      preservePage &&
+      ["inspect_observation", "inspect_action", "inspect_record"].includes(copy.request.action.kind)
+    )
   ) {
     // Otherwise an inspect_run result recursively contains every preceding inspection result.
     const preview = redactSensitiveText(copy.result.result.text, 1500);

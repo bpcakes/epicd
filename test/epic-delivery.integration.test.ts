@@ -3,8 +3,9 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { closureFixture, publishVerified } from "./fixtures/tracker-closure.js";
-import { check, finding, git, resource, target } from "./fixtures/review.js";
+import { check, finding, git, resource, success, target } from "./fixtures/review.js";
 import type { CandidateIdentity } from "../src/domain/delivery.js";
+import type { JournalRecordTarget } from "../src/domain/journal-records.js";
 
 const actionCheck = ({ stage: _stage, ...value }: typeof check) => value;
 async function closed(s: Awaited<ReturnType<typeof closureFixture>>) {
@@ -45,6 +46,71 @@ async function refresh(s: Awaited<ReturnType<typeof closureFixture>>) {
 }
 
 describe.skipIf(process.platform !== "linux")("published whole-epic review", () => {
+  it("indexes only actual descendant proof records and exposes their retained history without replay", async () => {
+    const s = await closureFixture("sha1", true, "preclosed"),
+      run = s.authority.runId;
+    const { commit, publication } = await closed(s);
+    const candidate = await prepare(s);
+    const closure = s.journal.tracker
+      .operations(run)
+      .find((operation) => operation.kind === "close_task")!;
+    const reviews = [commit.reviewEvidenceId, closure.closure!.reviewEvidenceId].map((id) =>
+      s.journal.reviews.evidence(run, id),
+    );
+    const validations = [...new Set(reviews.flatMap((review) => review.validationEvidenceIds))];
+    expect(reviews.map((review) => review.phase)).toEqual(["pre_commit", "exact_revision"]);
+    expect(validations).toHaveLength(2);
+    const records: JournalRecordTarget[] = [
+      { recordKind: "tracker_operation", recordId: closure.trackerOperationId },
+      { recordKind: "commit", recordId: commit.commitId },
+      { recordKind: "publication", recordId: publication.publicationId },
+      ...reviews.map((review) => ({ recordKind: "review" as const, recordId: review.evidenceId })),
+      ...validations.map((recordId) => ({ recordKind: "validation" as const, recordId })),
+    ];
+    const context = s.journal.delivery.epicReviewContext(run, candidate);
+    expect(context).toMatchObject({
+      preexistingClosedTaskIds: ["demo.2"],
+      closedTasks: [{ taskId: "demo.1", historicalRecords: records }],
+    });
+    const originalTracker = s.journal.tracker.operations(run),
+      originalCommits = s.journal.commits.records(run),
+      originalPublications = s.journal.publications.records(run);
+    for (const record of records) {
+      let offset: number | null = 0,
+        expectedDigest: string | null = null,
+        retained = "";
+      do {
+        const result = success(
+          await s.dispatch({
+            kind: "inspect_record",
+            ...record,
+            offset,
+            limit: 4000,
+            expectedDigest,
+          }),
+        );
+        if (result.kind !== "inspection") throw new Error("Expected primary record inspection");
+        const page = JSON.parse(result.text);
+        expect(page).toMatchObject({ ...record, settled: true });
+        retained += page.content;
+        offset = page.nextOffset;
+        expectedDigest = page.digest;
+      } while (offset !== null);
+      const viewed = JSON.parse(retained);
+      expect(viewed).toMatchObject({ ...record, record: { runId: run } });
+      expect(viewed.record).not.toHaveProperty("controllerLeaseId");
+      expect(viewed.record).not.toHaveProperty("ioLeaseId");
+      expect(viewed.record).not.toHaveProperty("lockNonce");
+      if (record.recordKind === "commit") expect(viewed.record.revision).toBe(commit.revision);
+      if (record.recordKind === "review") expect(viewed.record.report.verdict).toBe("approved");
+    }
+    expect(s.journal.tracker.operations(run)).toEqual(originalTracker);
+    expect(s.journal.commits.records(run)).toEqual(originalCommits);
+    expect(s.journal.publications.records(run)).toEqual(originalPublications);
+    expect(s.journal.delivery.epicReviewContext(run, candidate)).toEqual(context);
+    expect(s.journal.reviews.approval(run, candidate, "exact_revision")).toBeNull();
+  }, 30000);
+
   it("retains initially closed work as explicit scope without fabricating run-owned closure", async () => {
     const s = await closureFixture("sha1", true, "preclosed"),
       run = s.authority.runId;
