@@ -333,10 +333,9 @@ describe("retained diagnostic artifacts", () => {
     const s = fixture();
     const { artifact } = s.append("retained current-format observation");
     const original = s.db.prepare("SELECT * FROM observations").all();
+    const originalSchema = s.db.prepare("SELECT version FROM orchestration_schema").all();
     s.reopen();
-    expect(s.db.prepare("SELECT MAX(version) AS version FROM orchestration_schema").get()).toEqual({
-      version: 30,
-    });
+    expect(s.db.prepare("SELECT version FROM orchestration_schema").all()).toEqual(originalSchema);
     expect(s.db.prepare("SELECT * FROM observations").all()).toEqual(original);
     expect(
       s.store.orchestration.diagnostics.read(s.authority.runId, artifact.artifactId, 0, 100).text,
