@@ -7,6 +7,7 @@ export const JournalRecordTargetSchema = z.strictObject({
     "review",
     "agent_turn",
     "commit",
+    "workspace_inspection",
     "publication",
     "tracker_operation",
     "fixture_creation",

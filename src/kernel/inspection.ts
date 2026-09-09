@@ -5,6 +5,7 @@ import { InspectionError } from "../adapters/inspection-files.js";
 import { WorkspaceError, type WorkspaceManager } from "../adapters/workspaces.js";
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import type { ActionRecord } from "../domain/orchestration.js";
+import { workspaceInspectionSummary } from "../domain/workspace-inspection.js";
 import type { RecoveryObservation } from "./reconcile.js";
 
 /** A lost read result is not recovered by reading newer bytes and calling them the old observation. */
@@ -25,6 +26,20 @@ export function registerInspectionCapabilities(
   kernel: ActionKernel,
   workspaces: WorkspaceManager,
 ): void {
+  kernel.registerExternal("reconcile_workspace_inspection", async ({ authority }, action) => {
+    try {
+      const settled = await workspaces.reconcileInspection(authority, action.inspectionId);
+      return {
+        kind: "inspection",
+        text: JSON.stringify(workspaceInspectionSummary(settled)),
+        artifactIds: [],
+      };
+    } catch (error) {
+      kernel.journal.assertAuthority(authority);
+      if (error instanceof WorkspaceError) throw new CapabilityRejected(error.code, error.message);
+      throw error; // An unproven stop remains indeterminate, retaining its exclusion.
+    }
+  });
   kernel.registerExternal("inspect_repo", async ({ authority, record, signal }, action) => {
     try {
       const text = await inspectRepository(workspaces, authority, action, signal);

@@ -460,17 +460,15 @@ describe("managed independent Git workspaces", () => {
     const database = new Database(join(setup.root, "state.sqlite3"));
     try {
       // Crash point: all bytes exist but the readiness transaction has not happened yet.
-      database
-        .prepare("UPDATE workspaces SET record_json = ? WHERE workspace_id = ?")
-        .run(
-          JSON.stringify({
-            ...work,
-            status: "reserved",
-            directory: null,
-            baselineFingerprint: null,
-          }),
-          work.workspaceId,
-        );
+      database.prepare("UPDATE workspaces SET record_json = ? WHERE workspace_id = ?").run(
+        JSON.stringify({
+          ...work,
+          status: "reserved",
+          directory: null,
+          baselineFingerprint: null,
+        }),
+        work.workspaceId,
+      );
       mkdirSync(join(work.path, "ignored"));
       writeFileSync(join(work.path, "ignored", "unknown.txt"), "preserve this intervention");
       expect(await setup.manager.inspectMaterialization(setup.authority, work)).toBe("incomplete");

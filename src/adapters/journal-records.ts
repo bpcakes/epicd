@@ -4,6 +4,7 @@ import { redactDiagnosticValue } from "../util/redact.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
 import { DeliveryError } from "./delivery-journal.js";
 import { publicationView } from "../domain/publication.js";
+import { workspaceInspectionView } from "../domain/workspace-inspection.js";
 
 export class JournalRecordError extends Error {
   constructor(
@@ -98,6 +99,12 @@ export function journalRecordView(
       );
       record = publicationView(publication);
       settled = publication.outcome !== null && publication.ioStopped;
+      break;
+    }
+    case "workspace_inspection": {
+      const inspection = required(journal.workspaceInspections.find(runId, id));
+      record = workspaceInspectionView(inspection);
+      settled = inspection.outcome !== null;
       break;
     }
     case "tracker_operation": {

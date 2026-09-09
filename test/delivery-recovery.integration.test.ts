@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import * as lifetime from "../src/adapters/command-lifetime.js";
 import { ActionKernel } from "../src/kernel/actions.js";
@@ -13,9 +13,11 @@ import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
 import { OrchestratorController, controlledDriver } from "../src/controller.js";
 import { runRepositoryIO } from "../dist/adapters/repository-io.js";
-import { closureFixture } from "./fixtures/tracker-closure.js";
+import { closureFixture, publishVerified } from "./fixtures/tracker-closure.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
-import { fixture, check, git, success, target, waitFor } from "./fixtures/review.js";
+import { fixture, check, git, resource, success, target, waitFor } from "./fixtures/review.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 type Setup = Awaited<ReturnType<typeof fixture>>;
 type Kind =
@@ -386,7 +388,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     const originalBytes = git(s.workspace.path, "cat-file", "commit", intent.revision!);
     const recovered = cold(s);
     const inspect = vi
-      .spyOn(recovered.manager, "inspectCandidateCommit")
+      .spyOn(recovered.manager, "reconcileCandidateCommitInspection")
       .mockRejectedValueOnce(new Error("Transient object inspection failure"));
     const writes = vi.spyOn(recovered.manager, "writeCandidateCommit");
     const retry = { kind: "reconcile_action", actionId: lost.actionId } as const;
@@ -641,6 +643,68 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     await s.kernel.operation(running.operationId);
   });
 
+  it.each(["application_commit", "tracker_commit"] as const)(
+    "does not retry a failed %s inspection during repeated controller startup",
+    async (kind) => {
+      const s = await closureFixture(),
+        run = s.authority.runId;
+      let action: KernelAction;
+      if (kind === "application_commit") action = await request(s, "request_commit");
+      else {
+        const application = await publishVerified(s);
+        const exported = resource(await s.dispatch({ kind: "export_tracker" }));
+        action = {
+          kind: "request_tracker_commit",
+          trackerOperationId: exported.resourceId,
+          publicationId: application.publication.publicationId,
+        };
+      }
+      const start = lifetime.startDurableCommand;
+      const dispatchFault = vi
+        .spyOn(lifetime, "startDurableCommand")
+        .mockImplementation((intent, launch) => {
+          if (launch.args.some((arg) => arg.endsWith("workspace-inspection-io-cli.js")))
+            throw new Error("Inspection dispatch failed");
+          return start(intent, launch);
+        });
+      const settlementFault = vi
+        .spyOn(s.journal.workspaceInspections, "finish")
+        .mockImplementationOnce(() => {
+          throw new Error("Controller died before retaining inspection settlement");
+        });
+      const parent = await s.dispatch(action);
+      expect(parent.status).toBe("indeterminate");
+      dispatchFault.mockRestore();
+      settlementFault.mockRestore();
+      const pending = s.journal.workspaceInspections.unsettled(run).at(-1)!;
+      expect(pending).toMatchObject({ target: { kind }, outcome: null, workerResult: null });
+      const workspace = s.journal.agents.workspace(run, pending);
+      const refs = git(workspace.path, "for-each-ref");
+      s.journal.changeStatus(s.authority, "paused");
+      s.store.releaseLease(run, s.authority.ownerToken);
+      const store = s.reopen();
+      const launches = vi.spyOn(lifetime, "startDurableCommand");
+      for (let restart = 0; restart < 2; restart++) {
+        const status = await new OrchestratorController(store, run, {
+          repositoryIO: runRepositoryIO,
+        }).run();
+        expect(status.control.status).toBe("paused");
+        expect(store.orchestration.action(run, parent.actionId)?.status).toBe("indeterminate");
+        expect(store.orchestration.workspaceInspections.forWorkspace(run, workspace)).toMatchObject(
+          [{ inspectionId: pending.inspectionId, outcome: "failed", workerResult: null }],
+        );
+        expect(store.orchestration.agents.activeWorkspaceOperation(run, workspace)).toBeNull();
+      }
+      expect(
+        launches.mock.calls.some(([, launch]) =>
+          launch.args.some((arg) => arg.endsWith("workspace-inspection-io-cli.js")),
+        ),
+      ).toBe(false);
+      expect(git(workspace.path, "for-each-ref")).toBe(refs);
+    },
+    60000,
+  );
+
   it("recovers through the real controller before requesting the next coordinator decision", async () => {
     const s = await closureFixture(),
       run = s.authority.runId;
@@ -722,7 +786,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     }
     expect(first.journal.action(run, parent.actionId)?.status).toBe("succeeded");
     const second = cold(s);
-    const inspect = vi.spyOn(second.manager, "inspectCandidateCommit");
+    const inspect = vi.spyOn(second.manager, "reconcileCandidateCommitInspection");
     await reconcileActions(
       second.journal,
       s.authority,

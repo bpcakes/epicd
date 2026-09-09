@@ -374,6 +374,7 @@ export function concurrentWithPublication(kind: KernelAction["kind"]): boolean {
       "escalate",
       "reconcile_publication",
       "reconcile_action",
+      "reconcile_workspace_inspection",
     ].includes(kind)
   );
 }

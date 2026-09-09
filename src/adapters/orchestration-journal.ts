@@ -80,8 +80,12 @@ import {
   WorkspaceCreationJournal,
   createWorkspaceCreationSchema,
 } from "./workspace-creation-journal.js";
+import {
+  WorkspaceInspectionJournal,
+  createWorkspaceInspectionSchema,
+} from "./workspace-inspection-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 42;
+export const ORCHESTRATION_SCHEMA_VERSION = 43;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -94,6 +98,7 @@ export const ORCHESTRATION_TABLES = [
   ...AGENT_TABLES,
   "workspace_disposals",
   "workspace_creations",
+  "workspace_inspections",
   ...DELIVERY_TABLES,
   ...REVIEW_TABLES,
   ...COMMIT_TABLES,
@@ -166,6 +171,7 @@ export function createOrchestrationSchema(db: Database.Database): void {
   createAgentsSchema(db);
   createWorkspaceDisposalSchema(db);
   createWorkspaceCreationSchema(db);
+  createWorkspaceInspectionSchema(db);
   createDeliverySchema(db);
   createReviewsSchema(db);
   createCommitsSchema(db);
@@ -231,6 +237,7 @@ export class OrchestrationJournal {
   readonly agents: AgentJournal;
   readonly workspaceDisposals: WorkspaceDisposalJournal;
   readonly workspaceCreations: WorkspaceCreationJournal;
+  readonly workspaceInspections: WorkspaceInspectionJournal;
   readonly delivery: DeliveryJournal;
   readonly reviews: ReviewJournal;
   readonly commits: CommitJournal;
@@ -311,6 +318,8 @@ export class OrchestrationJournal {
         this.publications.permitsWorkspaceStop(runId, operationId),
       creationPermitsWorkspaceStop: (runId, operationId) =>
         this.workspaceCreations.permitsMemberStop(runId, operationId),
+      inspectionPermitsWorkspaceStop: (runId, operationId) =>
+        this.workspaceInspections.permitsMemberStop(runId, operationId),
       captureInterruptedBeforeLaunch: (runId, operationId) => {
         const candidate = this.delivery.candidateForWorkspaceOperation(runId, operationId);
         return (
@@ -502,6 +511,9 @@ export class OrchestrationJournal {
       this.transaction(authority, body),
     );
     this.workspaceCreations = new WorkspaceCreationJournal(db, this, (authority, body) =>
+      this.transaction(authority, body),
+    );
+    this.workspaceInspections = new WorkspaceInspectionJournal(db, this, (authority, body) =>
       this.transaction(authority, body),
     );
   }

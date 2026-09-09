@@ -1,6 +1,10 @@
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
-import type { WorkspaceManager } from "../adapters/workspaces.js";
+import { WorkspaceError, type WorkspaceManager } from "../adapters/workspaces.js";
 import type { ActionRecord, ControllerAuthority } from "../domain/orchestration.js";
+import {
+  workspaceInspectionSummary,
+  type CommitInspectionMode,
+} from "../domain/workspace-inspection.js";
 import { digestJson } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
 import type { ActionKernel } from "./actions.js";
@@ -22,6 +26,7 @@ const supported = new Set<ActionRecord["request"]["action"]["kind"]>([
   "run_review",
   "request_commit",
   "reconcile_action",
+  "reconcile_workspace_inspection",
   "reconcile_fixture_access",
   "interrupt_action",
   "dispose_workspace",
@@ -60,6 +65,7 @@ export function registerDeliveryRecoveryCapabilities(
         authority,
         parent,
         signal,
+        "request",
       );
       if (!outcome)
         throw new CapabilityRejected(
@@ -104,6 +110,7 @@ export async function reconcileDeliveryAction(
   authority: ControllerAuthority,
   input: ActionRecord,
   signal?: AbortSignal,
+  commitInspectionMode: CommitInspectionMode = "recover",
 ): Promise<RecoveryObservation | null> {
   journal.assertAuthority(authority);
   const record = journal.action(authority.runId, input.actionId);
@@ -130,6 +137,17 @@ export async function reconcileDeliveryAction(
       return failed(
         "Interrupted cancellation request lost its acknowledgement. It may already have signalled its target. No signal was replayed, no target result was changed, and no process stop or released resource exclusion was inferred. Inspect the original target and reconcile its resources separately.",
       );
+    if (action.kind === "reconcile_workspace_inspection") {
+      const settled = await workspaces.reconcileInspection(authority, action.inspectionId);
+      return {
+        status: "succeeded",
+        result: {
+          kind: "inspection",
+          text: JSON.stringify(workspaceInspectionSummary(settled)),
+          artifactIds: [],
+        },
+      };
+    }
     if (action.kind === "reconcile_action" || action.kind === "reconcile_fixture_access")
       return failed(
         "Interrupted reconciliation lost its acknowledgement. Inspect the original action again; no resource stop was inferred and no delivery effect was replayed.",
@@ -139,7 +157,14 @@ export async function reconcileDeliveryAction(
         .records(run)
         .find((entry) => entry.operationId === record.operationId);
       if (!intent) return failed("No private commit intent exists; no Git write was admitted");
-      const commit = await reconcileCommit(journal, workspaces, authority, intent.commitId, signal);
+      const commit = await reconcileCommit(
+        journal,
+        workspaces,
+        authority,
+        intent.commitId,
+        signal,
+        commitInspectionMode,
+      );
       const operation = journal.agents.workspaceOperation(run, commit.workspaceOperationId);
       if (
         !operation.stopEvidence ||
@@ -222,11 +247,7 @@ export async function reconcileDeliveryAction(
         if (creation?.outcome === "failed")
           return failed(creation.detail ?? "Workspace creation failed without replay");
       }
-      if (
-        !workspace ||
-        workspace.activeTurnId ||
-        journal.agents.activeWorkspaceOperation(run, workspace)
-      )
+      if (!workspace || workspace.activeTurnId)
         return unresolved(
           "Workspace materialization is not independently stopped and identifiable; no copy was recreated",
         );
@@ -285,6 +306,8 @@ export async function reconcileDeliveryAction(
     return null;
   } catch (error) {
     journal.assertAuthority(authority);
+    if (error instanceof WorkspaceError && error.code === "unknown_workspace_inspection")
+      return failed("No workspace inspection belongs to this request; no read was dispatched");
     return unresolved(
       `Delivery recovery remains unproven: ${String(error)}. No delivery effect was replayed.`,
     );

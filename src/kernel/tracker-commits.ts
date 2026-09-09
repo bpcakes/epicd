@@ -1,3 +1,4 @@
+import type { CommitInspectionMode } from "../domain/workspace-inspection.js";
 import { randomUUID } from "node:crypto";
 import type { ActionKernel } from "./actions.js";
 import type { ControllerAuthority } from "../domain/orchestration.js";
@@ -69,6 +70,7 @@ export function registerTrackerCommitCapabilities(
       workspaces,
       authority,
       action.trackerCommitId,
+      "request",
     );
     const parent = journal
       .actions(authority.runId)
@@ -110,13 +112,19 @@ export async function reconcileTrackerCommit(
   workspaces: WorkspaceManager,
   authority: ControllerAuthority,
   id: string,
+  inspectionMode: CommitInspectionMode = "recover",
 ) {
   journal.assertAuthority(authority);
   const record = journal.trackerCommits.record(authority.runId, id);
   if (["created", "failed"].includes(record.status)) return record;
   await reconcileCommitIO(journal, authority, { kind: "tracker", trackerCommitId: id });
   if (!record.dispatched) return journal.trackerCommits.cancelUndispatched(authority, id);
-  const result = await workspaces.inspectTrackerCommit(authority, record);
+  const result = await workspaces.reconcileTrackerCommitInspection(
+    authority,
+    record,
+    undefined,
+    inspectionMode,
+  );
   return journal.trackerCommits.finish(
     authority,
     id,

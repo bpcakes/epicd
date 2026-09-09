@@ -312,6 +312,7 @@ export function concurrentWithTracker(kind: KernelAction["kind"]): boolean {
       "escalate",
       "reconcile_tracker_operation",
       "reconcile_action",
+      "reconcile_workspace_inspection",
       "reconcile_fixture_access",
     ].includes(kind)
   );

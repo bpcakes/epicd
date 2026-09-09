@@ -34,6 +34,17 @@ import type { CandidateIdentity } from "../domain/delivery.js";
 import type { WorkspaceCreationSource } from "../domain/workspace-creation.js";
 import { runWorkspaceCreationIO, reconcileWorkspaceCreationIO } from "./workspace-creation-io.js";
 import { redactSensitiveText } from "../util/redact.js";
+import {
+  runWorkspaceInspectionIO,
+  reconcileWorkspaceInspectionIO,
+} from "./workspace-inspection-io.js";
+import type {
+  CommitInspectionMode,
+  CommitInspectionTarget,
+  WorkspaceInspection,
+  WorkspaceInspectionTarget,
+  WorkspaceInspectionObservation,
+} from "../domain/workspace-inspection.js";
 
 const FILE_LIMIT = 64 * 1024 * 1024;
 const CHECKOUT_LIMIT = 512 * 1024 * 1024;
@@ -53,8 +64,12 @@ export class WorkspaceError extends Error {
   }
 }
 
+/** A successfully established physical mismatch; operational/custody failures use other errors. */
+class WorkspaceMismatch extends WorkspaceError {}
+
 /** Physical workspace operations. Durable reservations and active-turn ownership live in the journal. */
 export class WorkspaceManager {
+  private readonly activeInspections = new Set<string>();
   constructor(
     private readonly journal: OrchestrationJournal,
     private readonly root: string,
@@ -194,41 +209,210 @@ export class WorkspaceManager {
     return record ? reconcileWorkspaceCreationIO(this.journal, authority, record.creationId) : null;
   }
 
-  /** An interrupted reservation remains preserved. Only a complete, matching copy may be adopted. */
+  /** Inspect current bytes. Prior receipts settle history but never answer this new readiness request. */
   async inspectMaterialization(
     authority: ControllerAuthority,
     identity: WorkspaceIdentity,
     signal?: AbortSignal,
   ): Promise<"ready" | "incomplete"> {
     this.journal.assertAuthority(authority);
+    signal?.throwIfAborted();
     const workspace = this.journal.agents.workspace(authority.runId, identity);
     if (workspace.status !== "reserved" && workspace.status !== "ready") return "incomplete";
-    return this.exclusive(authority, workspace, "inspect_materialization", async () => {
-      try {
-        await this.owned(authority, identity, "reserved");
-        const git = new KernelGit(workspace.path);
-        await this.assertPrivateGit(git, signal);
-        if (
-          (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() !==
-          workspace.baselineRevision
-        )
-          return "incomplete";
-        const entries = await this.treeEntries(git, workspace.baselineRevision, signal);
-        await assertExpectedNamespace(workspace.path, new Set(entries.map((entry) => entry.path)));
-        const manifest = await this.readExpectedFiles(workspace.path, entries);
-        const actual = await this.scan(git, workspace.baselineRevision, signal);
-        if (digestJson(manifest) !== digestJson(actual.map((file) => file.entry)))
-          return "incomplete";
-        this.journal.assertAuthority(authority);
-        if (workspace.status === "reserved")
-          this.journal.agents.markWorkspaceReady(authority, workspace, digestJson(manifest));
-        return "ready";
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        this.journal.assertAuthority(authority);
-        return "incomplete";
-      }
+    const observation = await this.withInspectionCustody(authority, identity, async () => {
+      signal?.throwIfAborted();
+      await this.settlePendingInspection(authority, identity, { kind: "materialization" });
+      signal?.throwIfAborted();
+      return this.inspectionObservation(
+        await runWorkspaceInspectionIO(
+          this.journal,
+          authority,
+          this.journal.workspaceInspections.reserve(authority, this.root, identity, {
+            kind: "materialization",
+          }),
+          signal,
+        ),
+      );
     });
+    if (observation.kind !== "materialization")
+      throw new Error("Materialization inspection target differs");
+    return observation.ready ? "ready" : "incomplete";
+  }
+
+  /** Recover this durable read even if its original caller no longer wants its target. */
+  async reconcileInspection(authority: ControllerAuthority, inspectionId: string) {
+    this.journal.assertAuthority(authority);
+    const record = this.journal.workspaceInspections.find(authority.runId, inspectionId);
+    if (!record)
+      throw new WorkspaceError(
+        "unknown_workspace_inspection",
+        "Inspection is missing or belongs to another run",
+      );
+    if (record.outcome) return record;
+    return this.withInspectionCustody(authority, record, () =>
+      reconcileWorkspaceInspectionIO(this.journal, authority, inspectionId),
+    );
+  }
+
+  private async withInspectionCustody<T>(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    body: () => Promise<T>,
+  ): Promise<T> {
+    const key = digestJson([authority.runId, identity.workspaceId, identity.workspaceGeneration]);
+    if (this.activeInspections.has(key))
+      throw new WorkspaceError(
+        "workspace_inspection_live",
+        "Do not reconcile a live workspace inspection",
+      );
+    this.activeInspections.add(key);
+    try {
+      return await body();
+    } finally {
+      this.activeInspections.delete(key);
+    }
+  }
+
+  /** Caller holds local inspection custody. An unknown stop or different target keeps its exclusion. */
+  private async settlePendingInspection(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    target: WorkspaceInspectionTarget,
+  ) {
+    const pending = this.journal.workspaceInspections.pending(authority.runId, identity);
+    if (pending && digestJson(pending.target) !== digestJson(target))
+      throw new WorkspaceError(
+        "workspace_inspection_conflict",
+        "A different inspection still owns this workspace",
+      );
+    return pending
+      ? reconcileWorkspaceInspectionIO(this.journal, authority, pending.inspectionId)
+      : null;
+  }
+
+  /** Commitment recovery may adopt its retained observation; materialization cannot use this path. */
+  private async reconcileCommitInspection(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    target: CommitInspectionTarget,
+    signal?: AbortSignal,
+    mode: CommitInspectionMode = "recover",
+  ): Promise<WorkspaceInspectionObservation> {
+    this.journal.assertAuthority(authority);
+    signal?.throwIfAborted();
+    const previous = this.journal.workspaceInspections.latestForCommit(
+      authority.runId,
+      identity,
+      target,
+    );
+    if (previous?.outcome && (mode === "recover" || previous.outcome === "observed"))
+      return this.inspectionObservation(previous);
+    return this.withInspectionCustody(authority, identity, async () => {
+      signal?.throwIfAborted();
+      const settled =
+        (previous?.outcome === null
+          ? await reconcileWorkspaceInspectionIO(this.journal, authority, previous.inspectionId)
+          : await this.settlePendingInspection(authority, identity, target)) ??
+        (await runWorkspaceInspectionIO(
+          this.journal,
+          authority,
+          this.journal.workspaceInspections.reserve(authority, this.root, identity, target),
+          signal,
+        ));
+      signal?.throwIfAborted();
+      return this.inspectionObservation(settled);
+    });
+  }
+
+  private inspectionObservation(settled: WorkspaceInspection): WorkspaceInspectionObservation {
+    if (settled.outcome !== "observed" || settled.workerResult?.status !== "observed")
+      throw new WorkspaceError(
+        "workspace_inspection_failed",
+        settled.detail ?? "Inspection has no retained observation",
+      );
+    return settled.workerResult.observation;
+  }
+
+  /** Fixed worker only. Its independent supervisor owns the entire inspection lifetime. */
+  async executeInspection(authority: ControllerAuthority, inspectionId: string) {
+    const record = this.journal.workspaceInspections.assertOwned(authority, inspectionId);
+    if (!record.execution) throw new Error("Inspection worker is not bound");
+    try {
+      let observation: WorkspaceInspectionObservation;
+      switch (record.target.kind) {
+        case "materialization":
+          observation = await this.inspectMaterializationStopped(authority, record);
+          break;
+        case "application_commit":
+          observation = await this.inspectCandidateCommitStopped(
+            authority,
+            this.journal.commits.record(authority.runId, record.target.commitId),
+          );
+          break;
+        case "tracker_commit":
+          observation = await this.inspectTrackerCommitStopped(
+            authority,
+            this.journal.trackerCommits.record(authority.runId, record.target.trackerCommitId),
+          );
+          break;
+      }
+      this.journal.workspaceInspections.recordResult(authority, inspectionId, {
+        status: "observed",
+        observation,
+      });
+    } catch (error) {
+      this.journal.workspaceInspections.recordResult(authority, inspectionId, {
+        status: "failed",
+        detail: error instanceof Error ? error.message : "Inspection failed",
+      });
+      throw error;
+    }
+  }
+
+  private async inspectMaterializationStopped(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+  ): Promise<Extract<WorkspaceInspectionObservation, { kind: "materialization" }>> {
+    // Custody is a prerequisite, not an observation about the copy's contents.
+    // Only a never-materialized reservation can legitimately have no directory.
+    const workspace = await this.owned(authority, identity, "reserved");
+    if (!workspace) return { kind: "materialization", ready: false, fingerprint: null };
+    const observation = await this.inspectMaterializationContents(workspace);
+    // A directory lost during the read must not turn a content error into negative evidence.
+    if (!(await this.owned(authority, identity, "reserved")))
+      throw new WorkspaceError("workspace_path_changed", "Workspace disappeared during inspection");
+    return observation;
+  }
+
+  private async inspectMaterializationContents(
+    workspace: WorkspaceRecord,
+  ): Promise<Extract<WorkspaceInspectionObservation, { kind: "materialization" }>> {
+    const incomplete = { kind: "materialization", ready: false, fingerprint: null } as const;
+    try {
+      const git = new KernelGit(workspace.path);
+      await this.assertPrivateGit(git);
+      if ((await git.text(["rev-parse", "HEAD"])).trim() !== workspace.baselineRevision)
+        return incomplete;
+      const entries = await this.treeEntries(git, workspace.baselineRevision);
+      await assertExpectedNamespace(workspace.path, new Set(entries.map((entry) => entry.path)));
+      const manifest = await this.readExpectedFiles(workspace.path, entries);
+      const actual = await this.scan(git, workspace.baselineRevision);
+      if (digestJson(manifest) !== digestJson(actual.map((file) => file.entry))) return incomplete;
+      return { kind: "materialization", ready: true, fingerprint: digestJson(manifest) };
+    } catch (error) {
+      // Here filesystem failures refer only to contents within established custody.
+      // Git execution, permission and unknown failures still establish no observation.
+      const missingEntry =
+        error instanceof Error &&
+        "code" in error &&
+        ["ENOENT", "ENOTDIR"].includes(String(error.code)) &&
+        "syscall" in error &&
+        ["lstat", "stat", "open", "scandir", "realpath", "readlink"].includes(
+          String(error.syscall),
+        );
+      if (error instanceof WorkspaceMismatch || missingEntry) return incomplete;
+      throw error;
+    }
   }
 
   /** Low-level trusted workspace primitive. Delivery capture uses the fixed worker below. */
@@ -703,11 +887,30 @@ export class WorkspaceManager {
     );
   }
 
-  async inspectTrackerCommit(
+  /** Recover retained tracker evidence; a new request may replace a settled failed inspection. */
+  async reconcileTrackerCommitInspection(
     authority: ControllerAuthority,
     input: TrackerCommitRecord,
     signal?: AbortSignal,
+    mode: CommitInspectionMode = "recover",
   ) {
+    const observation = await this.reconcileCommitInspection(
+      authority,
+      input,
+      { kind: "tracker_commit", trackerCommitId: input.trackerCommitId },
+      signal,
+      mode,
+    );
+    if (observation.kind !== "tracker_commit") throw new Error("Tracker inspection target differs");
+    const { kind: _kind, ...result } = observation;
+    return result;
+  }
+
+  private async inspectTrackerCommitStopped(
+    authority: ControllerAuthority,
+    input: TrackerCommitRecord,
+    signal?: AbortSignal,
+  ): Promise<Exclude<WorkspaceInspectionObservation, { kind: "materialization" }>> {
     const record = this.journal.trackerCommits.record(authority.runId, input.trackerCommitId);
     if (
       !this.journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId)
@@ -717,58 +920,61 @@ export class WorkspaceManager {
         "tracker_commit_io_unsettled",
         "Independently prove tracker commit I/O stopped before inspection",
       );
-    return this.exclusive(authority, record, "inspect_materialization", async () => {
-      const workspace = await this.assertTrackerCustody(authority, record, signal),
-        git = new KernelGit(workspace.path);
-      if (!record.revision)
-        return {
-          created: false,
-          sourceIntact: false,
-          detail: "No tracker commit write was admitted",
-        };
-      const ref = (
-        await git.text(
-          [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            `refs/epicd/tracker-commits/${record.trackerCommitId}`,
-          ],
-          { allowedExitCodes: [0, 1], ...optionalSignal(signal) },
-        )
-      ).trim();
-      if (ref && ref !== record.revision)
-        throw new WorkspaceError(
-          "tracker_commit_ref_changed",
-          "Tracker retention ref changed outside its intent",
-        );
-      const type = (
-        await git.text(["cat-file", "--batch-check"], {
-          input: `${record.revision}\n`,
-          ...optionalSignal(signal),
-        })
-      ).trim();
-      if (!ref && type === `${record.revision} missing`)
-        return {
-          created: false,
-          sourceIntact: false,
-          detail: "Tracker object and ref are absent after confirmed stop",
-        };
-      if (
-        type !== `${record.revision} commit ${Buffer.byteLength(record.objectContent!)}` ||
-        (await git.text(["cat-file", "commit", record.revision], optionalSignal(signal))) !==
-          record.objectContent
-      )
-        throw new WorkspaceError(
-          "tracker_commit_object_changed",
-          "Tracker object differs from its retained exact bytes",
-        );
+    const workspace = await this.assertTrackerCustody(authority, record, signal),
+      git = new KernelGit(workspace.path);
+    if (!record.revision)
       return {
-        created: !!ref,
-        sourceIntact: !!ref,
-        detail: ref ? null : "Tracker object exists without its retention ref; preserve it",
+        created: false,
+        sourceIntact: false,
+        detail: "No tracker commit write was admitted",
+        kind: "tracker_commit",
       };
-    });
+    const ref = (
+      await git.text(
+        [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          `refs/epicd/tracker-commits/${record.trackerCommitId}`,
+        ],
+        { allowedExitCodes: [0, 1], ...optionalSignal(signal) },
+      )
+    ).trim();
+    if (ref && ref !== record.revision)
+      throw new WorkspaceError(
+        "tracker_commit_ref_changed",
+        "Tracker retention ref changed outside its intent",
+      );
+    const type = (
+      await git.text(["cat-file", "--batch-check"], {
+        input: `${record.revision}\n`,
+        ...optionalSignal(signal),
+      })
+    ).trim();
+    if (!ref && type === `${record.revision} missing`)
+      return {
+        created: false,
+        sourceIntact: false,
+        detail: "Tracker object and ref are absent after confirmed stop",
+        kind: "tracker_commit",
+      };
+    if (
+      type !== `${record.revision} commit ${Buffer.byteLength(record.objectContent!)}` ||
+      (await git.text(["cat-file", "commit", record.revision], optionalSignal(signal))) !==
+        record.objectContent
+    )
+      throw new WorkspaceError(
+        "tracker_commit_object_changed",
+        "Tracker object differs from its retained exact bytes",
+      );
+    return ref
+      ? { kind: "tracker_commit", created: true, sourceIntact: true, detail: null }
+      : {
+          kind: "tracker_commit",
+          created: false,
+          sourceIntact: false,
+          detail: "Tracker object exists without its retention ref; preserve it",
+        };
   }
 
   private async assertTrackerCustody(
@@ -806,11 +1012,30 @@ export class WorkspaceManager {
   }
 
   /** Read-only reconciliation after independently confirmed I/O stop, including the object/ref crash window. */
-  async inspectCandidateCommit(
+  async reconcileCandidateCommitInspection(
     authority: ControllerAuthority,
     input: CommitRecord,
     signal?: AbortSignal,
-  ): Promise<{ created: boolean; sourceIntact: boolean; detail: string | null }> {
+    mode: CommitInspectionMode = "recover",
+  ) {
+    const observation = await this.reconcileCommitInspection(
+      authority,
+      input,
+      { kind: "application_commit", commitId: input.commitId },
+      signal,
+      mode,
+    );
+    if (observation.kind !== "application_commit")
+      throw new Error("Application inspection target differs");
+    const { kind: _kind, ...result } = observation;
+    return result;
+  }
+
+  private async inspectCandidateCommitStopped(
+    authority: ControllerAuthority,
+    input: CommitRecord,
+    signal?: AbortSignal,
+  ): Promise<Exclude<WorkspaceInspectionObservation, { kind: "materialization" }>> {
     const record = this.journal.commits.record(authority.runId, input.commitId);
     if (
       !this.journal.agents.workspaceOperation(authority.runId, record.workspaceOperationId)
@@ -820,70 +1045,72 @@ export class WorkspaceManager {
         "commit_io_unsettled",
         "An old commit exclusion cannot be cleared from Git state alone",
       );
-    return this.exclusive(authority, record, "inspect_materialization", async () => {
-      const workspace = await this.owned(authority, record);
-      this.assertStopped(workspace);
-      const git = new KernelGit(workspace.path);
-      await this.assertPrivateGit(git, signal);
-      if (!record.revision)
-        return {
-          created: false,
-          sourceIntact: false,
-          detail: "No commit-object write was admitted",
-        };
-      const retained = (
-        await git.text(
-          ["rev-parse", "--verify", "--quiet", `refs/epicd/commits/${record.commitId}`],
-          { allowedExitCodes: [0, 1], ...optionalSignal(signal) },
-        )
-      ).trim();
-      if (retained && retained !== record.revision)
-        throw new WorkspaceError(
-          "commit_ref_conflict",
-          "Private commit ref changed outside its intent",
-        );
-      const object = (
-        await git.text(["cat-file", "--batch-check"], {
-          input: `${record.revision}\n`,
-          ...optionalSignal(signal),
-        })
-      ).trim();
-      if (object === `${record.revision} missing` && !retained)
-        return {
-          created: false,
-          sourceIntact: false,
-          detail: "Commit object and retention ref are absent after confirmed stop",
-        };
-      if (
-        object !== `${record.revision} commit ${Buffer.byteLength(record.objectContent)}` ||
-        (await git.text(["cat-file", "commit", record.revision], optionalSignal(signal))) !==
-          record.objectContent
-      )
-        throw new WorkspaceError(
-          "commit_object_conflict",
-          "Private commit object differs from its reserved content",
-        );
-      if (!retained)
-        return {
-          created: false,
-          sourceIntact: false,
-          detail:
-            "Commit object exists but its retention ref was not installed; preserve the private object and recapture before retry",
-        };
-      const sourceIntact =
-        (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() ===
-          record.parentRevision &&
-        digestJson(
-          (await this.scan(git, record.parentRevision, signal)).map((file) => file.entry),
-        ) === record.fingerprint;
+    const workspace = await this.owned(authority, record);
+    this.assertStopped(workspace);
+    const git = new KernelGit(workspace.path);
+    await this.assertPrivateGit(git, signal);
+    if (!record.revision)
       return {
-        created: true,
-        sourceIntact,
-        detail: sourceIntact
-          ? null
-          : "Private commit exists, but its source changed after approval; recapture and review",
+        created: false,
+        sourceIntact: false,
+        detail: "No commit-object write was admitted",
+        kind: "application_commit",
       };
-    });
+    const retained = (
+      await git.text(
+        ["rev-parse", "--verify", "--quiet", `refs/epicd/commits/${record.commitId}`],
+        { allowedExitCodes: [0, 1], ...optionalSignal(signal) },
+      )
+    ).trim();
+    if (retained && retained !== record.revision)
+      throw new WorkspaceError(
+        "commit_ref_conflict",
+        "Private commit ref changed outside its intent",
+      );
+    const object = (
+      await git.text(["cat-file", "--batch-check"], {
+        input: `${record.revision}\n`,
+        ...optionalSignal(signal),
+      })
+    ).trim();
+    if (object === `${record.revision} missing` && !retained)
+      return {
+        created: false,
+        sourceIntact: false,
+        detail: "Commit object and retention ref are absent after confirmed stop",
+        kind: "application_commit",
+      };
+    if (
+      object !== `${record.revision} commit ${Buffer.byteLength(record.objectContent)}` ||
+      (await git.text(["cat-file", "commit", record.revision], optionalSignal(signal))) !==
+        record.objectContent
+    )
+      throw new WorkspaceError(
+        "commit_object_conflict",
+        "Private commit object differs from its reserved content",
+      );
+    if (!retained)
+      return {
+        created: false,
+        sourceIntact: false,
+        detail:
+          "Commit object exists but its retention ref was not installed; preserve the private object and recapture before retry",
+        kind: "application_commit",
+      };
+    const sourceIntact =
+      (await git.text(["rev-parse", "HEAD"], optionalSignal(signal))).trim() ===
+        record.parentRevision &&
+      digestJson(
+        (await this.scan(git, record.parentRevision, signal)).map((file) => file.entry),
+      ) === record.fingerprint;
+    return {
+      created: true,
+      sourceIntact,
+      kind: "application_commit",
+      detail: sourceIntact
+        ? null
+        : "Private commit exists, but its source changed after approval; recapture and review",
+    };
   }
 
   async read(
@@ -1236,12 +1463,12 @@ export class WorkspaceManager {
   private async assertPrivateGit(git: KernelGit, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     if ((await realpath(join(git.path, ".git"))) !== join(git.path, ".git"))
-      throw new WorkspaceError("shared_git_directory", "Managed Git directory is not private");
+      throw new WorkspaceMismatch("shared_git_directory", "Managed Git directory is not private");
     // Inspect metadata before asking Git to read it. In particular, do not honor an injected include.
     await rejectAliases(join(git.path, ".git"), signal);
     const config = (await regularBytes(join(git.path, ".git", "config"))).toString("utf8");
     if (config !== privateConfig("sha1") && config !== privateConfig("sha256"))
-      throw new WorkspaceError(
+      throw new WorkspaceMismatch(
         "git_config_changed",
         "Private Git configuration changed outside the kernel",
       );
@@ -1252,7 +1479,7 @@ export class WorkspaceManager {
       "shallow",
     ]) {
       if (await exists(join(git.path, ".git", name)))
-        throw new WorkspaceError(
+        throw new WorkspaceMismatch(
           "shared_object_store",
           "Managed object storage must be independent",
         );
@@ -1334,7 +1561,7 @@ export class WorkspaceManager {
       });
       if (!stat) continue;
       if (!stat.isFile() && !stat.isSymbolicLink())
-        throw new WorkspaceError("unsupported_file", `Unsupported candidate path: ${path}`);
+        throw new WorkspaceMismatch("unsupported_file", `Unsupported candidate path: ${path}`);
       const bytes = stat.isSymbolicLink()
         ? await readlink(absolute, { encoding: "buffer" })
         : await regularBytes(absolute);
@@ -1367,7 +1594,10 @@ export class WorkspaceManager {
             : "100644"
           : null;
       if (mode !== entry.mode)
-        throw new WorkspaceError("mode_mismatch", `Materialized file mode differs: ${entry.path}`);
+        throw new WorkspaceMismatch(
+          "mode_mismatch",
+          `Materialized file mode differs: ${entry.path}`,
+        );
       files.push(
         manifestEntry(
           entry,
@@ -1441,11 +1671,21 @@ export class WorkspaceManager {
     }
   }
 
+  private owned(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    access: "reserved",
+  ): Promise<WorkspaceRecord | null>;
+  private owned(
+    authority: ControllerAuthority,
+    identity: WorkspaceIdentity,
+    access?: "ready" | "diagnostic",
+  ): Promise<WorkspaceRecord>;
   private async owned(
     authority: ControllerAuthority,
     identity: WorkspaceIdentity,
     access: "ready" | "reserved" | "diagnostic" = "ready",
-  ): Promise<WorkspaceRecord> {
+  ): Promise<WorkspaceRecord | null> {
     this.journal.assertAuthority(authority);
     const workspace = this.journal.agents.workspace(authority.runId, identity);
     const expected = join(await realpath(this.root), authority.runId, workspace.workspaceId);
@@ -1460,7 +1700,26 @@ export class WorkspaceManager {
       );
     const retained = disposals.findLast((record) => record.outcome === "retained");
     const path = retained ? retainedWorkspacePath(retained) : workspace.path;
-    if (workspace.path !== expected || (await realpath(path)) !== path)
+    if (workspace.path !== expected)
+      throw new WorkspaceError(
+        "workspace_path_changed",
+        "Managed workspace path changed; preserve it",
+      );
+    const entry = await lstat(path).catch((error: unknown) => {
+      // Absence has meaning only at this exact reservation boundary, after root validation.
+      // A dangling symlink, a missing root or a lost registered directory is a custody failure.
+      if (
+        access === "reserved" &&
+        workspace.status === "reserved" &&
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      )
+        return null;
+      throw error;
+    });
+    if (!entry) return null;
+    if (!entry.isDirectory() || (await realpath(path)) !== path)
       throw new WorkspaceError(
         "workspace_path_changed",
         "Managed workspace path changed; preserve it",
@@ -1555,7 +1814,7 @@ async function assertExpectedNamespace(
       const stat = await lstat(absolute);
       if (stat.isDirectory()) await visit(absolute, path);
       else if (!expected.has(path))
-        throw new WorkspaceError(
+        throw new WorkspaceMismatch(
           "unexpected_file",
           "Unexpected file in materialized workspace; preserve it",
         );
@@ -1591,7 +1850,7 @@ async function safeParents(root: string, path: string, create = false): Promise<
       throw error;
     });
     if (stat && (!stat.isDirectory() || stat.isSymbolicLink()))
-      throw new WorkspaceError(
+      throw new WorkspaceMismatch(
         "unsafe_parent",
         "Candidate path has a non-directory or symbolic-link parent",
       );
@@ -1602,7 +1861,7 @@ async function regularBytes(path: string): Promise<Buffer> {
   try {
     const before = await handle.stat();
     if (!before.isFile() || before.nlink !== 1 || before.size > FILE_LIMIT)
-      throw new WorkspaceError(
+      throw new WorkspaceMismatch(
         "unsupported_file",
         "Candidate files must be unshared regular files no larger than 64 MiB",
       );
@@ -1632,11 +1891,14 @@ async function rejectAliases(root: string, signal?: AbortSignal): Promise<void> 
   const stat = await lstat(root);
   signal?.throwIfAborted();
   if (stat.isSymbolicLink())
-    throw new WorkspaceError("shared_git_directory", "Managed metadata contains a symbolic link");
+    throw new WorkspaceMismatch(
+      "shared_git_directory",
+      "Managed metadata contains a symbolic link",
+    );
   if (stat.isDirectory()) {
     for (const entry of await readdir(root)) await rejectAliases(join(root, entry), signal);
   } else if (!stat.isFile() || stat.nlink !== 1)
-    throw new WorkspaceError(
+    throw new WorkspaceMismatch(
       "shared_git_directory",
       "Managed metadata contains a shared or non-regular file",
     );

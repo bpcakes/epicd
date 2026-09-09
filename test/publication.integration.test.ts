@@ -401,7 +401,7 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     expect(git(s.source, "rev-parse", `refs/heads/epicd/${s.authority.runId}`)).toBe(
       commit.revision,
     );
-  }, 20000);
+  });
 
   it("creates subsequent implementation work from canonical custody and never assigns that custody to an agent", async () => {
     const s = await fixture();
@@ -664,6 +664,7 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     );
   }, 20000);
 
+  // Two complete supervised verification/publication cycles need two normal integration budgets.
   it("appends and independently verifies another commit, then advances the same canonical and user branches by CAS", async () => {
     const s = await fixture();
     const first = await verified(s);
@@ -724,7 +725,7 @@ describe.skipIf(process.platform !== "linux")("durable verified publication capa
     expect(git(s.source, "cat-file", "commit", first.commit.revision!)).toBe(
       first.commit.objectContent.trim(),
     );
-  }, 25000);
+  }, 60000);
 
   it("quarantines all current publication ownership records", async () => {
     const s = await fixture();

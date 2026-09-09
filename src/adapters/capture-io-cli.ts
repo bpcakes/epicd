@@ -1,22 +1,11 @@
-import { Socket } from "node:net";
+import { readWorkerRequest } from "./worker-request.js";
 import { StateStore } from "./store.js";
 import { WorkspaceManager } from "./workspaces.js";
 import { CaptureIORequestSchema, assertCaptureWorker } from "./capture-io.js";
 import { redactSensitiveText } from "../util/redact.js";
 
 async function work() {
-  const input = new Socket({ fd: 3, readable: true, writable: false });
-  let data = "";
-  try {
-    for await (const chunk of input) {
-      data += chunk.toString();
-      if (Buffer.byteLength(data) > 65_536)
-        throw new Error("Capture worker request exceeded its bound");
-    }
-  } finally {
-    input.destroy();
-  }
-  const request = CaptureIORequestSchema.parse(JSON.parse(data));
+  const request = CaptureIORequestSchema.parse(await readWorkerRequest("Capture worker request"));
   // Exact existing state only: attachment cannot adopt, initialize or migrate a file.
   const store = new StateStore(request.stateFile.path, request.stateFile);
   try {

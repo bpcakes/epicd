@@ -235,7 +235,21 @@ describe.skipIf(process.platform !== "linux")("complete workspace creation lifet
             status: "succeeded",
             result: { kind: "resource", resourceId: copy.workspaceId },
           });
-          expect(launches).not.toHaveBeenCalled();
+          // Creation is recovered from its original receipt. Current readiness is
+          // a separate supervised read, never a replay of the copying worker.
+          expect(launches).toHaveBeenCalledTimes(1);
+          expect(launches.mock.calls[0]![1].args).toEqual([
+            resolve("dist/adapters/workspace-inspection-io-cli.js"),
+          ]);
+          const inspections = journal.workspaceInspections.forWorkspace(f.authority.runId, copy);
+          expect(inspections).toHaveLength(1);
+          expect(inspections[0]).toMatchObject({
+            target: { kind: "materialization" },
+            outcome: "observed",
+            workerResult: { status: "observed", observation: { ready: true } },
+            stop: { kind: "stopped", code: 0 },
+          });
+          expect(launches.mock.calls[0]![0]).toEqual(inspections[0]!.execution);
           expect(
             journal.workspaceCreations.get(f.authority.runId, pending.creationId),
           ).toMatchObject({ outcome: "created", stop: receipt });

@@ -17,12 +17,13 @@ export function registerWorkspaceDisposalCapabilities(
     const creation = journal.workspaceCreations.forWorkspace(authority.runId, action);
     const view = {
       workspace,
+      ...journal.workspaceInspections.historyPreview(authority.runId, action),
       creation: creation
         ? {
             creationId: creation.creationId,
             operationId: creation.creationOperationId,
             outcome: creation.outcome,
-            workerResult: creation.workerResult,
+            workerResult: creation.workerResult ? { ...creation.workerResult } : null,
             stopConfirmed:
               creation.stop !== null ||
               (creation.execution === null && creation.outcome === "failed"),
@@ -37,6 +38,7 @@ export function registerWorkspaceDisposalCapabilities(
                     workspaceGeneration: creation.source.workspaceGeneration,
                   },
             detail: creation.detail,
+            detailsTruncated: false,
           }
         : null,
       disposals: disposals.slice(-20).map((record) => ({
@@ -48,19 +50,55 @@ export function registerWorkspaceDisposalCapabilities(
         retainedPath: record.outcome === "retained" ? retainedWorkspacePath(record) : null,
         sourcePathOccupied: record.sourcePathOccupied,
         detail: record.detail,
+        detailTruncated: false,
       })),
       omittedDisposals: Math.max(0, disposals.length - 20),
       warning:
-        "Disposal retains files and historical evidence, not fresh approval. Native endpoint/provider records remain intact; no pane closure or permanent deletion is implied. inspect_repo reads the original retained copy by workspace identity.",
+        "Disposal retains files and historical evidence, not fresh approval. Native endpoint/provider records remain intact; no pane closure or permanent deletion is implied. inspect_repo reads the original retained copy by workspace identity. Histories and diagnostics are bounded previews; inspect_record pages the complete retained records.",
     };
-    while (Buffer.byteLength(JSON.stringify(view)) > 64_000 && view.disposals.length) {
-      view.disposals.shift();
-      view.omittedDisposals += 1;
+    // Budget the assembled JSON, including escaping, rather than assuming that
+    // independently bounded fields fit together. Every optional section can shrink.
+    let text = JSON.stringify(view);
+    while (Buffer.byteLength(text) > 64_000) {
+      if (view.disposals.length > 1) {
+        view.disposals.shift();
+        view.omittedDisposals += 1;
+      } else if (view.inspections.length > 1) {
+        view.inspections.shift();
+        view.omittedInspections += 1;
+      } else if (
+        view.creation &&
+        (view.creation.detail?.length ||
+          (view.creation.workerResult?.status === "failed" &&
+            view.creation.workerResult.detail.length))
+      ) {
+        if (view.creation.detail)
+          view.creation.detail = view.creation.detail.slice(
+            0,
+            Math.floor(view.creation.detail.length / 2),
+          );
+        if (view.creation.workerResult?.status === "failed")
+          view.creation.workerResult.detail = view.creation.workerResult.detail.slice(
+            0,
+            Math.floor(view.creation.workerResult.detail.length / 2),
+          );
+        view.creation.detailsTruncated = true;
+      } else if (view.disposals[0]?.detail) {
+        const latest = view.disposals[0];
+        latest.detail = latest.detail!.slice(0, Math.floor(latest.detail!.length / 2));
+        latest.detailTruncated = true;
+      } else {
+        throw new CapabilityRejected(
+          "inspection_too_large",
+          "Workspace metadata exceeds the bounded inspection budget",
+        );
+      }
+      text = JSON.stringify(view);
     }
     return {
       kind: "inspection",
       artifactIds: [],
-      text: JSON.stringify(view),
+      text,
     };
   });
   kernel.registerExternal("dispose_workspace", async ({ authority, record, signal }, action) => {

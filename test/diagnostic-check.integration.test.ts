@@ -173,9 +173,38 @@ with socket.socket() as server, socket.socket() as client:
     )!;
     expect(evidence).toMatchObject({
       purpose: "diagnostic",
-      status: "finished",
-      outcome: { status: "cancelled", processTreeStopped: true },
+      status: "interrupted",
+      outcome: null,
     });
+    // Stopping the complete worker proves custody is released, not a retained check outcome.
+    const operation = f.s.journal.agents.workspaceOperation(
+      f.s.authority.runId,
+      evidence.workspaceOperationId,
+    );
+    expect(operation.executionStop).toMatchObject({ kind: "stopped", reason: "cancelled" });
+    expect(operation.stopEvidence).not.toBeNull();
+    expect(() =>
+      f.s.journal.delivery.finishValidation(
+        f.s.authority,
+        evidence.evidenceId,
+        {
+          status: "succeeded",
+          exitCode: 0,
+          signal: null,
+          stdout: "Late successful output",
+          stderr: "",
+          outputTruncated: false,
+          startedAt: evidence.createdAt,
+          endedAt: new Date().toISOString(),
+          processTreeStopped: true,
+        },
+        true,
+        true,
+      ),
+    ).toThrow("Only the bound running worker may retain its observed check outcome");
+    expect(f.s.journal.delivery.evidence(f.s.authority.runId, evidence.evidenceId)).toEqual(
+      evidence,
+    );
     expect(f.s.journal.delivery.satisfiesCheck(f.s.authority.runId, evidence.evidenceId)).toBe(
       false,
     );

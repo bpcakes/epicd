@@ -6,6 +6,7 @@ import type { Readable, Writable } from "node:stream";
 import { Socket } from "node:net";
 import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
 import { redactSensitiveText } from "../util/redact.js";
+import { readJsonRequest } from "./worker-request.js";
 import { z } from "zod";
 import {
   preparePrivateIO,
@@ -50,13 +51,9 @@ export const RepositoryIORequestSchema = z
 
 const entrypoint = fileURLToPath(new URL("repository-io-cli.js", import.meta.url));
 export async function readRepositoryIORequest(input: Readable) {
-  let data = "";
-  for await (const chunk of input) {
-    data += chunk.toString();
-    if (Buffer.byteLength(data) > 65_536)
-      throw new Error("Repository I/O request exceeded its bound");
-  }
-  return RepositoryIORequestSchema.parse(JSON.parse(data));
+  return RepositoryIORequestSchema.parse(
+    await readJsonRequest(input, 65_536, "Repository I/O request"),
+  );
 }
 
 /** Host supervisor. Entrypoint injection is for trusted process tests, not a model capability. */

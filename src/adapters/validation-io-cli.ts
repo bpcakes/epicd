@@ -1,4 +1,4 @@
-import { Socket } from "node:net";
+import { readWorkerRequest } from "./worker-request.js";
 import { StateStore } from "./store.js";
 import { WorkspaceManager } from "./workspaces.js";
 import { ValidationIORequestSchema, assertValidationWorker } from "./validation-io.js";
@@ -6,18 +6,9 @@ import { executeCandidateValidation } from "./validation.js";
 import { redactSensitiveText } from "../util/redact.js";
 
 async function work() {
-  const input = new Socket({ fd: 3, readable: true, writable: false });
-  let data = "";
-  try {
-    for await (const chunk of input) {
-      data += chunk.toString();
-      if (Buffer.byteLength(data) > 65_536)
-        throw new Error("Validation worker request exceeded its bound");
-    }
-  } finally {
-    input.destroy();
-  }
-  const request = ValidationIORequestSchema.parse(JSON.parse(data));
+  const request = ValidationIORequestSchema.parse(
+    await readWorkerRequest("Validation worker request"),
+  );
   // Exact existing file only. Attaching cannot initialize, adopt, or migrate state.
   const store = new StateStore(request.stateFile.path, request.stateFile);
   try {

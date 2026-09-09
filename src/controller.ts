@@ -169,6 +169,27 @@ export class OrchestratorController {
           });
         }
       }
+      // Reads own durable exclusions even when no parent action/agent was reserved.
+      // Drain them before parent recovery or settings can select a different workspace.
+      for (const inspection of journal.workspaceInspections.unsettled(this.runId)) {
+        try {
+          await workspaces.reconcileInspection(authority, inspection.inspectionId);
+        } catch (error) {
+          journal.assertAuthority(authority);
+          journal.appendObservation(authority, {
+            source: "controller",
+            sourceEventId: `inspection-${authority.leaseId}-${inspection.inspectionId}`,
+            kind: "recovery.unresolved",
+            summary: redactSensitiveText(
+              `Inspection ${inspection.inspectionId}: ${String(error)}`,
+              7999,
+            ),
+            identity: null,
+            artifactIds: [],
+            wakesOrchestrator: true,
+          });
+        }
+      }
       await reconcileActions(journal, authority, async (action) => {
         const delivery = await reconcileDeliveryAction(
           journal,

@@ -1,4 +1,4 @@
-import { Socket } from "node:net";
+import { readWorkerRequest } from "./worker-request.js";
 import { StateStore } from "./store.js";
 import {
   WorkspaceDisposalRequestSchema,
@@ -8,17 +8,7 @@ import { moveDisposedWorkspace } from "./workspace-disposal-files.js";
 import { redactSensitiveText } from "../util/redact.js";
 
 async function work() {
-  const input = new Socket({ fd: 3, readable: true, writable: false });
-  let bytes = "";
-  try {
-    for await (const chunk of input) {
-      bytes += chunk.toString();
-      if (Buffer.byteLength(bytes) > 65_536) throw new Error("Disposal request exceeded its bound");
-    }
-  } finally {
-    input.destroy();
-  }
-  const request = WorkspaceDisposalRequestSchema.parse(JSON.parse(bytes));
+  const request = WorkspaceDisposalRequestSchema.parse(await readWorkerRequest("Disposal request"));
   const store = new StateStore(request.stateFile.path, request.stateFile);
   try {
     const record = assertWorkspaceDisposalWorker(store.orchestration, request);

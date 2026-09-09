@@ -1,3 +1,4 @@
+import type { CommitInspectionMode } from "../domain/workspace-inspection.js";
 import type { ActionKernel } from "./actions.js";
 import type { ControllerAuthority } from "../domain/orchestration.js";
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
@@ -89,6 +90,7 @@ export async function reconcileCommit(
   authority: ControllerAuthority,
   commitId: string,
   signal?: AbortSignal,
+  inspectionMode: CommitInspectionMode = "recover",
 ) {
   journal.assertAuthority(authority);
   let record = journal.commits.record(authority.runId, commitId);
@@ -96,7 +98,12 @@ export async function reconcileCommit(
   await reconcileCommitIO(journal, authority, { kind: "application", commitId });
   record = journal.commits.record(authority.runId, commitId);
   if (["created", "failed"].includes(record.status)) return record;
-  const observed = await workspaces.inspectCandidateCommit(authority, record, signal);
+  const observed = await workspaces.reconcileCandidateCommitInspection(
+    authority,
+    record,
+    signal,
+    inspectionMode,
+  );
   return journal.commits.finish(
     authority,
     commitId,

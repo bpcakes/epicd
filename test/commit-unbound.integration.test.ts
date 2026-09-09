@@ -54,7 +54,7 @@ describe.skipIf(process.platform !== "linux")("unbound application commit recove
     const journal = f.reopen().orchestration;
     journal.markInterruptedActions(f.authority);
     const manager = new WorkspaceManager(journal, join(f.root, "managed"));
-    const inspections = vi.spyOn(manager, "inspectCandidateCommit");
+    const inspections = vi.spyOn(manager, "reconcileCandidateCommitInspection");
     const launches = vi.spyOn(lifetime, "startDurableCommand");
     const settled = await reconcileCommit(journal, manager, f.authority, pending.commitId);
     expect(settled).toMatchObject({ status: "failed", revision: null, sourceIntact: false });
@@ -127,7 +127,7 @@ describe.skipIf(process.platform !== "linux")("unbound application commit recove
         turnTimeoutMs: 30000,
       });
       const launches = vi.spyOn(lifetime, "startDurableCommand");
-      const inspections = vi.spyOn(manager, "inspectCandidateCommit");
+      const inspections = vi.spyOn(manager, "reconcileCandidateCommitInspection");
       await reconcileActions(
         journal,
         f.authority,
@@ -278,7 +278,7 @@ describe.skipIf(process.platform !== "linux")("unbound application commit recove
       expect(f.journal.control(f.authority.runId).controlVersion).toBe(version);
       expect(f.journal.latestObservationCursor(f.authority.runId)).toBe(cursor);
       db.exec("DROP TRIGGER deny_commit_cancel");
-      const inspections = vi.spyOn(f.manager, "inspectCandidateCommit");
+      const inspections = vi.spyOn(f.manager, "reconcileCandidateCommitInspection");
       expect(
         await reconcileCommit(f.journal, f.manager, f.authority, record.commitId),
       ).toMatchObject({ status: "failed", revision: null });

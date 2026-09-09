@@ -232,6 +232,7 @@ export const KernelActionSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({ kind: z.literal("dispose_workspace"), ...WorkspaceTarget }),
   z.strictObject({ kind: z.literal("inspect_workspace"), ...WorkspaceTarget }),
+  z.strictObject({ kind: z.literal("reconcile_workspace_inspection"), inspectionId: z.uuid() }),
   z.strictObject({
     kind: z.literal("run_validation"),
     ...WorkspaceTarget,

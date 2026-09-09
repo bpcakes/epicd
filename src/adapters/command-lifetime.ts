@@ -15,6 +15,7 @@ import {
 } from "../domain/command-lifetime.js";
 import { digestJson } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
+import { readJsonRequest } from "./worker-request.js";
 import { NamespaceStopUnprovenError, startNamespaceProcess } from "./pid-namespace.js";
 import {
   preparePrivateIO,
@@ -180,13 +181,9 @@ export async function superviseCommand() {
   process.stdout.on("error", stop);
   process.stderr.on("error", stop);
   try {
-    let data = "";
-    for await (const chunk of process.stdin) {
-      data += chunk.toString();
-      if (Buffer.byteLength(data) > 1_048_576)
-        throw new Error("Command supervisor request exceeded its bound");
-    }
-    const { intent, launch } = RequestSchema.parse(JSON.parse(data));
+    const { intent, launch } = RequestSchema.parse(
+      await readJsonRequest(process.stdin, 1_048_576, "Command supervisor request"),
+    );
     if (dirname(intent.directory.path) !== rootFor(launch.cwd))
       throw new Error("Command control storage differs from its admitted workspace");
     const directory = await openCommandIO(intent);

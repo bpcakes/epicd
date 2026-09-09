@@ -385,6 +385,48 @@ describe.runIf(process.platform === "linux")("recoverable workspace disposal", (
     },
   );
 
+  it("recovers a pending inspection explicitly after revocation before allowing disposal", async () => {
+    const f = await fixture();
+    const agent = f.reserveAgent();
+    const noReceipt = vi.spyOn(lifetime, "recoverCommandStop").mockResolvedValueOnce(null);
+    await expect(f.manager.inspectMaterialization(f.authority, f.workspace)).rejects.toThrow(
+      "no independent stop receipt",
+    );
+    noReceipt.mockRestore();
+    const pending = f.journal.workspaceInspections.pending(f.authority.runId, f.workspace)!;
+    expect(pending.workerResult).toMatchObject({
+      status: "observed",
+      observation: { ready: true },
+    });
+    f.journal.agents.revokeAgent(
+      f.authority,
+      agent,
+      "Revoke authority while preserving inspection custody",
+    );
+    const launches = vi.spyOn(lifetime, "startDurableCommand");
+    expect(await f.manager.inspectMaterialization(f.authority, f.workspace)).toBe("incomplete");
+    expect(f.journal.workspaceInspections.get(f.authority.runId, pending.inspectionId)).toEqual(
+      pending,
+    );
+    expect(await f.dispatch({ kind: "dispose_workspace", ...target(f.workspace) })).toMatchObject({
+      status: "rejected",
+      code: "workspace_busy",
+    });
+    const result = success(
+      await f.dispatch({
+        kind: "reconcile_workspace_inspection",
+        inspectionId: pending.inspectionId,
+      }),
+    );
+    if (result.kind !== "inspection") throw new Error("Expected retained inspection");
+    expect(JSON.parse(result.text)).toMatchObject({ outcome: "observed", stopConfirmed: true });
+    expect(launches).not.toHaveBeenCalled();
+    expect(f.journal.agents.workspace(f.authority.runId, f.workspace).status).toBe("quarantined");
+    expect(f.journal.agents.activeWorkspaceOperation(f.authority.runId, f.workspace)).toBeNull();
+    success(await f.dispatch({ kind: "dispose_workspace", ...target(f.workspace) }));
+    expect(f.journal.agents.workspace(f.authority.runId, f.workspace).status).toBe("disposed");
+  });
+
   it.each(["directory", "symlink"] as const)(
     "rejects a replaced source %s without moving either owner",
     async (kind) => {

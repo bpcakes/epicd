@@ -142,6 +142,7 @@ export function createAgentsSchema(db: Database.Database): void {
 type Access = {
   publicationPermitsWorkspaceStop(runId: string, operationId: string): boolean | null;
   creationPermitsWorkspaceStop(runId: string, operationId: string): boolean | null;
+  inspectionPermitsWorkspaceStop(runId: string, operationId: string): boolean | null;
   captureInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   validationInterruptedBeforeLaunch(runId: string, operationId: string): boolean;
   transaction<T>(authority: ControllerAuthority, body: () => T): T;
@@ -459,7 +460,14 @@ export class AgentJournal {
     expectedControlVersion: number,
   ): WorkspaceOperation {
     return this.access.transaction(authority, () => {
-      if (kind !== "inspect_materialization") this.active(authority, expectedControlVersion);
+      // inspect_materialization also covers commit/publication recovery reads.
+      // It requires current authority and exclusive custody, even when delivery is paused.
+      // Completion proves every operation stopped; it cannot admit a new recovery read.
+      if (
+        kind !== "inspect_materialization" ||
+        this.access.control(authority.runId).status === "complete"
+      )
+        this.active(authority, expectedControlVersion);
       const workspace = this.workspace(authority.runId, identity);
       const publication = this.access.publicationPending(authority.runId);
       if (
@@ -563,6 +571,10 @@ export class AgentJournal {
     return this.access.transaction(authority, () => {
       const operation = this.workspaceOperation(authority.runId, operationId);
       const creationStop = this.access.creationPermitsWorkspaceStop(authority.runId, operationId);
+      const inspectionStop = this.access.inspectionPermitsWorkspaceStop(
+        authority.runId,
+        operationId,
+      );
       const publicationStop = this.access.publicationPermitsWorkspaceStop(
         authority.runId,
         operationId,
@@ -576,6 +588,11 @@ export class AgentJournal {
         throw new AgentCoordinationError(
           "workspace_creation_unsettled",
           "The complete creation worker has not stopped; preserve every copy exclusion",
+        );
+      if (inspectionStop === false)
+        throw new AgentCoordinationError(
+          "workspace_inspection_unsettled",
+          "The complete inspection worker has not stopped; preserve its source exclusion",
         );
       const independentlyStopped = operation.execution !== null && operation.executionStop !== null;
       const unlaunchedValidation =
@@ -595,6 +612,7 @@ export class AgentJournal {
         operation.controllerLeaseId !== authority.leaseId &&
         !independentlyStopped &&
         creationStop !== true &&
+        inspectionStop !== true &&
         publicationStop !== true &&
         !unlaunchedValidation &&
         !unlaunchedCapture
@@ -641,6 +659,7 @@ export class AgentJournal {
       if (
         !["validation", "commit", "capture"].includes(operation.kind) ||
         this.access.creationPermitsWorkspaceStop(authority.runId, operationId) !== null ||
+        this.access.inspectionPermitsWorkspaceStop(authority.runId, operationId) !== null ||
         this.access.publicationPermitsWorkspaceStop(authority.runId, operationId) !== null ||
         operation.controllerLeaseId !== authority.leaseId ||
         operation.stopEvidence ||

@@ -90,12 +90,7 @@ export async function reconcileDiagnosticWorkspace(
       return unresolved();
     }
   }
-  if (
-    !workspace ||
-    workspace.activeTurnId ||
-    journal.agents.activeWorkspaceOperation(authority.runId, workspace)
-  )
-    return unresolved();
+  if (!workspace || workspace.activeTurnId) return unresolved();
   try {
     const base = source(journal, authority.runId, record.request.action);
     if (

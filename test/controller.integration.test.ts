@@ -157,6 +157,91 @@ function coordinatorCreations(store: StateStore, run: string) {
 // Real SQLite, private Git copies, SDK event parsing and supervised process stop.
 // Decision content is scripted; green does not establish Astra's delivery competence.
 describe.runIf(process.platform === "linux")("single orchestrator controller bootstrap", () => {
+  it.each(["unbound", "stopped", "missing_receipt"] as const)(
+    "recovers a %s orphaned bootstrap inspection after settings select a different coordinator",
+    async (phase) => {
+      const f = fixture(),
+        run = f.state.runId,
+        journal = f.store.orchestration;
+      const create = WorkspaceManager.prototype.create;
+      vi.spyOn(WorkspaceManager.prototype, "create").mockImplementationOnce(async function (
+        this: WorkspaceManager,
+        ...args
+      ) {
+        await create.apply(this, args);
+        throw new Error("Lost creation acknowledgement");
+      });
+      vi.spyOn(
+        journal.workspaceInspections,
+        phase === "missing_receipt" ? "recordStop" : "finish",
+      ).mockImplementation(() => {
+        throw new Error("Lost inspection settlement");
+      });
+      const reserve = journal.workspaceInspections.reserve.bind(journal.workspaceInspections);
+      vi.spyOn(journal.workspaceInspections, "reserve").mockImplementation((...args) => {
+        const record = reserve(...args);
+        if (phase === "unbound")
+          vi.spyOn(commandLifetime, "prepareCommandLifetime").mockRejectedValue(
+            new Error("No worker binding"),
+          );
+        return record;
+      });
+      await expect(
+        new OrchestratorController(f.store, run, { driver: f.driverFactory([]) }).run(),
+      ).rejects.toThrow("Lost inspection settlement");
+      vi.restoreAllMocks();
+      const pending = journal.workspaceInspections.unsettled(run)[0]!;
+      expect(pending).toMatchObject({ outcome: null, target: { kind: "materialization" } });
+      expect(pending.execution === null).toBe(phase === "unbound");
+      expect(journal.agents.instances(run)).toEqual([]);
+      const oldWorkspace = journal.agents.workspace(run, pending);
+      expect(journal.workspaceCreations.forWorkspace(run, oldWorkspace)?.actionId).toBeNull();
+      const preferences = structuredClone(f.state.agentSettings);
+      preferences.orchestrator.reasoningEffort = "xhigh";
+      f.store.updateAgentSettings(run, preferences);
+      journal.operatorControl(run, journal.control(run).controlVersion, {
+        kind: "respond",
+        escalationId: journal.pendingEscalation(run)!.escalationId,
+        message: "Continue with the new coordinator settings",
+      });
+      const launches = vi.spyOn(commandLifetime, "startDurableCommand");
+      const recoverStop = commandLifetime.recoverCommandStop;
+      const receiptFault =
+        phase === "missing_receipt"
+          ? vi
+              .spyOn(commandLifetime, "recoverCommandStop")
+              .mockImplementation((intent) =>
+                intent.operationId === pending.inspectionId
+                  ? Promise.resolve(null)
+                  : recoverStop(intent),
+              )
+          : null;
+      await new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run();
+      expect(journal.agents.instances(run)).toHaveLength(1);
+      expect(journal.agents.instances(run)[0]!.workspaceId).not.toBe(oldWorkspace.workspaceId);
+      if (receiptFault) {
+        expect(journal.workspaceInspections.get(run, pending.inspectionId)).toEqual(pending);
+        expect(journal.agents.activeWorkspaceOperation(run, oldWorkspace)?.stopEvidence).toBeNull();
+        expect(journal.control(run).status).toBe("awaiting_user");
+        receiptFault.mockRestore();
+        // A later startup recovers orphaned reads even without resuming delivery.
+        await new OrchestratorController(f.store, run, { driver: f.driverFactory([]) }).run();
+        expect(journal.control(run).status).toBe("awaiting_user");
+        expect(journal.agents.instances(run)).toHaveLength(1);
+      }
+      expect(journal.workspaceInspections.unsettled(run)).toEqual([]);
+      expect(journal.workspaceInspections.get(run, pending.inspectionId)).toMatchObject({
+        outcome: phase === "unbound" ? "failed" : "observed",
+        workerResult: pending.workerResult,
+      });
+      expect(journal.agents.activeWorkspaceOperation(run, oldWorkspace)).toBeNull();
+      expect(
+        launches.mock.calls.some(([intent]) => intent.operationId === pending.inspectionId),
+      ).toBe(false);
+      expect(readFileSync(join(oldWorkspace.path, "app.txt"), "utf8")).toBe("unchanged\n");
+    },
+  );
+
   it("starts the coordinator from a fresh copy after a proven failed creation, preserving the original copy and user bytes", async () => {
     const f = fixture(),
       run = f.state.runId,

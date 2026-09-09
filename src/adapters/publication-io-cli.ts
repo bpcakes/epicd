@@ -1,4 +1,4 @@
-import { Socket } from "node:net";
+import { readWorkerRequest } from "./worker-request.js";
 import { StateStore } from "./store.js";
 import { WorkspaceManager } from "./workspaces.js";
 import { PublicationAdapter } from "./publication.js";
@@ -6,18 +6,7 @@ import { PublicationIORequestSchema, assertPublicationWorker } from "./publicati
 import { redactSensitiveText } from "../util/redact.js";
 
 async function work() {
-  const input = new Socket({ fd: 3, readable: true, writable: false });
-  let data = "";
-  try {
-    for await (const chunk of input) {
-      data += chunk.toString();
-      if (Buffer.byteLength(data) > 65_536)
-        throw new Error("Publication request exceeded its bound");
-    }
-  } finally {
-    input.destroy();
-  }
-  const request = PublicationIORequestSchema.parse(JSON.parse(data));
+  const request = PublicationIORequestSchema.parse(await readWorkerRequest("Publication request"));
   const store = new StateStore(request.stateFile.path, request.stateFile);
   try {
     const { record } = assertPublicationWorker(store.orchestration, request);

@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { ControlledLaunches } from "../src/adapters/controlled-launch.js";
+import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import type { NativeLaunchEndpoint } from "../src/domain/codex-launch.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
@@ -312,6 +313,102 @@ describe("coordinator conversation accounting", () => {
 });
 
 describe("durable agent coordination", () => {
+  it.each(["active", "paused", "awaiting_user", "blocked"] as const)(
+    "admits and settles recovery inspections while %s",
+    (status) => {
+      const setup = fixture();
+      const workspace = setup.workspace();
+      if (status !== "active") setup.journal.changeStatus(setup.authority, status);
+      const inspection = setup.journal.workspaceInspections.reserve(
+        setup.authority,
+        join(setup.root, "workspaces"),
+        workspace,
+        { kind: "materialization" },
+      );
+      expect(setup.agents.activeWorkspaceOperation(setup.authority.runId, workspace)).toMatchObject(
+        {
+          operationId: inspection.workspaceOperationId,
+          stopEvidence: null,
+        },
+      );
+      // An unbound reservation settles by cancellation without starting a worker.
+      expect(
+        setup.journal.workspaceInspections.finish(setup.authority, inspection.inspectionId),
+      ).toMatchObject({ outcome: "failed", execution: null });
+      expect(setup.agents.activeWorkspaceOperation(setup.authority.runId, workspace)).toBeNull();
+      expect(setup.journal.control(setup.authority.runId).status).toBe(status);
+    },
+  );
+
+  it("rejects new inspection reservations after completion while retaining settled recovery", async () => {
+    const setup = fixture();
+    const workspace = setup.workspace();
+    const root = join(setup.root, "workspaces");
+    const inspection = setup.journal.workspaceInspections.reserve(
+      setup.authority,
+      root,
+      workspace,
+      { kind: "materialization" },
+    );
+    const settled = setup.journal.workspaceInspections.finish(
+      setup.authority,
+      inspection.inspectionId,
+    );
+    // Seed terminal control to isolate admission; this does not simulate delivery proof.
+    setup.db
+      .prepare("UPDATE orchestration_runs SET status = 'complete' WHERE run_id = ?")
+      .run(setup.authority.runId);
+    const control = setup.journal.control(setup.authority.runId);
+    const inspections = setup.db.prepare("SELECT * FROM workspace_inspections").all();
+    const operations = setup.db.prepare("SELECT * FROM workspace_operations").all();
+    const observations = setup.db.prepare("SELECT * FROM observations").all();
+
+    expect(() =>
+      setup.journal.workspaceInspections.reserve(setup.authority, root, workspace, {
+        kind: "materialization",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "run_not_active", message: "Run is complete" }));
+    expect(setup.db.prepare("SELECT * FROM workspace_inspections").all()).toEqual(inspections);
+    expect(setup.db.prepare("SELECT * FROM workspace_operations").all()).toEqual(operations);
+    expect(setup.db.prepare("SELECT * FROM observations").all()).toEqual(observations);
+    expect(setup.agents.activeWorkspaceOperation(setup.authority.runId, workspace)).toBeNull();
+    expect(
+      setup.journal.workspaceInspections.get(setup.authority.runId, inspection.inspectionId),
+    ).toEqual(settled);
+    const manager = new WorkspaceManager(setup.journal, root);
+    await expect(manager.inspectMaterialization(setup.authority, workspace)).rejects.toMatchObject({
+      code: "run_not_active",
+    });
+    expect(await manager.reconcileInspection(setup.authority, inspection.inspectionId)).toEqual(
+      settled,
+    );
+    expect(setup.journal.control(setup.authority.runId)).toEqual(control);
+  });
+
+  it.each(["capture", "validation", "publication"] as const)(
+    "keeps a %s operation's custody when readiness inspection is requested",
+    async (kind) => {
+      const setup = fixture();
+      const workspace = setup.workspace();
+      const operation = setup.agents.beginWorkspaceOperation(
+        setup.authority,
+        workspace,
+        kind,
+        setup.version(),
+      );
+      const manager = new WorkspaceManager(setup.journal, join(setup.root, "workspaces"));
+      await expect(
+        manager.inspectMaterialization(setup.authority, workspace),
+      ).rejects.toMatchObject({
+        code: "workspace_busy",
+      });
+      expect(setup.journal.workspaceInspections.records(setup.authority.runId)).toEqual([]);
+      expect(setup.agents.activeWorkspaceOperation(setup.authority.runId, workspace)).toEqual(
+        operation,
+      );
+    },
+  );
+
   it.each(["missing", "null", "different_path"] as const)(
     "rejects a %s materialized workspace identity without changing its stored record",
     (kind) => {
