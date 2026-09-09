@@ -2,7 +2,12 @@ import { resolve } from "node:path";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
-import { discoverHerdr, resolveExecutable, selectedCodexExecutable } from "./bootstrap.js";
+import {
+  discoverHerdrEffect,
+  resolveExecutableEffect,
+  selectedCodexExecutableEffect,
+  type HerdrEndpoint,
+} from "./adapters/runtime-discovery.js";
 import { verifyCodexExecutable } from "./adapters/codex-settings.js";
 import { ORCHESTRATOR_MODEL, type RuntimeKind } from "./domain/types.js";
 
@@ -19,7 +24,7 @@ export type DoctorReport = {
   orchestratorModel: typeof ORCHESTRATOR_MODEL;
   defaultReasoning: "high";
   fallback: false;
-  herdr: Awaited<ReturnType<typeof discoverHerdr>> | null;
+  herdr: HerdrEndpoint | null;
   warning: string;
 };
 
@@ -28,29 +33,30 @@ export class DoctorCheckFailed extends Data.TaggedError("DoctorCheckFailed")<{
   readonly cause: unknown;
 }> {}
 
-function check<A>(stage: DoctorCheckFailed["stage"], run: () => Promise<A>) {
-  return Effect.tryPromise({
-    try: run,
-    catch: (cause) => new DoctorCheckFailed({ stage, cause }),
-  });
-}
-
 /** Helpers own their deadlines; fiber interruption does not drain their underlying I/O. */
 export function doctorEffect(
   options: DoctorOptions,
 ): Effect.Effect<DoctorReport, DoctorCheckFailed> {
   return Effect.gen(function* () {
     const cwd = resolve(options.repoPath);
-    const executable = yield* check("select_executable", () =>
-      selectedCodexExecutable(options.runtime, options.codexPath),
+    const executable = yield* Effect.mapError(
+      selectedCodexExecutableEffect(options.runtime, options.codexPath),
+      ({ cause }) => new DoctorCheckFailed({ stage: "select_executable", cause }),
     );
-    const version = yield* check("verify_version", () =>
-      verifyCodexExecutable(cwd, { executablePath: executable, args: [] }),
-    );
+    const version = yield* Effect.tryPromise({
+      try: () => verifyCodexExecutable(cwd, { executablePath: executable, args: [] }),
+      catch: (cause) => new DoctorCheckFailed({ stage: "verify_version", cause }),
+    });
     let herdr: DoctorReport["herdr"] = null;
     if (options.runtime === "herdr") {
-      const herdrExecutable = yield* check("resolve_herdr", () => resolveExecutable("herdr"));
-      herdr = yield* check("discover_herdr", () => discoverHerdr(herdrExecutable, cwd));
+      const herdrExecutable = yield* Effect.mapError(
+        resolveExecutableEffect("herdr"),
+        ({ cause }) => new DoctorCheckFailed({ stage: "resolve_herdr", cause }),
+      );
+      herdr = yield* Effect.mapError(
+        discoverHerdrEffect(herdrExecutable, cwd),
+        ({ cause }) => new DoctorCheckFailed({ stage: "discover_herdr", cause }),
+      );
     }
     return {
       runtime: options.runtime,

@@ -1,10 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { access, readFile, realpath } from "node:fs/promises";
-import { constants } from "node:fs";
+import { readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { z } from "zod";
 import { KernelGit } from "./adapters/kernel-git.js";
 import { PublicationGit } from "./adapters/publication-git.js";
 import { KernelBeads } from "./adapters/kernel-beads.js";
@@ -19,106 +16,22 @@ import {
   type RunState,
   type RuntimeKind,
 } from "./domain/types.js";
-import { runCommand } from "./util/command.js";
 import { assertRuntimeHandoffReady } from "./adapters/runtime-handoff.js";
 import { RuntimeHandoffTargetSchema } from "./domain/runtime-handoff.js";
 import { RepositoryAdmission } from "./kernel/repository-admission.js";
+import {
+  discoverHerdr,
+  resolveExecutable,
+  selectedCodexExecutable,
+} from "./adapters/runtime-discovery.js";
 
-export async function resolveExecutable(value: string): Promise<string> {
-  if (!value.trim()) throw new Error("Executable cannot be empty");
-  const candidates =
-    isAbsolute(value) || value.includes("/")
-      ? [resolve(value)]
-      : (process.env.PATH ?? "")
-          .split(":")
-          .filter(Boolean)
-          .map((path) => join(path, value));
-  for (const candidate of candidates) {
-    try {
-      const path = await realpath(candidate);
-      await access(path, constants.X_OK);
-      return path;
-    } catch (error) {
-      if (!["ENOENT", "EACCES", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? ""))
-        throw error;
-    }
-  }
-  throw new Error(`Executable unavailable: ${value}`);
-}
-
-export async function sdkNativeExecutable(): Promise<string> {
-  if (process.platform !== "linux" || process.arch !== "x64")
-    throw new Error("Controlled runtime admission currently requires Linux x64");
-  const sdkRequire = createRequire(import.meta.resolve("@openai/codex-sdk"));
-  const manifest = sdkRequire.resolve("@openai/codex-linux-x64/package.json");
-  return resolveExecutable(join(dirname(manifest), "vendor/x86_64-unknown-linux-musl/bin/codex"));
-}
-
-/** Resolve the selected installation's current npm launcher to its native payload.
- * Never execute the JavaScript shim inside confinement or substitute the SDK's
- * installation when the selected installation is incomplete.
- */
-export async function selectedCodexExecutable(
-  runtime: RuntimeKind,
-  override?: string,
-): Promise<string> {
-  if (!override && runtime === "sdk") return sdkNativeExecutable();
-  const entry = await resolveExecutable(override ?? "codex");
-  if (basename(entry) !== "codex.js") return entry;
-  if (process.platform !== "linux" || process.arch !== "x64")
-    throw new Error("Controlled runtime admission currently requires Linux x64");
-  const manifestPath = join(dirname(entry), "..", "package.json");
-  const manifest = z
-    .object({
-      name: z.literal("@openai/codex"),
-      bin: z.object({ codex: z.literal("bin/codex.js") }),
-    })
-    .safeParse(JSON.parse(await readFile(manifestPath, "utf8")));
-  if (!manifest.success || dirname(entry).split("/").at(-1) !== "bin")
-    throw new Error("Select a native Codex binary or its supported npm entrypoint");
-  let nativeManifest: string;
-  try {
-    nativeManifest = createRequire(entry).resolve("@openai/codex-linux-x64/package.json");
-  } catch (error) {
-    throw new Error(
-      "The selected Codex installation has no native Linux x64 dependency; no installation fallback was attempted",
-      { cause: error },
-    );
-  }
-  return resolveExecutable(
-    join(dirname(nativeManifest), "vendor/x86_64-unknown-linux-musl/bin/codex"),
-  );
-}
-
-/** Read-only caller discovery. Never infer a workspace from focus or create a session here. */
-export async function discoverHerdr(executable: string, cwd: string) {
-  if (process.env.HERDR_ENV !== "1")
-    throw new Error("Native Herdr requires a Herdr-managed caller (HERDR_ENV=1)");
-  const read = async (args: string[]) =>
-    (await runCommand(executable, args, { cwd, timeoutMs: 10_000 })).stdout;
-  const status = await read(["status", "server"]);
-  const socket = /^socket:\s*(.+)$/m.exec(status)?.[1]?.trim();
-  if (!socket || !/^compatible:\s*yes\s*$/m.test(status))
-    throw new Error("Herdr server endpoint or protocol compatibility could not be verified");
-  const sessions = z
-    .object({
-      sessions: z.array(
-        z.object({
-          name: z.string(),
-          running: z.boolean(),
-          socket_path: z.string(),
-        }),
-      ),
-    })
-    .parse(JSON.parse(await read(["session", "list", "--json"]))).sessions;
-  const matching = sessions.filter((session) => session.running && session.socket_path === socket);
-  if (matching.length !== 1)
-    throw new Error("Cannot identify the caller's exact named Herdr session");
-  const pane = z
-    .object({ result: z.object({ pane: z.object({ workspace_id: z.string().min(1) }) }) })
-    .parse(JSON.parse(await read(["pane", "current", "--current"])));
-  return { executable, sessionName: matching[0]!.name, workspaceId: pane.result.pane.workspace_id };
-}
+// Retain existing Promise imports while discovery callers migrate to Effect.
+export {
+  discoverHerdr,
+  resolveExecutable,
+  sdkNativeExecutable,
+  selectedCodexExecutable,
+} from "./adapters/runtime-discovery.js";
 
 export type CreateRunOptions = {
   repoPath: string;

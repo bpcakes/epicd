@@ -13,7 +13,13 @@ import { fileURLToPath } from "node:url";
 
 /** Real discovery commands with no model, external endpoint, or host PATH dependency. */
 export function doctorFixture(
-  options: { versionFails?: boolean; incompatible?: boolean; ambiguous?: boolean } = {},
+  options: {
+    versionFails?: boolean;
+    incompatible?: boolean;
+    ambiguous?: boolean;
+    malformedSessions?: boolean;
+    invalidPane?: boolean;
+  } = {},
 ) {
   const root = mkdtempSync("/var/tmp/epicd-doctor-");
   const repo = join(root, "repository with spaces");
@@ -35,8 +41,13 @@ ${options.versionFails ? "printf '%s\\n' 'token=doctor-test-secret version unava
   );
   const herdr = join(bin, "herdr");
   const session = { name: "owned", running: true, socket_path: "/fixture/socket" };
-  const sessions = JSON.stringify({
-    sessions: options.ambiguous ? [session, { ...session, name: "other" }] : [session],
+  const sessions = options.malformedSessions
+    ? "{"
+    : JSON.stringify({
+        sessions: options.ambiguous ? [session, { ...session, name: "other" }] : [session],
+      });
+  const pane = JSON.stringify({
+    result: { pane: { workspace_id: options.invalidPane ? "" : "fixture-workspace" } },
   });
   writeFileSync(
     herdr,
@@ -45,7 +56,7 @@ printf '%s\\n' "herdr $*" >> "$EPICD_DOCTOR_LOG"
 case "$*" in
   'status server') printf 'compatible: ${options.incompatible ? "no" : "yes"}\\nsocket: /fixture/socket\\n';;
   'session list --json') printf '%s\\n' '${sessions}';;
-  'pane current --current') printf '%s\\n' '{"result":{"pane":{"workspace_id":"fixture-workspace"}}}';;
+  'pane current --current') printf '%s\\n' '${pane}';;
   *) exit 9;;
 esac
 `,

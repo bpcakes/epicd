@@ -1,8 +1,8 @@
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
-import * as bootstrap from "../src/bootstrap.js";
+import * as discovery from "../src/adapters/runtime-discovery.js";
 import * as codexSettings from "../src/adapters/codex-settings.js";
 import { doctorEffect, runDoctor, type DoctorCheckFailed } from "../src/doctor.js";
 import { doctorFixture } from "./fixtures/doctor.js";
@@ -23,22 +23,40 @@ describe("doctor Effect boundary", () => {
   ] satisfies { stage: DoctorCheckFailed["stage"]; cause: unknown }[])(
     "retains $stage failures lazily, short-circuits, and preserves the Promise rejection",
     async ({ stage, cause }) => {
-      // Fault injection is limited to existing I/O helpers; the Effect program runs normally.
+      // Inject failures at discovery boundaries; real discovery is covered below and in its own tests.
       const stages = {
         select_executable: vi
-          .spyOn(bootstrap, "selectedCodexExecutable")
-          .mockResolvedValue("/fixture/codex"),
+          .spyOn(discovery, "selectedCodexExecutableEffect")
+          .mockReturnValue(Effect.succeed("/fixture/codex")),
         verify_version: vi
           .spyOn(codexSettings, "verifyCodexExecutable")
           .mockResolvedValue("fixture"),
-        resolve_herdr: vi.spyOn(bootstrap, "resolveExecutable").mockResolvedValue("/fixture/herdr"),
-        discover_herdr: vi.spyOn(bootstrap, "discoverHerdr").mockResolvedValue({
-          executable: "/fixture/herdr",
-          sessionName: "owned",
-          workspaceId: "fixture-workspace",
-        }),
+        resolve_herdr: vi
+          .spyOn(discovery, "resolveExecutableEffect")
+          .mockReturnValue(Effect.succeed("/fixture/herdr")),
+        discover_herdr: vi.spyOn(discovery, "discoverHerdrEffect").mockReturnValue(
+          Effect.succeed({
+            executable: "/fixture/herdr",
+            sessionName: "owned",
+            workspaceId: "fixture-workspace",
+          }),
+        ),
       };
-      stages[stage].mockRejectedValue(cause);
+      if (stage === "verify_version") stages.verify_version.mockRejectedValue(cause);
+      else
+        stages[stage].mockReturnValue(
+          Effect.fail(
+            new discovery.RuntimeDiscoveryError({
+              operation:
+                stage === "select_executable"
+                  ? "select_codex"
+                  : stage === "resolve_herdr"
+                    ? "resolve_executable"
+                    : "discover_herdr",
+              cause,
+            }),
+          ),
+        );
       const options = { repoPath: "/fixture", runtime: "herdr" as const };
       const program = doctorEffect(options);
       for (const helper of Object.values(stages)) expect(helper).not.toHaveBeenCalled();
@@ -72,6 +90,23 @@ function fixture(options: Parameters<typeof doctorFixture>[0] = {}) {
 }
 
 describe.runIf(process.platform === "linux")("read-only doctor", () => {
+  it.runIf(process.arch === "x64")(
+    "uses the SDK native binary by default instead of Codex on PATH",
+    async () => {
+      const f = fixture();
+      const before = f.snapshot();
+      const report = await runDoctor({ repoPath: f.repo, runtime: "sdk" });
+      expect(report.executable).not.toBe(f.codex);
+      expect(readFileSync(report.executable).subarray(0, 4)).toEqual(
+        Buffer.from([0x7f, 0x45, 0x4c, 0x46]),
+      );
+      expect(report.version).toContain("codex-cli");
+      expect(report.herdr).toBeNull();
+      expect(f.calls()).toEqual([]);
+      expect(f.snapshot()).toEqual(before);
+    },
+  );
+
   it("reports the selected SDK executable once without inspecting Herdr or changing files", async () => {
     const f = fixture();
     const before = f.snapshot();

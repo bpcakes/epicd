@@ -12,6 +12,26 @@ afterEach(() => {
   for (const close of cleanup.splice(0).reverse()) close();
 });
 describe.runIf(process.platform === "linux")("doctor CLI", () => {
+  it("serializes the exact Herdr endpoint after ordered discovery", () => {
+    const f = doctorFixture();
+    cleanup.push(f.cleanup);
+    const before = f.snapshot();
+    const result = f.cli("herdr");
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      runtime: "herdr",
+      executable: f.codex,
+      herdr: { executable: f.herdr, sessionName: "owned", workspaceId: "fixture-workspace" },
+    });
+    expect(f.calls()).toEqual([
+      "codex --version",
+      "herdr status server",
+      "herdr session list --json",
+      "herdr pane current --current",
+    ]);
+    expect(f.snapshot()).toEqual(before);
+  });
+
   it("prints the read-only report as JSON without creating state", () => {
     const f = doctorFixture();
     cleanup.push(f.cleanup);

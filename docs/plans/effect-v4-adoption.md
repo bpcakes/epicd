@@ -3,7 +3,8 @@
 Investigated 2026-09-09 on `feature/always-engaged-orchestrator`, at HEAD
 `2ec237f`, including the existing uncommitted workspace-inspection and recovery
 changes. Steps 1 and 2 are now implemented on top of `9e66f49`; see the
-implementation record below. The broader adoption sections remain proposals.
+implementation records below. Shared runtime discovery is also implemented;
+the controller and resource-lifetime sections remain proposals.
 
 Start with the read-only `doctor` command. Use it to establish a small typed
 Effect program behind the existing Promise API. Then consider a single scoped
@@ -209,3 +210,42 @@ Adding acquisition, typed read/close failures and a Promise bridge would expand
 that function without a current composed Effect consumer. Revisit it when a
 larger read-only Effect operation can own the scope. Controller concurrency and
 durable recovery remain future work.
+
+## Shared runtime discovery, 2026-09-09
+
+The next slice on `chore/effects-v4` moves executable resolution, SDK native
+selection, selected-installation validation, and Herdr discovery into
+`src/adapters/runtime-discovery.ts`. Each operation has a lazy `*Effect` function.
+Filesystem calls, JSON parsing, Zod validation, and command failures enter the
+typed `RuntimeDiscoveryError` channel with their operation and original cause.
+The operation identifies the public discovery API: both Codex selection APIs
+report `select_codex`, including delegated executable-resolution failures.
+Direct executable resolution reports `resolve_executable`, and Herdr discovery
+reports `discover_herdr`. Normalizing the operation preserves the original cause.
+
+Doctor now composes those Effects directly. The discovery module also exposes
+Promise adapters, re-exported from bootstrap to preserve existing callers.
+Bootstrap and handoff retain their check order; no discovery step executes a
+nested Effect runtime. Promise boundaries preserve original rejection values,
+and doctor retains its four existing failure stages.
+
+The command runners still own deadlines and process cleanup. No services, layers,
+new dependencies, retries, or cancellation guarantees were introduced. Zod and
+the persistent state format are unchanged.
+
+Tests add the default SDK doctor path and successful Herdr CLI serialization,
+plus direct discovery checks for lazy PATH resolution, expected candidate
+fallback, unexpected filesystem failures, invalid npm manifests, malformed
+Herdr responses, and original command rejection identity. The baseline with
+the new doctor/CLI cases passed 54 tests across doctor, CLI, bootstrap, and
+runtime handoff before extraction.
+
+Four additional regression cases cover the public operation label for explicit
+entrypoint, SDK payload, default SDK selection, and selected npm payload failures,
+including original cause identity through normalization and Promise rejection.
+
+After extraction and operation-label normalization, all 69 tests passed across those four files plus
+`test/runtime-discovery.test.ts`. Build, typecheck, repository formatting, and
+diff checks passed. The build ran before typechecking and integration tests
+because some tests import compiled `dist` modules. The full suite and
+authenticated runtime acceptance were not run for this slice.
