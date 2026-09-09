@@ -4,9 +4,9 @@ import { resolve } from "node:path";
 import { Command, Option } from "commander";
 import { render } from "ink";
 import { StateStore, defaultStatePath } from "./adapters/store.js";
-import { createRun, handoffRuntime } from "./bootstrap.js";
-import { bindFixtureExecutable, bindFixtureProvider } from "./adapters/fixtures.js";
+import { createRun } from "./bootstrap.js";
 import { FixtureOperationSchema } from "./domain/fixtures.js";
+import { RunOperator, type OperatorRequest } from "./operator-controls.js";
 import { OrchestratorController } from "./controller.js";
 import {
   AgentRoleSchema,
@@ -17,6 +17,7 @@ import {
 } from "./domain/types.js";
 import { humanRunStatus, runStatusView } from "./status.js";
 import { RunView } from "./tui/run-view.js";
+import { OperatorView } from "./tui/operator-view.js";
 import { runDoctor } from "./doctor.js";
 import { redactSensitiveText } from "./util/redact.js";
 
@@ -46,6 +47,11 @@ async function withStore<T>(
   } finally {
     store.close();
   }
+}
+async function operatorCommand(options: BaseOptions, runId: string, request: OperatorRequest) {
+  return withStore(options, async (store) => {
+    process.stdout.write((await new RunOperator(store, runId).submit(request)) + "\n");
+  });
 }
 async function launch(store: StateStore, runId: string, options: LaunchOptions) {
   const controller = new OrchestratorController(store, runId);
@@ -91,6 +97,49 @@ export function createProgram() {
     .version("0.1.0");
   stateOption(
     program
+      .command("control <run-id>")
+      .description("Open an operator console for an existing run; never starts a controller"),
+  ).action(async (runId: string, options: BaseOptions) => {
+    if (!process.stdin.isTTY || !process.stdout.isTTY)
+      throw new Error(
+        "The operator console requires an interactive terminal; use explicit CLI commands otherwise",
+      );
+    await withStore(options, async (store) => {
+      const operator = new RunOperator(store, runId);
+      operator.status(); // Validate the selected run before mounting a terminal UI.
+      const cancellation = new AbortController();
+      let ui: ReturnType<typeof render> | undefined;
+      const close = () => {
+        cancellation.abort(new Error("Operator console closed"));
+        ui?.unmount();
+      };
+      const controls = {
+        status: () => operator.status(),
+        submit: (request: OperatorRequest) => operator.submit(request, cancellation.signal),
+      };
+      process.once("SIGINT", close);
+      process.once("SIGTERM", close);
+      try {
+        ui = render(<OperatorView controls={controls} close={close} />, {
+          exitOnCtrlC: false,
+          // This command requires real terminal input/output above. CI detection
+          // must not silently hide an explicitly requested interactive console.
+          interactive: true,
+        });
+        await ui.waitUntilExit();
+      } finally {
+        close();
+        process.off("SIGINT", close);
+        process.off("SIGTERM", close);
+        await operator.settle(); // Never close SQLite under asynchronous binding or handoff.
+      }
+      process.stdout.write(
+        "Operator console closed. No controller was started. Inspect status for committed requests.\n",
+      );
+    });
+  });
+  stateOption(
+    program
       .command("grant-fixture-validation <run-id> <fixture-id>")
       .description(
         "Grant checked SQL use of a declared disposable database and its dedicated role; separate from creation authority",
@@ -105,21 +154,12 @@ export function createProgram() {
         fixtureId: string,
         options: BaseOptions & { controlVersion: number; expiresAt: string; psqlPath: string },
       ) =>
-        withStore(options, async (store) => {
-          const fixtures = store.orchestration.fixtures,
-            definition = fixtures.definition(runId, fixtureId),
-            policy = fixtures.validation.policy(runId, fixtureId);
-          const binding = await bindFixtureProvider(definition, resolve(options.psqlPath));
-          const pgbouncer = await bindFixtureExecutable(policy.pgbouncerExecutable);
-          const grant = fixtures.validation.grant(runId, options.controlVersion, {
-            fixtureId,
-            binding,
-            pgbouncer,
-            expiresAt: options.expiresAt,
-          });
-          process.stdout.write(
-            `SQL-access grant ${grant.grantId} recorded; no server query or adoption occurred. Runtime still requires owned creation and restricted-role checks.\n`,
-          );
+        operatorCommand(options, runId, {
+          kind: "grant_sql",
+          fixtureId,
+          controlVersion: options.controlVersion,
+          expiresAt: options.expiresAt,
+          psqlPath: options.psqlPath,
         }),
     );
   stateOption(
@@ -130,11 +170,10 @@ export function createProgram() {
     .requiredOption("--control-version <number>", "version observed in status", versionNumber)
     .action(
       async (runId: string, grantId: string, options: BaseOptions & { controlVersion: number }) =>
-        withStore(options, (store) => {
-          store.orchestration.fixtures.validation.revoke(runId, options.controlVersion, grantId);
-          process.stdout.write(
-            "SQL access revoked. Resource exclusions remain until local and remote stop are proven.\n",
-          );
+        operatorCommand(options, runId, {
+          kind: "revoke_sql",
+          grantId,
+          controlVersion: options.controlVersion,
         }),
     );
   stateOption(
@@ -165,22 +204,15 @@ export function createProgram() {
           psqlPath: string;
         },
       ) =>
-        withStore(options, async (store) => {
-          const journal = store.orchestration;
-          const operations = options.operations
+        operatorCommand(options, runId, {
+          kind: "grant_fixture",
+          fixtureId,
+          controlVersion: options.controlVersion,
+          operations: options.operations
             .split(",")
-            .map((value) => FixtureOperationSchema.parse(value.trim()));
-          const definition = journal.fixtures.definition(runId, fixtureId);
-          const binding = await bindFixtureProvider(definition, resolve(options.psqlPath));
-          const grant = journal.fixtures.grant(runId, options.controlVersion, {
-            fixtureId,
-            binding,
-            operations,
-            expiresAt: options.expiresAt,
-          });
-          process.stdout.write(
-            `Grant ${grant.grantId} recorded for ${fixtureId}, expiring ${grant.expiresAt}. No database mutation or test-service access occurred.\n`,
-          );
+            .map((value) => FixtureOperationSchema.parse(value.trim())),
+          expiresAt: options.expiresAt,
+          psqlPath: options.psqlPath,
         }),
     );
   stateOption(
@@ -191,11 +223,10 @@ export function createProgram() {
     .requiredOption("--control-version <number>", "version observed in status", versionNumber)
     .action(
       async (runId: string, grantId: string, options: BaseOptions & { controlVersion: number }) =>
-        withStore(options, (store) => {
-          store.orchestration.fixtures.revoke(runId, options.controlVersion, grantId);
-          process.stdout.write(
-            "Fixture grant revoked. No resource was removed; a stop request is not proof that in-flight I/O stopped.\n",
-          );
+        operatorCommand(options, runId, {
+          kind: "revoke_fixture",
+          grantId,
+          controlVersion: options.controlVersion,
         }),
     );
   runtimeOption(
@@ -266,11 +297,12 @@ export function createProgram() {
           herdrPath?: string;
         },
       ) =>
-        withStore(options, async (store) => {
-          const state = await handoffRuntime(store, runId, options);
-          process.stdout.write(
-            `Runtime ${state.runtime} recorded. Stopped conversations are retired; evidence, memory, budgets and resources are retained. No model started and no pending question was answered. Inspect status, then resume this run.\n`,
-          );
+        operatorCommand(options, runId, {
+          kind: "handoff",
+          runtime: options.runtime,
+          controlVersion: options.controlVersion,
+          ...(options.codexPath ? { codexPath: options.codexPath } : {}),
+          ...(options.herdrPath ? { herdrPath: options.herdrPath } : {}),
         }),
     );
   stateOption(
@@ -314,12 +346,7 @@ export function createProgram() {
   )
     .requiredOption("--control-version <number>", "version observed in status", versionNumber)
     .action(async (runId: string, options: BaseOptions & { controlVersion: number }) =>
-      withStore(options, (store) => {
-        store.orchestration.operatorControl(runId, options.controlVersion, { kind: "pause" });
-        process.stdout.write(
-          "Pause recorded. External work is not considered stopped until its runtime receipt confirms it.\n",
-        );
-      }),
+      operatorCommand(options, runId, { kind: "pause", controlVersion: options.controlVersion }),
     );
   stateOption(
     program
@@ -338,15 +365,11 @@ export function createProgram() {
         message: string,
         options: BaseOptions & { controlVersion: number },
       ) =>
-        withStore(options, (store) => {
-          store.orchestration.operatorControl(runId, options.controlVersion, {
-            kind: "respond",
-            escalationId,
-            message,
-          });
-          process.stdout.write(
-            `Response recorded. Run epicd resume ${runId} --state ${options.state} to attach a controller.\n`,
-          );
+        operatorCommand(options, runId, {
+          kind: "respond",
+          escalationId,
+          message,
+          controlVersion: options.controlVersion,
         }),
     );
   stateOption(

@@ -10,6 +10,7 @@ import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { RepositoryAdmission } from "../src/kernel/repository-admission.js";
 import { runRepositoryIO } from "../dist/adapters/repository-io.js";
 import { handoffRuntime } from "../src/bootstrap.js";
+import { RunOperator } from "../src/operator-controls.js";
 import * as codexSettings from "../src/adapters/codex-settings.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import { SdkAgentSessionContractSchema, resolveAgentRoleSettings } from "../src/domain/types.js";
@@ -152,6 +153,40 @@ async function fixture() {
 }
 
 describe.runIf(process.platform === "linux")("explicit current-format runtime handoff", () => {
+  it("uses the operator-console boundary for stopped native handoff without starting or answering work", async () => {
+    const f = await fixture(),
+      run = f.state.runId;
+    const escalationId = f.journal.setEscalation(
+      f.authority,
+      "Need operator judgment",
+      "judgment",
+      [],
+    );
+    f.detach();
+    vi.stubEnv("HERDR_ENV", "1");
+    const before = f.store.get(run)!;
+    const operator = new RunOperator(f.store, run);
+    await expect(
+      operator.submit({
+        kind: "handoff",
+        runtime: "herdr",
+        controlVersion: f.version(),
+        codexPath: f.codex,
+        herdrPath: f.herdr,
+      }),
+    ).resolves.toContain("No model started");
+    expect(f.store.get(run)!.runtime).toBe("herdr");
+    expect(f.store.get(run)!.agentSettings).toEqual(before.agentSettings);
+    expect(f.journal.pendingEscalation(run)?.escalationId).toBe(escalationId);
+    expect(f.journal.agents.turns(run)).toEqual([]);
+    expect(f.store.controllerLease(run)).toBeNull();
+    expect(readFileSync(f.commands, "utf8").trim().split("\n")).toEqual([
+      "status server",
+      "session list --json",
+      "pane current --current",
+    ]);
+  });
+
   it("cold-switches SDK to Herdr to SDK without sharing conversations, refilling budgets or changing user work", async () => {
     const f = await fixture(),
       run = f.state.runId;

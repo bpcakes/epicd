@@ -40,6 +40,7 @@ export function runStatusView(store: StateStore, runId: string) {
     diagnostics: journal.diagnostics.summary(runId),
     fixtures: {
       declarations: journal.policy(runId).fixtures,
+      validationPolicies: journal.policy(runId).fixtureValidation,
       authority: journal.fixtures.summary(runId),
     },
     validationServices: journal.policy(runId).validationServices,

@@ -25,6 +25,19 @@ function fixture() {
   return { store, state, cli };
 }
 describe("hard-cut CLI", () => {
+  it("offers a separate operator console and refuses noninteractive input without changing the run", () => {
+    const f = fixture();
+    const help = f.cli("control", "--help");
+    expect(help.status, help.stderr).toBe(0);
+    expect(help.stdout).toContain("operator console");
+    const before = f.store.orchestration.control(f.state.runId);
+    const refused = f.cli("control", f.state.runId);
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain("interactive terminal");
+    expect(f.store.orchestration.control(f.state.runId)).toEqual(before);
+    expect(f.store.controllerLease(f.state.runId)).toBeNull();
+  });
+
   it("reports journal status with Astra settings and no lifecycle/session aliases", () => {
     const f = fixture(),
       result = f.cli("status", f.state.runId, "--json");
