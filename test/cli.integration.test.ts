@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
@@ -11,6 +12,49 @@ const cleanup: (() => void)[] = [];
 afterEach(() => {
   for (const close of cleanup.splice(0).reverse()) close();
 });
+describe("CLI entrypoint", () => {
+  it.each([{ args: [] }, { args: ["--help"] }, { args: ["--version"] }])(
+    "runs through an installed executable symlink with arguments $args",
+    ({ args }) => {
+      const root = mkdtempSync("/var/tmp/epicd-cli-entry-");
+      cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+      const entry = resolve("dist/cli.js");
+      const link = join(root, "epicd");
+      symlinkSync(entry, link);
+      const direct = spawnSync(process.execPath, [entry, ...args], {
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      const linked = spawnSync(process.execPath, [link, ...args], {
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      expect(linked.error).toBeUndefined();
+      expect(linked.status).toBe(args.length ? 0 : 1);
+      expect(linked.status).toBe(direct.status);
+      expect(linked.stdout).toBe(direct.stdout);
+      expect(linked.stderr).toBe(direct.stderr);
+      expect(linked.stdout + linked.stderr).toContain(
+        args.includes("--version") ? "0.1.0" : "Usage: epicd",
+      );
+    },
+  );
+
+  it("can be imported without starting the CLI", () => {
+    const root = mkdtempSync("/var/tmp/epicd-cli-import-");
+    cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+    const wrapper = join(root, "import.mjs");
+    writeFileSync(
+      wrapper,
+      `import { createProgram } from ${JSON.stringify(pathToFileURL(resolve("dist/cli.js")).href)};\nconsole.log(createProgram().name());\n`,
+    );
+    const result = spawnSync(process.execPath, [wrapper], { encoding: "utf8", timeout: 10_000 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("epicd\n");
+    expect(result.stderr).toBe("");
+  });
+});
+
 describe.runIf(process.platform === "linux")("doctor CLI", () => {
   it("serializes the exact Herdr endpoint after ordered discovery", () => {
     const f = doctorFixture();
