@@ -32,6 +32,7 @@
     "@openai/codex-sdk": "0.153.4",
     "better-sqlite3": "^13.0.3",
     "commander": "^15.0.0",
+    "effect": "4.0.0-rc.112",
     "ink": "^7.1.1",
     "react": "^19.2.8",
     "zod": "^4.5.4"

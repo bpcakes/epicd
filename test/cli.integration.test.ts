@@ -5,10 +5,49 @@ import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { doctorFixture } from "./fixtures/doctor.js";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
   for (const close of cleanup.splice(0).reverse()) close();
+});
+describe.runIf(process.platform === "linux")("doctor CLI", () => {
+  it("prints the read-only report as JSON without creating state", () => {
+    const f = doctorFixture();
+    cleanup.push(f.cleanup);
+    const before = f.snapshot();
+    const result = f.cli();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      runtime: "sdk",
+      executable: f.codex,
+      version: `${f.codex} — codex-cli fixture`,
+      orchestratorModel: "gpt-6-astra",
+      defaultReasoning: "high",
+      fallback: false,
+      herdr: null,
+      warning:
+        "Executable/endpoint checks only. These checks do not prove authentication, confinement, model result admission or epic delivery.",
+    });
+    expect(f.calls()).toEqual(["codex --version"]);
+    expect(f.snapshot()).toEqual(before);
+  });
+
+  it("prints a redacted failure with exit code 1 and no success report or state", () => {
+    const f = doctorFixture({ versionFails: true });
+    cleanup.push(f.cleanup);
+    const before = f.snapshot();
+    const result = f.cli("herdr");
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(
+      `epicd: ${f.codex} --version failed with exit code 7: token=[REDACTED] version unavailable\n`,
+    );
+    expect(result.stderr).not.toContain("doctor-test-secret");
+    expect(f.calls()).toEqual(["codex --version"]);
+    expect(f.snapshot()).toEqual(before);
+  });
 });
 function fixture() {
   const root = mkdtempSync("/var/tmp/epicd-cli-");
