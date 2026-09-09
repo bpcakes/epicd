@@ -175,16 +175,25 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       ).resolves.toMatchObject({ control: { status: "awaiting_user" } });
       const copies = coordinatorCreations(f.store, run);
       expect(copies).toHaveLength(2);
-      expect(copies[0]).toMatchObject({ outcome: "failed", stop: { kind: "stopped", code: 1 } });
-      expect(copies[1]).toMatchObject({ outcome: "created", stop: { kind: "stopped", code: 0 } });
-      expect(copies[1]!.workspaceId).not.toBe(copies[0]!.workspaceId);
+      // Workspace listings are UUID-sorted, not chronological. Bind each outcome
+      // to its bootstrap attempt identity, never to its position or observed status.
+      const first = copies.find((copy) =>
+        /^coordinator-[a-f0-9]{40}$/.test(copy.creationOperationId ?? ""),
+      );
+      expect(first).toBeDefined();
+      const second = copies.find(
+        (copy) => copy.creationOperationId === `${first!.creationOperationId}-attempt-2`,
+      );
+      expect(first).toMatchObject({ outcome: "failed", stop: { kind: "stopped", code: 1 } });
+      expect(second).toMatchObject({ outcome: "created", stop: { kind: "stopped", code: 0 } });
+      expect(second!.workspaceId).not.toBe(first!.workspaceId);
       for (const copy of copies) {
         const workspace = journal.agents.workspace(run, copy);
         expect(readFileSync(join(workspace.path, "app.txt"), "utf8")).toBe("unchanged\n");
         expect(journal.agents.activeWorkspaceOperation(run, copy)).toBeNull();
       }
       expect(journal.agents.instances(run)).toHaveLength(1);
-      expect(journal.agents.instances(run)[0]!.workspaceId).toBe(copies[1]!.workspaceId);
+      expect(journal.agents.instances(run)[0]!.workspaceId).toBe(second!.workspaceId);
       expect(journal.agents.instances(run)[0]!.contract.effective).toMatchObject({
         model: "gpt-6-astra",
         reasoningEffort: "high",
