@@ -10,10 +10,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RUN_OWNERSHIP_REF } from "../dist/adapters/publication-git.js";
 import { StateStore } from "../dist/adapters/store.js";
 import { ControlledSdkRuntime } from "../dist/adapters/controlled-sdk.js";
+import { WorkspaceManager } from "../dist/adapters/workspaces.js";
+import * as commandLifetime from "../dist/adapters/command-lifetime.js";
 import { OrchestratorController, controlledDriver } from "../dist/controller.js";
 import { ActionKernel } from "../dist/kernel/actions.js";
 import { buildOrchestratorContext } from "../dist/orchestrator/context.js";
@@ -28,6 +31,7 @@ import { initialRun } from "./fixtures/orchestration/state.js";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const close of cleanup.splice(0).reverse()) close();
 });
 const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -38,7 +42,7 @@ const question: KernelAction = {
   reason: "judgment",
   evidenceIds: [],
 };
-function fixture() {
+function fixture(identicalFailures = 3) {
   const root = mkdtempSync("/var/tmp/epicd-controller-");
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   const source = join(root, "source");
@@ -77,7 +81,7 @@ function fixture() {
         herdr: null,
       },
     },
-    RepositoryPolicySchema.parse({ schemaVersion: 1 }),
+    RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { identicalFailures } }),
   );
   const providerIds = new Map<string, string>();
   const observed: {
@@ -139,9 +143,253 @@ function fixture() {
   return { root, source, path, store, state, git, observed, driverFactory };
 }
 
+function coordinatorCreations(store: StateStore, run: string) {
+  return store.orchestration.agents
+    .workspaces(run)
+    .filter((workspace) => workspace.purpose === "coordinator")
+    .map((workspace) => {
+      const creation = store.orchestration.workspaceCreations.forWorkspace(run, workspace);
+      if (!creation) throw new Error("Coordinator copy has no creation record");
+      return creation;
+    });
+}
+
 // Real SQLite, private Git copies, SDK event parsing and supervised process stop.
 // Decision content is scripted; green does not establish Astra's delivery competence.
 describe.runIf(process.platform === "linux")("single orchestrator controller bootstrap", () => {
+  it("starts the coordinator from a fresh copy after a proven failed creation, preserving the original copy and user bytes", async () => {
+    const f = fixture(),
+      run = f.state.runId,
+      journal = f.store.orchestration,
+      db = new Database(f.path);
+    writeFileSync(join(f.source, "app.txt"), "user staged bytes\n");
+    f.git("add", "app.txt");
+    const index = readFileSync(join(f.source, ".git/index"));
+    writeFileSync(join(f.source, "app.txt"), "user unstaged bytes\n");
+    db.exec(
+      "CREATE TRIGGER fail_first_coordinator_completion BEFORE UPDATE OF record_json ON workspace_creations WHEN json_extract(NEW.record_json,'$.purpose')='coordinator' AND json_extract(NEW.record_json,'$.workerResult.status')='created' AND (SELECT count(*) FROM workspace_creations WHERE run_id=NEW.run_id AND json_extract(record_json,'$.purpose')='coordinator')=1 BEGIN SELECT RAISE(ABORT,'Lost first coordinator completion'); END",
+    );
+    try {
+      await expect(
+        new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+      ).resolves.toMatchObject({ control: { status: "awaiting_user" } });
+      const copies = coordinatorCreations(f.store, run);
+      expect(copies).toHaveLength(2);
+      expect(copies[0]).toMatchObject({ outcome: "failed", stop: { kind: "stopped", code: 1 } });
+      expect(copies[1]).toMatchObject({ outcome: "created", stop: { kind: "stopped", code: 0 } });
+      expect(copies[1]!.workspaceId).not.toBe(copies[0]!.workspaceId);
+      for (const copy of copies) {
+        const workspace = journal.agents.workspace(run, copy);
+        expect(readFileSync(join(workspace.path, "app.txt"), "utf8")).toBe("unchanged\n");
+        expect(journal.agents.activeWorkspaceOperation(run, copy)).toBeNull();
+      }
+      expect(journal.agents.instances(run)).toHaveLength(1);
+      expect(journal.agents.instances(run)[0]!.workspaceId).toBe(copies[1]!.workspaceId);
+      expect(journal.agents.instances(run)[0]!.contract.effective).toMatchObject({
+        model: "gpt-6-astra",
+        reasoningEffort: "high",
+      });
+      expect(f.observed).toHaveLength(1);
+      expect(journal.reviews.records(run)).toEqual([]);
+      expect(f.git("rev-parse", "HEAD")).toBe(f.state.epicBaseRevision);
+      expect(readFileSync(join(f.source, ".git/index"))).toEqual(index);
+      expect(readFileSync(join(f.source, "app.txt"), "utf8")).toBe("user unstaged bytes\n");
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each([1, 3])(
+    "does not refill the coordinator-copy attempt budget of %i after a stopped failure and operator resume",
+    async (limit) => {
+      const f = fixture(limit),
+        run = f.state.runId,
+        journal = f.store.orchestration,
+        db = new Database(f.path);
+      db.exec(
+        "CREATE TRIGGER fail_coordinator_completion BEFORE UPDATE OF record_json ON workspace_creations WHEN json_extract(NEW.record_json,'$.purpose')='coordinator' AND json_extract(NEW.record_json,'$.workerResult.status')='created' BEGIN SELECT RAISE(ABORT,'Lost coordinator completion'); END",
+      );
+      try {
+        await expect(
+          new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+        ).rejects.toThrow("attempt budget exhausted");
+        const copies = coordinatorCreations(f.store, run);
+        expect(copies).toHaveLength(journal.policy(run).budgets.identicalFailures);
+        for (const copy of copies) {
+          expect(copy).toMatchObject({ outcome: "failed", stop: { kind: "stopped", code: 1 } });
+          expect(journal.agents.activeWorkspaceOperation(run, copy)).toBeNull();
+        }
+        expect(f.observed).toEqual([]);
+        const escalation = journal.pendingEscalation(run)!;
+        journal.operatorControl(run, journal.control(run).controlVersion, {
+          kind: "respond",
+          escalationId: escalation.escalationId,
+          message: "Resume without changing the creation budget",
+        });
+        const reopened = new StateStore(f.path);
+        cleanup.push(() => reopened.close());
+        await expect(
+          new OrchestratorController(reopened, run, { driver: f.driverFactory([question]) }).run(),
+        ).rejects.toThrow("attempt budget exhausted");
+        expect(coordinatorCreations(f.store, run)).toEqual(copies);
+        expect(journal.agents.instances(run)).toEqual([]);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it("keeps one coordinator reservation when its creation stop is unknown, then recovers that original copy", async () => {
+    const f = fixture(),
+      run = f.state.runId,
+      journal = f.store.orchestration;
+    const recover = commandLifetime.recoverCommandStop;
+    const missing = vi
+      .spyOn(commandLifetime, "recoverCommandStop")
+      .mockImplementation((execution) => {
+        const creation = journal.agents
+          .workspaces(run)
+          .filter((workspace) => workspace.purpose === "coordinator")
+          .map((workspace) => journal.workspaceCreations.forWorkspace(run, workspace))
+          .find((record) => record?.execution?.ioId === execution.ioId);
+        return creation ? Promise.resolve(null) : recover(execution);
+      });
+    await expect(
+      new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+    ).rejects.toThrow("no independent stop receipt");
+    const copies = coordinatorCreations(f.store, run);
+    expect(copies).toHaveLength(1);
+    const original = copies[0]!;
+    expect(original).toMatchObject({
+      outcome: null,
+      stop: null,
+      workerResult: { status: "created" },
+    });
+    const receipt = await commandLifetime.readCommandStop(original.execution!);
+    expect(receipt).toMatchObject({ kind: "stopped", code: 0 });
+    expect(journal.agents.activeWorkspaceOperation(run, original)?.operationId).toBe(
+      original.workspaceOperationId,
+    );
+    expect(f.observed).toEqual([]);
+    missing.mockRestore();
+    journal.operatorControl(run, journal.control(run).controlVersion, {
+      kind: "respond",
+      escalationId: journal.pendingEscalation(run)!.escalationId,
+      message: "Reconcile the original receipt without creating another copy",
+    });
+    const reopened = new StateStore(f.path);
+    cleanup.push(() => reopened.close());
+    await expect(
+      new OrchestratorController(reopened, run, { driver: f.driverFactory([question]) }).run(),
+    ).resolves.toMatchObject({ control: { status: "awaiting_user" } });
+    expect(coordinatorCreations(f.store, run)).toHaveLength(1);
+    expect(journal.workspaceCreations.get(run, original.creationId)).toMatchObject({
+      outcome: "created",
+      stop: receipt,
+    });
+    expect(journal.agents.instances(run)[0]!.workspaceId).toBe(original.workspaceId);
+    expect(journal.agents.activeWorkspaceOperation(run, original)).toBeNull();
+  });
+
+  it.each([false, true])(
+    "preserves an acknowledged-lost coordinator copy without replacement (changed=%s)",
+    async (changed) => {
+      const f = fixture(),
+        run = f.state.runId,
+        journal = f.store.orchestration;
+      const create = WorkspaceManager.prototype.create;
+      const fault = vi
+        .spyOn(WorkspaceManager.prototype, "create")
+        .mockImplementation(async function (this: WorkspaceManager, ...args) {
+          const workspace = await create.apply(this, args);
+          if (changed)
+            writeFileSync(join(workspace.path, "app.txt"), "unexpected retained bytes\n");
+          throw new Error("Lost coordinator creation acknowledgement");
+        });
+      const running = new OrchestratorController(f.store, run, {
+        driver: f.driverFactory([question]),
+      }).run();
+      if (changed) await expect(running).rejects.toThrow("incomplete");
+      else await expect(running).resolves.toMatchObject({ control: { status: "awaiting_user" } });
+      expect(fault).toHaveBeenCalledOnce();
+      const copies = coordinatorCreations(f.store, run);
+      expect(copies).toHaveLength(1);
+      expect(copies[0]).toMatchObject({ outcome: "created", stop: { kind: "stopped", code: 0 } });
+      const workspace = journal.agents.workspace(run, copies[0]!);
+      expect(readFileSync(join(workspace.path, "app.txt"), "utf8")).toBe(
+        changed ? "unexpected retained bytes\n" : "unchanged\n",
+      );
+      expect(journal.agents.instances(run)).toHaveLength(changed ? 0 : 1);
+      expect(journal.reviews.records(run)).toEqual([]);
+      expect(readFileSync(join(f.source, "app.txt"), "utf8")).toBe("unchanged\n");
+    },
+  );
+
+  it.each(["abort", "pause", "ownership"] as const)(
+    "does not start another coordinator copy after %s interrupts recovery",
+    async (intervention) => {
+      const f = fixture(),
+        run = f.state.runId,
+        journal = f.store.orchestration,
+        db = new Database(f.path);
+      db.exec(
+        "CREATE TRIGGER fail_coordinator_completion BEFORE UPDATE OF record_json ON workspace_creations WHEN json_extract(NEW.record_json,'$.purpose')='coordinator' AND json_extract(NEW.record_json,'$.workerResult.status')='created' BEGIN SELECT RAISE(ABORT,'Lost coordinator completion'); END",
+      );
+      const signal = new AbortController(),
+        create = WorkspaceManager.prototype.create;
+      const fault = vi
+        .spyOn(WorkspaceManager.prototype, "create")
+        .mockImplementation(async function (this: WorkspaceManager, ...args) {
+          try {
+            return await create.apply(this, args);
+          } catch (error) {
+            if (intervention === "abort") signal.abort();
+            else if (intervention === "pause")
+              journal.operatorControl(run, journal.control(run).controlVersion, { kind: "pause" });
+            else f.git("update-ref", RUN_OWNERSHIP_REF, f.state.epicBaseRevision);
+            throw error;
+          }
+        });
+      try {
+        const running = new OrchestratorController(f.store, run, {
+          driver: f.driverFactory([question]),
+        }).run(signal.signal);
+        if (intervention === "abort")
+          await expect(running).resolves.toMatchObject({ control: { status: "paused" } });
+        else
+          await expect(running).rejects.toThrow(
+            intervention === "pause" ? "no longer active" : "Repository ownership changed",
+          );
+        expect(fault).toHaveBeenCalledOnce();
+        const copies = coordinatorCreations(f.store, run);
+        expect(copies).toHaveLength(1);
+        expect(copies[0]).toMatchObject({ outcome: "failed", stop: { kind: "stopped", code: 1 } });
+        expect(journal.agents.instances(run)).toEqual([]);
+        expect(f.observed).toEqual([]);
+        if (intervention === "pause") expect(journal.control(run).status).toBe("paused");
+        if (intervention === "ownership")
+          expect(f.git("rev-parse", RUN_OWNERSHIP_REF)).toBe(f.state.epicBaseRevision);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it("does not invent a retryable coordinator creation when no intent was admitted", async () => {
+    const f = fixture(),
+      run = f.state.runId;
+    const fault = vi
+      .spyOn(WorkspaceManager.prototype, "create")
+      .mockRejectedValueOnce(new Error("No workspace was admitted"));
+    await expect(
+      new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+    ).rejects.toThrow("No workspace was admitted");
+    expect(fault).toHaveBeenCalledOnce();
+    expect(f.store.orchestration.agents.workspaces(run)).toEqual([]);
+    expect(f.store.orchestration.agents.instances(run)).toEqual([]);
+    expect(f.observed).toEqual([]);
+  });
+
   it("starts a fresh Astra conversation after an explicit runtime round trip and rebuilds continuity from the journal", async () => {
     const f = fixture(),
       run = f.state.runId;

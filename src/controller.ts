@@ -6,7 +6,7 @@ import {
   type RunState,
 } from "./domain/types.js";
 import type { ControllerAuthority } from "./domain/orchestration.js";
-import type { AgentInstance } from "./domain/agents.js";
+import type { AgentInstance, WorkspaceRecord } from "./domain/agents.js";
 import { StateStore } from "./adapters/store.js";
 import { WorkspaceManager } from "./adapters/workspaces.js";
 import { ControlledSdkRuntime } from "./adapters/controlled-sdk.js";
@@ -336,7 +336,7 @@ export class OrchestratorController {
         };
       });
       if (journal.control(this.runId).status === "active" && !signal?.aborted) {
-        let coordinator = await this.coordinator(authority, state, workspaces, signal);
+        let coordinator = await this.coordinator(authority, state, workspaces, admission, signal);
         let source = new ControlledDecisionSource(journal, authority, coordinator, driver);
         const currentAuthority = authority;
         await new OrchestratorLoop(
@@ -355,6 +355,7 @@ export class OrchestratorController {
                 currentAuthority,
                 this.store.get(this.runId)!,
                 workspaces,
+                admission,
                 turnSignal,
               );
               if (
@@ -430,6 +431,7 @@ export class OrchestratorController {
     authority: ControllerAuthority,
     state: RunState,
     workspaces: WorkspaceManager,
+    admission: RepositoryAdmission,
     signal?: AbortSignal,
   ): Promise<AgentInstance> {
     const journal = this.store.orchestration;
@@ -464,28 +466,14 @@ export class OrchestratorController {
       );
     }
     const operation = `coordinator-${digestJson([this.runId, prior.length, contract]).slice(0, 40)}`;
-    let workspace = journal.agents.workspaceForOperation(this.runId, operation);
-    if (workspace) {
-      const creation = await workspaces.reconcileCreation(authority, workspace);
-      if (creation?.outcome === "failed")
-        throw new Error(
-          creation.detail ?? "Coordinator workspace creation failed; preserved for inspection",
-        );
-      if ((await workspaces.inspectMaterialization(authority, workspace, signal)) !== "ready")
-        throw new Error(
-          "The reserved coordinator workspace is incomplete; it was preserved for inspection",
-        );
-      workspace = journal.agents.workspace(this.runId, workspace);
-    } else {
-      workspace = await workspaces.create(
-        authority,
-        state.repoPath,
-        state.epicBaseRevision,
-        "coordinator",
-        signal,
-        operation,
-      );
-    }
+    const workspace = await this.coordinatorWorkspace(
+      authority,
+      state,
+      workspaces,
+      admission,
+      operation,
+      signal,
+    );
     return journal.agents.reserveAgent(
       authority,
       {
@@ -501,6 +489,112 @@ export class OrchestratorController {
         confinementProfile: "epicd-isolated",
       },
       journal.control(this.runId).controlVersion,
+    );
+  }
+
+  /** Bootstrap availability, not delivery strategy. Never replay or remove a failed copy. */
+  private async coordinatorWorkspace(
+    authority: ControllerAuthority,
+    state: RunState,
+    workspaces: WorkspaceManager,
+    admission: RepositoryAdmission,
+    operation: string,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceRecord> {
+    const journal = this.store.orchestration;
+    const limit = journal.policy(this.runId).budgets.identicalFailures;
+    const active = () => {
+      journal.assertAuthority(authority);
+      signal?.throwIfAborted();
+      if (journal.control(this.runId).status !== "active")
+        throw new Error("Coordinator workspace bootstrap is no longer active");
+    };
+    for (let attempt = 0; attempt < limit; attempt++) {
+      active();
+      await admission.assertOwned(signal);
+      active();
+      // Stable IDs retain the attempt budget across restart for this slot/contract.
+      const attemptId = attempt === 0 ? operation : `${operation}-attempt-${attempt + 1}`;
+      let workspace = journal.agents.workspaceForOperation(this.runId, attemptId);
+      let fresh = false;
+      if (!workspace) {
+        try {
+          workspace = await workspaces.create(
+            authority,
+            state.repoPath,
+            state.epicBaseRevision,
+            "coordinator",
+            signal,
+            attemptId,
+          );
+          fresh = true;
+        } catch (error) {
+          active();
+          workspace = journal.agents.workspaceForOperation(this.runId, attemptId);
+          if (!workspace) throw error; // No recorded intent: do not invent a retryable outcome.
+          journal.appendObservation(authority, {
+            source: "controller",
+            sourceEventId: `${attemptId}-interrupted`,
+            kind: "controller.coordinator_copy_interrupted",
+            summary: redactSensitiveText(String(error), 7999),
+            identity: null,
+            artifactIds: [],
+            wakesOrchestrator: true,
+          });
+        }
+      }
+      // This adapter proves the original complete-worker stop or unused binding fence.
+      // An unknown stop throws; it never opens the next attempt.
+      const creation = await workspaces.reconcileCreation(authority, workspace);
+      active();
+      workspace = journal.agents.workspace(this.runId, workspace);
+      if (
+        !creation ||
+        creation.creationOperationId !== attemptId ||
+        creation.actionId !== null ||
+        creation.purpose !== "coordinator" ||
+        creation.revision !== state.epicBaseRevision ||
+        creation.source.kind !== "repository" ||
+        creation.source.path !== state.repoPath ||
+        workspace.purpose !== "coordinator" ||
+        workspace.sourceMode !== "immutable" ||
+        workspace.baselineRevision !== state.epicBaseRevision
+      )
+        throw new Error("Coordinator copy differs from its frozen bootstrap source; preserve it");
+      if (creation.outcome === "failed") {
+        if (
+          workspace.activeTurnId ||
+          journal.agents.activeWorkspaceOperation(this.runId, workspace)
+        )
+          throw new Error("Failed coordinator copy still has unsettled custody; preserve it");
+        journal.appendObservation(authority, {
+          source: "controller",
+          sourceEventId: `coordinator-copy-failed-${creation.creationId}`,
+          kind: "controller.coordinator_copy_failed",
+          summary: redactSensitiveText(
+            `Failed coordinator copy ${workspace.workspaceId} is preserved, not reused. ${creation.detail ?? "No retained creation result"}`,
+            7999,
+          ),
+          identity: null,
+          artifactIds: [],
+          wakesOrchestrator: true,
+        });
+        continue;
+      }
+      if (creation.outcome !== "created")
+        throw new Error("Coordinator copy has no settled creation outcome; preserve it");
+      if (
+        !fresh &&
+        (await workspaces.inspectMaterialization(authority, workspace, signal)) !== "ready"
+      )
+        throw new Error(
+          "The reserved coordinator workspace is incomplete; it was preserved for inspection",
+        );
+      active();
+      return journal.agents.workspace(this.runId, workspace);
+    }
+    throw new Error(
+      `Coordinator workspace attempt budget exhausted (${limit}); failed copies and their original records were preserved`,
     );
   }
 }
