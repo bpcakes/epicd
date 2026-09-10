@@ -1,3 +1,4 @@
+import { fixtureAccounts } from "./fixtures/accounts.js";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -275,7 +276,7 @@ describe("single-format run ownership and operator controls", () => {
         trackerExecutable: "/bin/false",
         runtimeRoot: "/owned/runtime",
         workspaceRoot: "/owned/workspaces",
-        authCachePath: null,
+        accounts: fixtureAccounts(),
         turnTimeoutMs: 1000,
         herdr: null,
       },
@@ -324,6 +325,14 @@ describe("single-format run ownership and operator controls", () => {
         )
         .all(),
     ).toHaveLength(1);
+  });
+  it("rejects a version-3 record without rewriting or inferring account selections", () => {
+    const f = fixture();
+    const db = database(f.path);
+    const raw = JSON.stringify({ ...f.state, stateSchemaVersion: 3 });
+    db.prepare("UPDATE runs SET state_json = ? WHERE run_id = ?").run(raw, f.state.runId);
+    expect(() => f.store.get(f.state.runId)).toThrow(RunStateDecodeError);
+    expect(db.prepare("SELECT state_json FROM runs").get()).toEqual({ state_json: raw });
   });
   it("does not quarantine a future run-state version or rewrite it", () => {
     const f = fixture();

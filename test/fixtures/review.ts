@@ -1,3 +1,4 @@
+import { fixtureAccounts } from "./accounts.js";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -139,7 +140,7 @@ export async function fixture(
               trackerExecutable: tracker.executable(root),
               workspaceRoot: join(root, "managed"),
               runtimeRoot: join(root, "runtime"),
-              authCachePath: null,
+              accounts: fixtureAccounts(),
               turnTimeoutMs: 30000,
               herdr: null,
             },

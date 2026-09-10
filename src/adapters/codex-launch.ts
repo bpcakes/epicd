@@ -1,3 +1,6 @@
+import { projectAccountAccessToken } from "./accounts.js";
+import { readOwnerFile } from "./codex-credentials.js";
+export { readCodexAccessToken } from "./codex-credentials.js";
 import { constants } from "node:fs";
 import {
   chmod,
@@ -214,54 +217,16 @@ export async function materializeCodexLauncher(
   return { executable, manifestPath, launch };
 }
 
-/** Ephemeral access-token input. Managed refresh-token state remains with its existing owner. */
-export async function readCodexAccessToken(authCachePath: string): Promise<string> {
-  return (await readCodexAccessCache(authCachePath)).tokens.access_token;
-}
-
-async function readCodexAccessCache(authCachePath: string) {
-  try {
-    const cache: unknown = JSON.parse(await readOwnerFile(authCachePath, 64 * 1024));
-    const parsed = z
-      .object({
-        auth_mode: z.literal("chatgpt").optional(),
-        last_refresh: z.string().optional(),
-        tokens: z.object({
-          access_token: z.string().min(1).max(32_768),
-          id_token: z.string().max(32_768).optional(),
-          account_id: z.string().max(512).optional(),
-        }),
-      })
-      .safeParse(cache);
-    if (!parsed.success) throw new Error("A managed ChatGPT access-token cache is required");
-    const token = parsed.data.tokens.access_token;
-    if (/[\0\r\n]/.test(token)) throw new Error("Invalid Codex access token");
-    return parsed.data;
-  } catch {
-    // Never attach a parser error or cache contents to a diagnostic.
-    throw new Error(
-      "Unable to load a supported Codex access token; refresh the existing login or configure supported authentication",
-    );
-  }
-}
-
 /** Private token-only cache, never a second owner of the managed refresh credential. */
 export async function prepareCodexAccessToken(launch: CodexLaunch, signal?: AbortSignal) {
   if (!launch.authCachePath) return;
-  const cache = await readCodexAccessCache(launch.authCachePath);
-  signal?.throwIfAborted();
-  if (!cache.tokens.id_token || !cache.tokens.account_id || !cache.last_refresh)
-    throw new Error("The managed Codex cache lacks identity or refresh-time metadata");
-  // Preserve the actual timestamp: never forge a refresh to suppress provider expiry handling.
-  const projection = {
-    ...cache,
-    auth_mode: "chatgpt",
-    tokens: { ...cache.tokens, refresh_token: "" },
-  };
-  const target = join(launch.confinement.providerHome, "auth.json");
-  const temporary = `${target}.${launch.generation}.tmp`;
-  await writeFile(temporary, JSON.stringify(projection), { flag: "wx", mode: 0o600 });
-  await rename(temporary, target);
+  await projectAccountAccessToken(
+    launch.authCachePath,
+    launch.confinement.providerHome,
+    launch.generation,
+    launch.accountBinding?.source,
+    signal,
+  );
 }
 
 /** Exact private file, not an arbitrary caller-selected mount. Check again before recording stop. */
@@ -399,7 +364,8 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
     const path = mounts[index + 1]!;
     if (
       overlap(path, launch.controlDirectory) ||
-      (launch.authCachePath && overlap(path, launch.authCachePath))
+      (launch.authCachePath && overlap(path, launch.authCachePath)) ||
+      (launch.accountBinding && overlap(path, launch.accountBinding.source.codexHome))
     )
       throw new Error("A runtime mount would expose launch control or the managed auth cache");
     index += 2;
@@ -497,33 +463,6 @@ async function privateDirectory(path: string) {
 async function canonicalFile(path: string) {
   if (!(await lstat(path)).isFile() || (await realpath(path)) !== path)
     throw new Error("Codex launch inputs must be canonical regular files");
-}
-async function readOwnerFile(path: string, limit: number): Promise<string> {
-  if ((await realpath(path)) !== path) throw new Error("Codex control input must be canonical");
-  // NONBLOCK prevents a replaced FIFO from hanging admission before fstat can reject it.
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const stat = await file.stat();
-    if (
-      !stat.isFile() ||
-      stat.nlink !== 1 ||
-      stat.size > limit ||
-      (stat.mode & 0o077) !== 0 ||
-      stat.uid !== process.getuid?.()
-    )
-      throw new Error("Codex control input must be a bounded owner-only regular file");
-    const bytes = Buffer.alloc(limit + 1);
-    let length = 0;
-    while (length < bytes.length) {
-      const { bytesRead } = await file.read(bytes, length, bytes.length - length, length);
-      if (bytesRead === 0) break;
-      length += bytesRead;
-    }
-    if (length > limit) throw new Error("Codex control input exceeded its byte limit");
-    return bytes.subarray(0, length).toString("utf8");
-  } finally {
-    await file.close();
-  }
 }
 async function rejectSharedFiles(directory: string): Promise<void> {
   for (const entry of await readdir(directory, { withFileTypes: true })) {

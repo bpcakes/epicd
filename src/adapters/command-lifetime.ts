@@ -32,6 +32,7 @@ const LaunchSchema = z.strictObject({
   cwd: z.string().startsWith("/"),
   env: z.record(z.string(), z.string()),
   extraInput: z.string().nullable(),
+  interactiveInput: z.literal(true).optional(),
 });
 export type CommandLaunch = z.infer<typeof LaunchSchema>;
 const RequestSchema = z
@@ -121,7 +122,7 @@ export function startDurableCommand(intent: CommandLifetime, launch: CommandLaun
     cwd: "/",
     env: { PATH: "/usr/bin:/bin" },
     detached: true,
-    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe", "pipe", ...(launch.interactiveInput ? ["pipe" as const] : [])],
     shell: false,
   });
   const control = child.stdio[3] as Writable;
@@ -161,7 +162,12 @@ export function startDurableCommand(intent: CommandLifetime, launch: CommandLaun
       );
     });
   });
-  return { child, result, interrupt: () => control.end() };
+  return {
+    child,
+    result,
+    input: launch.interactiveInput ? (child.stdio[4] as Writable) : undefined,
+    interrupt: () => control.end(),
+  };
 }
 
 /** CLI entrypoint only, outside all repository mounts. */
@@ -203,9 +209,16 @@ export async function superviseCommand() {
         cwd: launch.cwd,
         env: launch.env,
         stdio: "pipe",
+        ...(launch.interactiveInput ? { stdin: "pipe" as const } : {}),
         timeoutMs: intent.timeoutMs,
         ...(launch.extraInput === null ? {} : { extraInput: launch.extraInput }),
       });
+      const input = launch.interactiveInput
+        ? new Socket({ fd: 4, readable: true, writable: false })
+        : null;
+      input?.on("error", () => namespace.interrupt());
+      namespace.child.stdin?.on("error", () => namespace.interrupt());
+      if (input) input.pipe(namespace.child.stdin!);
       const interrupt = () => {
         namespace.interrupt();
         // Broken parent output must not prevent the supervisor draining/reaping its namespace.
@@ -227,6 +240,7 @@ export async function superviseCommand() {
       const code = await new Promise<number | null>((resolve) =>
         namespace.child.once("close", resolve),
       );
+      input?.destroy();
       abort.signal.removeEventListener("abort", interrupt);
       process.stdout.off("error", interrupt);
       process.stderr.off("error", interrupt);

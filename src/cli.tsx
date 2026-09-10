@@ -1,10 +1,15 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import { Command, Option } from "commander";
 import { render } from "ink";
-import { StateStore, defaultStatePath } from "./adapters/store.js";
+import * as Effect from "effect/Effect";
+import * as Result from "effect/Result";
+import { StateStore, UnsupportedStateFormatError, defaultStatePath } from "./adapters/store.js";
+import { selectAccounts } from "./tui/account-editor-session.js";
+import { loadAccountDraft } from "./adapters/accounts.js";
+import { frozenAccountSummary, type AccountOverrides } from "./domain/accounts.js";
 import { createRun } from "./bootstrap.js";
 import { FixtureOperationSchema } from "./domain/fixtures.js";
 import { RunOperator, type OperatorRequest } from "./operator-controls.js";
@@ -21,9 +26,29 @@ import { RunView } from "./tui/run-view.js";
 import { OperatorView } from "./tui/operator-view.js";
 import { runDoctor } from "./doctor.js";
 import { redactSensitiveText } from "./util/redact.js";
+import {
+  assertEpicBrowserSelection,
+  browserTimingTracer,
+  loadEpicBrowserEffect,
+  type EpicBrowserSnapshot,
+} from "./epic-browser.js";
+import type { EpicBrowserQuery } from "./tui/epic-picker.js";
+import { pickEpicEffect } from "./tui/epic-picker-session.js";
+import { EPIC_PAGE_SIZE } from "./domain/epic-discovery.js";
 
 type BaseOptions = { state: string };
-type LaunchOptions = BaseOptions & { headless?: boolean };
+type LaunchOptions = BaseOptions & { headless?: boolean; interactive?: true };
+type StartOptions = LaunchOptions & {
+  repo: string;
+  runtime: RuntimeKind;
+  codexPath?: string;
+  trackerPath?: string;
+  workerModel?: string;
+  codexHome?: string;
+  agentCodexHome?: string[];
+  accountsConfig?: string;
+  traceDiscovery?: boolean;
+};
 const stateOption = (command: Command) =>
   command.option("--state <path>", "current-format SQLite state path", defaultStatePath());
 const runtimeOption = (command: Command) =>
@@ -38,6 +63,34 @@ const versionNumber = (value: string) => {
     throw new Error("Expected a nonnegative integer");
   return number;
 };
+
+function unsupportedStateAdvice(error: UnsupportedStateFormatError): string {
+  const files = (path: string) => [path, `${path}-wal`, `${path}-shm`, `${path}-journal`];
+  const quote = (path: string) => "'" + path.replaceAll("'", "'\\''") + "'";
+  let fresh = `${error.path}.fresh`;
+  for (let index = 2; files(fresh).some(existsSync); index++)
+    fresh = `${error.path}.fresh-${index}`;
+  const intro = `${error.message}\n\nState file: ${JSON.stringify(error.path)}`;
+  // Do not print executable snippets containing terminal control characters.
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(error.path))
+    return `${intro}\nThe path above is JSON-escaped because it contains control characters. Choose a different file with --state <path>.`;
+  return [
+    intro,
+    "",
+    "Keep the old data and use a fresh state file:",
+    `  epicd --state ${quote(fresh)}`,
+    "",
+    "Or permanently delete all saved runs in the old file:",
+    "  1. Stop any Epicd controllers using this state file.",
+    "  2. Delete the database and its SQLite sidecar files:",
+    `     rm -f -- ${files(error.path).map(quote).join(" ")}`,
+    "  3. Start again:",
+    `     epicd --state ${quote(error.path)}`,
+    "",
+    "Resetting state does not release existing repository run reservations.",
+  ].join("\n");
+}
+
 async function withStore<T>(
   options: BaseOptions,
   body: (store: StateStore) => T | Promise<T>,
@@ -62,7 +115,10 @@ async function launch(store: StateStore, runId: string, options: LaunchOptions) 
   process.once("SIGTERM", stop);
   const ui =
     !options.headless && process.stdout.isTTY && process.stdin.isTTY
-      ? render(<RunView controller={controller} stop={stop} />, { exitOnCtrlC: false })
+      ? render(<RunView controller={controller} stop={stop} />, {
+          exitOnCtrlC: false,
+          ...(options.interactive ? { interactive: true } : {}),
+        })
       : null;
   let cursor = store.events(runId, 1).at(-1)?.id ?? 0;
   const timer = ui
@@ -80,6 +136,9 @@ async function launch(store: StateStore, runId: string, options: LaunchOptions) 
       }, 500);
   try {
     await controller.run(request.signal);
+  } catch (failure) {
+    process.exitCode = 1;
+    throw failure;
   } finally {
     if (timer) clearInterval(timer);
     ui?.unmount();
@@ -88,7 +147,248 @@ async function launch(store: StateStore, runId: string, options: LaunchOptions) 
   }
   const status = controller.status();
   process.stdout.write(humanRunStatus(status) + "\n");
-  if (["blocked", "awaiting_user"].includes(status.control.status)) process.exitCode = 2;
+  process.exitCode = ["blocked", "awaiting_user"].includes(status.control.status) ? 2 : 0;
+}
+
+const startOptions = (command: Command) =>
+  runtimeOption(stateOption(command))
+    .option("-C, --repo <path>", "repository to work in", process.cwd())
+    .option("--codex-path <path>", "selected native Codex executable")
+    .option("--tracker-path <path>", "selected br executable")
+    .option(
+      "--worker-model <model>",
+      "concrete worker default; otherwise resolve the selected Codex default once",
+    )
+    .option("--codex-home <path>", "default source Codex home for new runs")
+    .option(
+      "--agent-codex-home <class=path>",
+      "per-class source home; use class=inherit to clear",
+      (value: string, previous: string[] = []) => [...previous, value],
+    )
+    .option("--accounts-config <path>", "machine-local account preferences file");
+
+async function startRun(
+  store: StateStore,
+  epicId: string,
+  options: StartOptions,
+  signal?: AbortSignal,
+  epicTitle?: string | null,
+) {
+  const accountOverrides: AccountOverrides = {
+    ...(options.codexHome !== undefined ? { codexHome: options.codexHome } : {}),
+    ...(options.agentCodexHome !== undefined ? { agentCodexHome: options.agentCodexHome } : {}),
+  };
+  const configPath =
+    options.accountsConfig !== undefined ? resolve(options.accountsConfig) : undefined;
+  const create = (
+    accountDraft: Awaited<ReturnType<typeof loadAccountDraft>>,
+    signal?: AbortSignal,
+  ) =>
+    createRun(
+      store,
+      {
+        repoPath: options.repo,
+        epicId,
+        runtime: options.runtime,
+        ...(options.codexPath ? { codexPath: options.codexPath } : {}),
+        ...(options.trackerPath ? { trackerPath: options.trackerPath } : {}),
+        ...(options.workerModel ? { model: ModelIdSchema.parse(options.workerModel) } : {}),
+        accountDraft,
+      },
+      signal,
+    );
+  let run: Awaited<ReturnType<typeof createRun>> | undefined;
+  if (!options.headless && process.stdin.isTTY && process.stdout.isTTY) {
+    const selection = await selectAccounts(epicId, accountOverrides, configPath, signal, {
+      ...(epicTitle !== undefined ? { epicTitle } : {}),
+      repoPath: resolve(options.repo),
+      runtime: options.runtime,
+      start: async (draft, setupSignal) => {
+        run = await create(draft, setupSignal);
+      },
+    });
+    if (selection === "quit") return "quit" as const;
+    if (selection === null || signal?.aborted) return false;
+  } else {
+    run = await create(await loadAccountDraft(accountOverrides, configPath), signal);
+  }
+  if (!run) throw new Error("Account setup completed without creating a run");
+  process.stdout.write(`Created run ${run.runId}\n`);
+  signal?.throwIfAborted();
+  await launch(store, run.runId, options);
+  return true;
+}
+
+async function resumeRun(store: StateStore, runId: string, options: LaunchOptions) {
+  const state = store.get(runId);
+  if (state)
+    process.stdout.write(
+      "Saved account selections (new defaults do not apply):\n" +
+        frozenAccountSummary(state.runtimeConfiguration)
+          .map((line) => line.replace(/[\u0000-\u001f\u007f-\u009f]/g, " "))
+          .join("\n") +
+        "\n",
+    );
+  const lease = store.controllerLease(runId);
+  if (lease?.alive) throw new Error(`Run is already controlled by process ${lease.pid}`);
+  const control = store.orchestration.control(runId);
+  if (control.status === "paused")
+    store.orchestration.operatorControl(runId, control.controlVersion, { kind: "resume" });
+  await launch(store, runId, options);
+}
+
+async function openOperator(store: StateStore, runId: string) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY)
+    throw new Error(
+      "The operator console requires an interactive terminal; use explicit CLI commands otherwise",
+    );
+  const operator = new RunOperator(store, runId);
+  operator.status();
+  const cancellation = new AbortController();
+  let ui: ReturnType<typeof render> | undefined;
+  const close = () => {
+    cancellation.abort(new Error("Operator console closed"));
+    ui?.unmount();
+  };
+  const controls = {
+    status: () => operator.status(),
+    submit: (request: OperatorRequest) => operator.submit(request, cancellation.signal),
+  };
+  process.once("SIGINT", close);
+  process.once("SIGTERM", close);
+  try {
+    ui = render(<OperatorView controls={controls} close={close} />, {
+      exitOnCtrlC: false,
+      interactive: true,
+    });
+    await ui.waitUntilExit();
+  } finally {
+    close();
+    process.off("SIGINT", close);
+    process.off("SIGTERM", close);
+    await operator.settle();
+  }
+  process.stdout.write(
+    "Operator console closed. No controller was started. Inspect status for committed requests.\n",
+  );
+}
+
+async function browseEpics(store: StateStore, options: StartOptions) {
+  const program = Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const cancellation = new AbortController();
+      const stop = () => cancellation.abort(new Error("Epic browser closed"));
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+      return { cancellation, stop };
+    }),
+    ({ cancellation }) =>
+      Effect.gen(function* () {
+        let error: string | undefined;
+        let query: EpicBrowserQuery = { page: 1, search: "", showNested: false };
+        let loadedQuery = query;
+        let snapshot: EpicBrowserSnapshot | undefined;
+        const tracer = options.traceDiscovery
+          ? browserTimingTracer((line) => {
+              process.stderr.write(line + "\n");
+            })
+          : undefined;
+        while (!cancellation.signal.aborted) {
+          yield* Effect.try({
+            try: () => process.stdout.write("Loading Beads epics…\n"),
+            catch: (cause) => cause,
+          });
+          const loading = loadEpicBrowserEffect(
+            store,
+            {
+              ...options,
+              offset: (query.page - 1) * EPIC_PAGE_SIZE,
+              search: query.search,
+            },
+            cancellation.signal,
+          );
+          const loaded = yield* Effect.result(
+            tracer ? Effect.withTracer(loading, tracer) : loading,
+          );
+          if (cancellation.signal.aborted) return;
+          let pickerError = error;
+          if (Result.isFailure(loaded)) {
+            if (!snapshot) return yield* Effect.fail(loaded.failure);
+            query = loadedQuery;
+            const reloadError = `${loaded.failure.message} Showing the previous page; press r to reload or try navigation again.`;
+            pickerError = error ? `${error}\n${reloadError}` : reloadError;
+          } else {
+            snapshot = loaded.success;
+            loadedQuery = query;
+          }
+          const selection = yield* pickEpicEffect(
+            {
+              items: snapshot.items,
+              runtime: options.runtime,
+              query,
+              hasNextPage: snapshot.nextOffset !== null,
+              ...(pickerError ? { error: pickerError } : {}),
+            },
+            cancellation.signal,
+          );
+          if (cancellation.signal.aborted || selection.kind === "quit") return;
+          if (selection.kind === "browse") {
+            query = selection.query;
+            error = undefined;
+            continue;
+          }
+          // A retained page is display-only until discovery succeeds and the user confirms anew.
+          if (Result.isFailure(loaded)) {
+            error = "Review the refreshed epic list before confirming again.";
+            continue;
+          }
+          // Legacy controllers retain stop/drain ownership. Never detach their Promise on interruption.
+          const confirmedSnapshot = snapshot;
+          const launched = yield* Effect.result(
+            Effect.uninterruptible(
+              Effect.tryPromise({
+                try: async () => {
+                  assertEpicBrowserSelection(store, confirmedSnapshot, selection.item);
+                  const action = selection.item.action;
+                  if (action.kind === "start") {
+                    const started = await startRun(
+                      store,
+                      selection.item.epic.id,
+                      { ...options, repo: confirmedSnapshot.repoPath, interactive: true },
+                      cancellation.signal,
+                      selection.item.epic.title,
+                    );
+                    if (started === "quit") return "quit" as const;
+                    if (!started) return "back" as const;
+                  } else if (action.kind === "resume")
+                    await resumeRun(store, action.runId, { ...options, interactive: true });
+                  else if (action.kind === "control") await openOperator(store, action.runId);
+                },
+                catch: (cause) => cause,
+              }),
+            ),
+          );
+          if (cancellation.signal.aborted) return;
+          if (Result.isSuccess(launched)) {
+            if (launched.success === "back") {
+              error = undefined;
+              continue;
+            }
+            return;
+          }
+          const failure = launched.failure;
+          error = redactSensitiveText(failure instanceof Error ? failure.message : String(failure));
+        }
+      }),
+    ({ cancellation, stop }) =>
+      Effect.sync(() => {
+        process.off("SIGINT", stop);
+        process.off("SIGTERM", stop);
+        if (!cancellation.signal.aborted) stop();
+      }),
+  );
+  const result = await Effect.runPromise(Effect.result(program));
+  if (Result.isFailure(result)) throw result.failure;
 }
 
 export function createProgram() {
@@ -96,6 +396,20 @@ export function createProgram() {
     .name("epicd")
     .description("Persistent Astra engineering lead under a Git and Beads safety kernel")
     .version("0.1.0");
+  startOptions(
+    program
+      .command("browse", { isDefault: true })
+      .description("Browse epics and start or resume the orchestrator (default in a terminal)"),
+  )
+    .option("--trace-discovery", "write browser discovery stage timings to stderr")
+    .action(async (options: StartOptions) => {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        program.outputHelp({ error: true });
+        process.exitCode = 1;
+        return;
+      }
+      await withStore(options, (store) => browseEpics(store, options));
+    });
   stateOption(
     program
       .command("control <run-id>")
@@ -105,39 +419,7 @@ export function createProgram() {
       throw new Error(
         "The operator console requires an interactive terminal; use explicit CLI commands otherwise",
       );
-    await withStore(options, async (store) => {
-      const operator = new RunOperator(store, runId);
-      operator.status(); // Validate the selected run before mounting a terminal UI.
-      const cancellation = new AbortController();
-      let ui: ReturnType<typeof render> | undefined;
-      const close = () => {
-        cancellation.abort(new Error("Operator console closed"));
-        ui?.unmount();
-      };
-      const controls = {
-        status: () => operator.status(),
-        submit: (request: OperatorRequest) => operator.submit(request, cancellation.signal),
-      };
-      process.once("SIGINT", close);
-      process.once("SIGTERM", close);
-      try {
-        ui = render(<OperatorView controls={controls} close={close} />, {
-          exitOnCtrlC: false,
-          // This command requires real terminal input/output above. CI detection
-          // must not silently hide an explicitly requested interactive console.
-          interactive: true,
-        });
-        await ui.waitUntilExit();
-      } finally {
-        close();
-        process.off("SIGINT", close);
-        process.off("SIGTERM", close);
-        await operator.settle(); // Never close SQLite under asynchronous binding or handoff.
-      }
-      process.stdout.write(
-        "Operator console closed. No controller was started. Inspect status for committed requests.\n",
-      );
-    });
+    await withStore(options, (store) => openOperator(store, runId));
   });
   stateOption(
     program
@@ -230,49 +512,13 @@ export function createProgram() {
           controlVersion: options.controlVersion,
         }),
     );
-  runtimeOption(
-    stateOption(
-      program
-        .command("run <epic-id>")
-        .description("Create a fresh run and engage the orchestrator"),
-    ),
+  startOptions(
+    program.command("run <epic-id>").description("Create a fresh run and engage the orchestrator"),
   )
-    .option("--repo <path>", "repository containing .epicd/policy.json", process.cwd())
-    .option("--codex-path <path>", "selected native Codex executable")
-    .option("--tracker-path <path>", "selected br executable")
-    .option(
-      "--worker-model <model>",
-      "concrete worker default; otherwise resolve the selected Codex default once",
-    )
-    .option("--auth-cache <path>", "existing token cache to project into private runtime storage")
     .option("--headless", "print events without the status UI")
-    .action(
-      async (
-        epicId: string,
-        options: LaunchOptions & {
-          repo: string;
-          runtime: RuntimeKind;
-          codexPath?: string;
-          trackerPath?: string;
-          workerModel?: string;
-          authCache?: string;
-        },
-      ) => {
-        await withStore(options, async (store) => {
-          const run = await createRun(store, {
-            repoPath: options.repo,
-            epicId,
-            runtime: options.runtime,
-            ...(options.codexPath ? { codexPath: options.codexPath } : {}),
-            ...(options.trackerPath ? { trackerPath: options.trackerPath } : {}),
-            ...(options.workerModel ? { model: ModelIdSchema.parse(options.workerModel) } : {}),
-            ...(options.authCache ? { authCachePath: options.authCache } : {}),
-          });
-          process.stdout.write(`Created run ${run.runId}\n`);
-          await launch(store, run.runId, options);
-        });
-      },
-    );
+    .action(async (epicId: string, options: StartOptions) => {
+      await withStore(options, (store) => startRun(store, epicId, options));
+    });
   stateOption(
     program
       .command("handoff <run-id>")
@@ -313,15 +559,7 @@ export function createProgram() {
   )
     .option("--headless", "print events without the status UI")
     .action(async (runId: string, options: LaunchOptions) =>
-      withStore(options, async (store) => {
-        // Do not resume or change control state owned by another live controller.
-        const lease = store.controllerLease(runId);
-        if (lease?.alive) throw new Error(`Run is already controlled by process ${lease.pid}`);
-        const control = store.orchestration.control(runId);
-        if (control.status === "paused")
-          store.orchestration.operatorControl(runId, control.controlVersion, { kind: "resume" });
-        await launch(store, runId, options);
-      }),
+      withStore(options, (store) => resumeRun(store, runId, options)),
     );
   stateOption(
     program
@@ -461,7 +699,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.ar
     .parseAsync()
     .catch((error) => {
       process.stderr.write(
-        `epicd: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}\n`,
+        `epicd: ${
+          error instanceof UnsupportedStateFormatError
+            ? unsupportedStateAdvice(error)
+            : redactSensitiveText(error instanceof Error ? error.message : String(error))
+        }\n`,
       );
       process.exitCode = 1;
     });

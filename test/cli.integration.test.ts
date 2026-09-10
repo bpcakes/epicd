@@ -1,8 +1,17 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { StateStore } from "../src/adapters/store.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
@@ -13,6 +22,84 @@ afterEach(() => {
   for (const close of cleanup.splice(0).reverse()) close();
 });
 describe("CLI entrypoint", () => {
+  it.each(["default", "explicit"])(
+    "prints usable recovery steps for an unsupported %s state path without resetting it",
+    (kind) => {
+      const root = mkdtempSync("/var/tmp/epicd-cli-old-state-");
+      cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+      const stateHome = join(root, "state home");
+      const relative = "state dir/old ' token=retained $(touch INJECTED) `touch INJECTED`.sqlite3";
+      const path =
+        kind === "default" ? join(stateHome, "epicd", "epicd.sqlite3") : join(root, relative);
+      mkdirSync(resolve(path, ".."), { recursive: true });
+      const db = new Database(path);
+      db.exec(
+        "CREATE TABLE retained_work(value TEXT); INSERT INTO retained_work VALUES ('keep this')",
+      );
+      db.close();
+      const before = readFileSync(path);
+      writeFileSync(`${path}.fresh`, "existing file: do not overwrite");
+      const neighbor = join(root, "unrelated.sqlite3");
+      writeFileSync(neighbor, "unrelated data");
+      const result = spawnSync(
+        process.execPath,
+        [
+          resolve("dist/cli.js"),
+          "status",
+          "unused",
+          ...(kind === "explicit" ? ["--state", relative] : []),
+        ],
+        {
+          cwd: root,
+          env: { ...process.env, XDG_STATE_HOME: stateHome },
+          encoding: "utf8",
+          timeout: 10000,
+        },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("This Epicd state format is unsupported");
+      expect(result.stderr).toContain(`State file: ${JSON.stringify(path)}`);
+      expect(result.stderr).toContain("Keep the old data");
+      expect(result.stderr).toContain(".fresh-2'");
+      expect(result.stderr).toContain("Stop any Epicd controllers");
+      expect(result.stderr).toContain("permanently delete all saved runs");
+      expect(result.stderr).toContain("does not release existing repository run reservations");
+      expect(readFileSync(path)).toEqual(before);
+      expect(existsSync(`${path}.fresh-2`)).toBe(false);
+      const deletion = result.stderr
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.startsWith("rm -f -- "));
+      expect(deletion).toBeDefined();
+      const files = [path, `${path}-wal`, `${path}-shm`, `${path}-journal`];
+      // Verify literal argument handling in the user's shell, including quotes,
+      // credential-looking filenames and command substitutions, without deleting yet.
+      if (existsSync("/usr/bin/fish")) {
+        const argumentsOnly = deletion!.replace("rm -f -- ", "printf '%s\\n' ");
+        const fish = spawnSync("/usr/bin/fish", ["--no-config", "-c", argumentsOnly], {
+          cwd: root,
+          encoding: "utf8",
+          timeout: 10000,
+        });
+        expect(fish.status, fish.stderr).toBe(0);
+        expect(fish.stdout.trimEnd().split("\n")).toEqual(files);
+      }
+      for (const file of files.slice(1)) writeFileSync(file, "test-owned sidecar");
+      // Execute only the printed deletion command against this disposable fixture.
+      const removed = spawnSync("/bin/sh", ["-c", deletion!], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      expect(removed.status, removed.stderr).toBe(0);
+      expect(files.some(existsSync)).toBe(false);
+      expect(readFileSync(`${path}.fresh`, "utf8")).toBe("existing file: do not overwrite");
+      expect(readFileSync(neighbor, "utf8")).toBe("unrelated data");
+      expect(existsSync(join(root, "INJECTED"))).toBe(false);
+    },
+  );
+
   it.each([{ args: [] }, { args: ["--help"] }, { args: ["--version"] }])(
     "runs through an installed executable symlink with arguments $args",
     ({ args }) => {

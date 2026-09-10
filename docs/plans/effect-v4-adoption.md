@@ -249,3 +249,186 @@ After extraction and operation-label normalization, all 69 tests passed across t
 diff checks passed. The build ran before typechecking and integration tests
 because some tests import compiled `dist` modules. The full suite and
 authenticated runtime acceptance were not run for this slice.
+
+## Epic browser discovery, 2026-09-09
+
+The restored browser composes `loadEpicBrowserEffect` from repository reads,
+`resolveExecutableEffect`, the confined tracker page query, and synchronous
+journal projections. `EpicBrowserLoadFailed.stage` distinguishes repository
+resolution, repository binding, tracker resolution, tracker reading, and run
+projection failures. Its original cause survives the single Promise boundary
+used by Promise callers. Commander consumes `Effect.result` directly at its own
+runtime boundary so a failed navigation can retain the previous page. The program
+stays lazy and stops at the first failed stage. Reloads require user input; no
+automatic page retry or stale-choice launch is introduced.
+
+This is the useful Effect boundary for the browser fixes. Console routing,
+confirmation identity, roots filtering and launch exit status remain ordinary
+logic; wrapping those decisions in Effects would not fix them. Controller
+launch, SQLite mutations and process supervision retain their existing owners.
+No services, layers, Effect retries or fiber cancellation API were added. The explicit
+AbortSignal still reaches the legacy adapters; cancellation waits for their
+settlement rather than treating fiber completion as physical stop proof.
+
+Tracker browsing now requests searchable pages of 50 epics. A bounded metadata
+projection includes one lookahead identity for pagination. Each ordinary nonempty
+page needs one listing/search command and one exact-ID detail command, retaining
+all six binding checks. Startup work no longer grows
+with every epic in the tracker, and trackers above 1,000 epics remain browsable.
+Tests cover typed failures and original causes, cancellation settlement, the
+reviewed state/confirmation bugs, large trackers, page validation and real
+terminal navigation. Authenticated model execution remains outside these tests.
+
+Validation passed 129 tests across 12 focused files, with one optional real-tracker
+test skipped. A separate isolated probe against the installed `br` verified page
+response parsing, deferred/closed filtering, title and ID search, and literal
+handling of a search beginning with `--`. Build, typecheck, repository formatting,
+and diff checks passed.
+
+The first oversized-page fix split listing/search ranges or detail ID batches
+after the original command had settled. Only the typed output-limit failure permits
+splitting; malformed data, binding changes and other command failures propagate.
+The 4 MiB command limit, shared deadline and binding checks remain enforced.
+An oversized single epic blocks only new starts. Listing overflow used
+the tracker's bounded ID/priority/status/type CSV projection; detail overflow
+retains the listing metadata. Saved-run resume and operator controls derive from
+the journal independently of tracker detail availability. Recovery stays in the
+existing Promise adapter; adding an Effect wrapper would duplicate its command
+lifetime owner. Controller exit status now reflects the latest controller attempt,
+while quitting immediately after a failed attempt preserves its failure status.
+
+Follow-up validation passed 100 tests across seven focused files, with one optional
+real-tracker test skipped. Added regressions cover failed page/search recovery,
+reload and renewed confirmation, controller failure followed by 0/2 outcomes,
+oversized listings and details, the single-epic output bound, and recovery in a
+real terminal. Build, typecheck, formatting and diff checks passed.
+
+The next review fix kept this recovery in the Promise adapter: its typed output
+limit error and normalized discovery result express the specific recovery without
+another Effect runtime or process owner. The existing Effect browser load carries
+that result to the UI. Input sanitization now preserves the submitted search
+regardless of paste chunking; redaction applies only when displaying it. Explicit
+run/resume retain Ink's CI detection, while browser launches remain interactive.
+
+Validation passed 110 distinct tests across seven focused files, including a
+disposable 5 MiB epic exercised against the installed `br` and a real-terminal
+unavailable-choice check. The other optional real-tracker test was not run.
+Pagination regressions cover an oversized first entry, a page-boundary entry,
+legacy array responses and detail-only overflow. Build, typecheck, formatting
+and diff checks passed. The terminal test waits for the selected row before
+sending Enter so separate key events cannot coalesce in the test transport.
+
+The subsequent structural fix replaces full `Issue` placeholders and the separate
+unavailable-ID list with `DiscoveredEpic`. The adapter validates bounded metadata
+and translates dependency edges; the browser sees explicit unknown title/hierarchy
+values. A journal-only helper decides saved-run actions, and off-page owners carry
+unknown priority/status instead of invented defaults. The
+[discovery contract](../epic-browser-contract.md) records the root cause, decision
+table, research evidence and prevention rules. Earlier test counts above describe
+their respective iterations, not validation of this final boundary change.
+
+Final boundary validation passed 123 distinct tests across seven files: browser
+projection, Effect loading, picker rendering, CLI routing, real-terminal browsing,
+tracker integration and explicit CLI integration. Both installed-`br` tests ran,
+including the real 5 MiB deferred/P0 epic and confined child claim. One new picker
+assertion initially failed on terminal line wrapping; its fixture and assertion
+were corrected, and all 12 picker tests passed. Three malformed-summary assertions
+were tightened to require the specific header/schema failure and passed again.
+Build, typecheck, repository formatting and diff checks passed. No authenticated
+model run was needed or performed for this boundary change.
+
+The next Claude review identified crowded-page read amplification, hidden tracker
+status and process-argument exposure of search terms. Discovery now starts with a
+bounded 51-entry CSV projection and permits at most 16 JSON detail commands. This
+replaces recursive full listing reads and bounds detail recovery without hiding
+remaining epics. `budget_exhausted` preserves uncertainty separately from a proven
+single-epic overflow; saved-run actions remain independent of both. The picker now
+shows tracker status in the list and confirmation. The installed CLI has no private
+query-input option, so the picker and README explicitly disclose search visibility
+to local processes while retaining display redaction. This mitigates the disclosure
+gap; it does not remove process-argument exposure.
+
+Validation for that follow-up passed 128 distinct tests across the same seven
+focused files. The crowded-page fixture proves a maximum of 17 commands, preserved
+page identities and successful narrow-search recovery; all three installed-`br`
+cases ran, including list/search at offset 50. Rendering assertions exposed
+awkward independent column wrapping after adding status; each picker row now wraps
+as one text flow. One terminal run intermittently missed the first Enter when
+opening a live console; that case passed alone and the subsequent full five-case
+terminal file passed without changing its timing or assertions. Build, typecheck,
+repository formatting and diff checks passed. Authenticated model execution was
+not exercised.
+
+The subsequent Codex review found a dependency execution gap: `--deferred` makes
+the installed tracker remove SQL pagination and hydrate every matching issue before
+returning the bounded CSV page. Research of both command paths and a disposable
+real-CLI probe confirmed that deferred epics are already included by default.
+Discovery now omits the redundant flag. The installed-CLI paging test adds an
+unreadable record beyond the requested page and requires both list and search to
+succeed; negative controls with the flag require that record's exact decoder
+failure. This regression failed before the fix and passed afterward. The discovery
+contract now distinguishes wire size, command count, row materialization and
+database work, and requires rechecking the dependency's pagination behavior when
+changing query options or CLI versions. It does not claim constant database memory
+or execution time; a true metadata-only storage projection needs tracker support.
+
+Validation for this correction passed all 162 tests across eight files: browser
+projection, Effect loading, picker, CLI routing, terminal browsing, tracker,
+explicit CLI and state-format integration. All three installed-`br` cases ran,
+including deferred/P0 preservation and the off-page decoder canary for list and
+search. Build, typecheck, repository/document formatting and diff checks passed.
+No authenticated model execution was performed.
+
+## Policy, creation and browser lifetimes
+
+The next adoption slice covers the four candidates identified in the working-tree
+assessment. It retains the pinned Effect RC and adds no platform, SQL or React
+integration dependency.
+
+- `loadRepositoryPolicyEffect` in `src/adapters/repository-policy.ts` owns policy
+  reads, atomic initialization and decoding. Tagged failures retain stage, path and
+  cause. `acquireUseRelease` owns only the temporary directory; publication still
+  uses a same-filesystem hard link that cannot overwrite a competing declaration.
+  Capturing typed use failures inside the bracket preserves the previous `finally`
+  behavior: a cleanup failure wins when both writing and cleanup fail. Cleanup is
+  never skipped because the caller aborted. Each Node Promise settles before fiber
+  interruption, preventing cleanup from racing an unfinished write.
+- `createRunEffect` composes policy initialization, existing Effect discovery,
+  runtime verification, tracker reads and final journal creation in their original
+  sequential order. `createRun` remains the Promise entry point; its errors now
+  retain the failing stage and original cause in `RunCreationFailed`. Existing
+  declarations and generated defaults are still frozen by the same store operation.
+  Explicit cancellation is checked at each stage, and in-flight legacy adapters
+  settle before interruption. No retry, parallel admission or new process owner is
+  introduced.
+- `pickEpicEffect` owns one Ink instance and returns one typed event through a
+  Deferred completed by Ink callbacks. Release removes the abort listener, unmounts
+  and awaits exit. The browser loop has one Effect runtime entry and an enclosing
+  lifetime for process signal handlers; the existing Promise controller path still
+  owns launch, stop and drain. React rendering and journal-backed choice authority
+  remain unchanged.
+- Browser reads have child spans and a root span with page counts and search
+  presence. The opt-in `--trace-discovery` flag prints safe stage timings to stderr.
+  Typed load errors now reach the CLI with stage-specific advice and redaction;
+  `loadEpicBrowser` retains its existing raw-cause Promise rejection contract for
+  programmatic callers. Trace output failures cannot change discovery results.
+
+Validation must cover real policy files and concurrent creation, acquisition/use/
+release failures, interruption during an outstanding write, lazy creation and
+stage short-circuiting, interrupted tracker settlement, competing picker events,
+terminal exit settlement and handler cleanup, span timing and redaction, and the
+compiled terminal navigation/confirmation flows. Existing schemas, transaction
+ownership, tracker command budgets and process supervision remain their current
+implementations.
+
+Final validation passed 205 tests across twelve files, including all three
+installed-`br` cases and all five compiled terminal cases. Build, source/test
+typechecking, repository/document formatting and diff checks passed. New coverage
+includes real concurrent policy initialization, typed cleanup-error precedence,
+interruption that waits for file/tracker/UI settlement, run-creation stage failures,
+browser signal-handler cleanup, and opt-in trace output without query or payload
+text. One new bootstrap cancellation fixture initially omitted its readiness
+signal; correcting the fixture made its cancellation assertion execute. The
+initial-load CLI assertion was updated for the intentional stage-aware error
+wrapper while preserving the original cause. No authenticated model run was
+performed, and the full repository suite was not part of this focused validation.

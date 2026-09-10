@@ -64,7 +64,7 @@ export function controlledDriver(store: StateStore, state: RunState): Controlled
   const common = {
     root: config.runtimeRoot,
     executable: config.executable,
-    authCachePath: config.authCachePath,
+    authCachePath: null,
     turnTimeoutMs: config.turnTimeoutMs,
   };
   if (state.runtime === "sdk") return new ControlledSdkRuntime(store.orchestration, common);

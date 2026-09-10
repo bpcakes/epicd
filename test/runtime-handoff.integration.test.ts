@@ -1,3 +1,5 @@
+import { freezeAccountDraft } from "../src/adapters/accounts.js";
+import { AccountPreferencesSchema, resolveAccountDraft } from "../src/domain/accounts.js";
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -56,9 +58,36 @@ async function fixture() {
     `#!/bin/sh\nprintf '%s\\n' "$*" >> '${commands}'\ncase "$*" in\n'status server') printf 'socket: /fixture/socket\\ncompatible: yes\\n';;\n'session list --json') printf '%s\\n' '{"sessions":[{"name":"fixture","running":true,"socket_path":"/fixture/socket"}]}';;\n'pane current --current') printf '%s\\n' '{"result":{"pane":{"workspace_id":"w-test"}}}';;\n*) exit 32;;\nesac\n`,
     { mode: 0o700 },
   );
+  const accountHome = join(root, "account");
+  {
+    mkdirSync(accountHome, { mode: 0o700 });
+    writeFileSync(
+      join(accountHome, "auth.json"),
+      JSON.stringify({
+        auth_mode: "chatgpt",
+        last_refresh: "2026-09-01T00:00:00Z",
+        tokens: {
+          account_id: "fixture",
+          access_token: "synthetic-access",
+          id_token: `e30.${Buffer.from('{"sub":"member"}').toString("base64url")}.c2ln`,
+        },
+      }),
+      { mode: 0o600 },
+    );
+  }
+  const accounts = await freezeAccountDraft(
+    resolveAccountDraft({
+      preferences: AccountPreferencesSchema.parse({ schemaVersion: 1 }),
+      configPath: join(root, "accounts.json"),
+      cwd: root,
+      operatorHome: root,
+      overrides: { codexHome: accountHome },
+    }),
+  );
   const state = store.create(
     {
       ...initialRun(),
+      stateSchemaVersion: 4,
       repoPath: repo,
       epicBaseRevision: git("rev-parse", "HEAD"),
       runtimeConfiguration: {
@@ -67,7 +96,7 @@ async function fixture() {
         trackerExecutable: "/usr/bin/false",
         workspaceRoot: join(root, "workspaces"),
         runtimeRoot: join(root, "runtime"),
-        authCachePath: null,
+        accounts,
         turnTimeoutMs: 30000,
         herdr: null,
       },
@@ -548,4 +577,48 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
     expect(f.store.get(f.state.runId)?.runtime).toBe("herdr");
     expect(f.store.controllerLease(f.state.runId)).toBeNull();
   });
+});
+
+it("retains v4 account bindings across a durable SDK/native runtime round trip", async () => {
+  const f = await fixture();
+  const before = f.state.runtimeConfiguration!.accounts!;
+  const binding = f.agent.accountBinding;
+  expect(binding).toBeDefined();
+  f.pause();
+  f.journal.handoffRuntime(f.authority, f.version(), f.target);
+  expect(f.store.get(f.state.runId)!.runtimeConfiguration!.accounts).toEqual(before);
+  f.detach();
+  f.reopen();
+  expect(f.store.orchestration.agents.instance(f.state.runId, f.agent).accountBinding).toEqual(
+    binding,
+  );
+  f.store.orchestration.handoffRuntime(f.authority, f.version(), {
+    runtime: "sdk",
+    executable: f.codex,
+    herdr: null,
+  });
+  expect(f.store.get(f.state.runId)).toMatchObject({
+    stateSchemaVersion: 4,
+    runtime: "sdk",
+    runtimeConfiguration: { accounts: before },
+  });
+});
+
+it("rejects a handoff executable inside a frozen account home before changing runtime", async () => {
+  const f = await fixture();
+  f.pause();
+  const version = f.version();
+  const before = f.store.get(f.state.runId);
+  const executable = join(f.state.runtimeConfiguration!.accounts.sources[0]!.codexHome, "codex");
+  writeFileSync(executable, "#!/bin/sh\nexit 93\n", { mode: 0o700 });
+  f.detach();
+  await expect(
+    handoffRuntime(f.store, f.state.runId, {
+      runtime: "sdk",
+      controlVersion: version,
+      codexPath: executable,
+    }),
+  ).rejects.toThrow(/outside repository, state/);
+  expect(f.store.get(f.state.runId)).toEqual(before);
+  expect(f.store.controllerLease(f.state.runId)).toBeNull();
 });

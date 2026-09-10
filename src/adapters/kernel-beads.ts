@@ -4,7 +4,15 @@ import { constants } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { digestJson } from "../domain/repository-policy.js";
-import { IssueSchema } from "../domain/types.js";
+import {
+  EPIC_PAGE_SIZE,
+  EpicMetadataSchema,
+  type DiscoveredEpic,
+  type EpicMetadata,
+  type EpicPage,
+  type EpicPageRequest,
+} from "../domain/epic-discovery.js";
+import { IssueSchema, IssueStatusSchema } from "../domain/types.js";
 import {
   TrackerBindingSchema,
   TrackerGraphSchema,
@@ -25,11 +33,25 @@ export const TRACKER_CONFIGURATION_FILES = [
 ];
 const CONFIG = TRACKER_CONFIGURATION_FILES;
 const LIMIT = 4 * 1024 * 1024;
+// One bounded listing plus at most 16 full-detail commands per browser page.
+const EPIC_DETAIL_READ_LIMIT = 16;
 type Guard = () => void;
+const EpicRowSchema = EpicMetadataSchema.extend({
+  title: z.string().min(1),
+  issue_type: z.literal("epic"),
+});
+const EpicDetailSchema = EpicRowSchema.extend({
+  dependencies: z.array(z.object({ id: TrackerIdSchema, dependency_type: z.string() })).default([]),
+});
 export class TrackerTransportError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "TrackerTransportError";
+  }
+}
+class TrackerOutputLimitError extends TrackerTransportError {
+  constructor() {
+    super("Tracker output exceeds 4 MiB");
   }
 }
 
@@ -64,6 +86,122 @@ export class KernelBeads {
         "Tracker repository, database, executable or configuration changed",
       );
   }
+  /** One bounded browser page; never claims work or imports/exports tracker data. */
+  async listOpenEpics(
+    binding: TrackerBinding,
+    signal: AbortSignal,
+    request: EpicPageRequest = {},
+  ): Promise<EpicPage> {
+    signal = AbortSignal.any([signal, AbortSignal.timeout(120_000)]);
+    const guard = () => signal.throwIfAborted();
+    const offset = request.offset ?? 0;
+    const search = request.search?.trim() ?? "";
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      offset > Number.MAX_SAFE_INTEGER - EPIC_PAGE_SIZE
+    )
+      throw new TrackerTransportError("Epic page offset must be a nonnegative safe integer");
+    if (search.length > 200 || /[\u0000-\u001f\u007f]/.test(search))
+      throw new TrackerTransportError(
+        "Epic search must contain at most 200 characters without control characters",
+      );
+    // Project bounded wire fields, including one lookahead identity. Keep pagination
+    // in SQL: br includes deferred epics by default, but --deferred enables client
+    // filtering and hydrates the entire matching corpus before LIMIT/OFFSET.
+    const text = z
+      .string()
+      .parse(
+        await this.command(
+          binding,
+          [
+            search ? "search" : "list",
+            "--type",
+            "epic",
+            "--sort",
+            "priority",
+            "--limit",
+            String(EPIC_PAGE_SIZE + 1),
+            "--offset",
+            String(offset),
+          ],
+          guard,
+          signal,
+          false,
+          search || undefined,
+          "epic-summary",
+        ),
+      );
+    const lines = text.trimEnd().split(/\r?\n/);
+    if (lines.shift() !== "id,priority,status,issue_type")
+      throw new TrackerTransportError("Tracker summary projection returned an invalid header");
+    if (lines.length > EPIC_PAGE_SIZE + 1)
+      throw new TrackerTransportError(
+        `Tracker returned more than the requested ${EPIC_PAGE_SIZE + 1} epic page entries`,
+      );
+    // These four validated fields cannot contain CSV delimiters or unbounded text.
+    const listed: EpicMetadata[] = lines.map((line) => {
+      const [id, priority, status] = z
+        .tuple([
+          TrackerIdSchema,
+          z.enum(["0", "1", "2", "3", "4"]).transform(Number),
+          IssueStatusSchema,
+          z.literal("epic"),
+        ])
+        .parse(line.split(","));
+      return { id, title: null, priority, status };
+    });
+    if (new Set(listed.map((epic) => epic.id)).size !== listed.length)
+      throw new TrackerTransportError("Epic listing must contain unique epic identities");
+
+    let detailReads = 0;
+    const readDetails = async (batch: EpicMetadata[]): Promise<DiscoveredEpic[]> => {
+      if (!batch.length) return [];
+      if (detailReads === EPIC_DETAIL_READ_LIMIT)
+        return batch.map((epic) => ({ ...epic, details: "budget_exhausted", parentIds: null }));
+      detailReads++;
+      const ids = batch.map((epic) => epic.id);
+      try {
+        const details = z
+          .array(EpicDetailSchema)
+          .parse(await this.command(binding, ["show", ...ids], guard, signal));
+        if (
+          details.length !== ids.length ||
+          new Set(details.map((epic) => epic.id)).size !== ids.length ||
+          details.some((epic) => !ids.includes(epic.id))
+        )
+          throw new TrackerTransportError(
+            "Epic details did not return exactly the requested epics",
+          );
+        return details.map((row) => ({
+          ...EpicMetadataSchema.parse(row),
+          details: "available",
+          parentIds: row.dependencies
+            .filter((edge) => edge.dependency_type === "parent-child")
+            .map((edge) => edge.id),
+        }));
+      } catch (error) {
+        if (!(error instanceof TrackerOutputLimitError)) throw error;
+        if (batch.length === 1) return [{ ...batch[0]!, details: "too_large", parentIds: null }];
+        // The failed process has settled before either child read begins. The
+        // page-wide budget also covers successful reads and unbalanced splits.
+        const half = Math.floor(batch.length / 2);
+        const first = await readDetails(batch.slice(0, half));
+        return first.concat(await readDetails(batch.slice(half)));
+      }
+    };
+    const epics = await readDetails(listed.slice(0, EPIC_PAGE_SIZE));
+    // Even a metadata-only result must observe cancellation.
+    guard();
+    return {
+      epics: epics
+        .filter((epic) => epic.status !== "closed" && epic.status !== "tombstone")
+        .sort((left, right) => left.priority - right.priority || left.id.localeCompare(right.id)),
+      offset,
+      nextOffset: listed.length > EPIC_PAGE_SIZE ? offset + EPIC_PAGE_SIZE : null,
+    };
+  }
+
   async graph(
     binding: TrackerBinding,
     epicId: string,
@@ -250,6 +388,8 @@ export class KernelBeads {
     guard: Guard,
     signal: AbortSignal,
     exportJsonl = false,
+    searchQuery?: string,
+    output: "json" | "epic-summary" = "json",
   ): Promise<unknown> {
     if (process.platform !== "linux")
       throw new TrackerTransportError("Controlled Beads requires Linux process confinement");
@@ -317,12 +457,15 @@ export class KernelBeads {
       "/workspace/.beads/beads.db",
       "--no-auto-import",
       "--no-auto-flush",
-      "--json",
+      ...(output === "epic-summary"
+        ? ["--format", "csv", "--fields", "id,priority,status,issue_type"]
+        : ["--json"]),
+      ...(searchQuery === undefined ? [] : ["--", searchQuery]),
     );
     await this.assertBinding(binding);
     signal.throwIfAborted();
     guard();
-    const output = await new Promise<string>((resolve, reject) => {
+    const result = await new Promise<string>((resolve, reject) => {
       const namespace = startNamespaceProcess(this.bwrapPath, mounts, {
         cwd: binding.repository.path,
         env: { PATH: "/usr/bin:/bin" },
@@ -356,7 +499,7 @@ export class KernelBeads {
       child.stdout!.on("data", (chunk: Buffer) => {
         size += chunk.length;
         if (size <= LIMIT) chunks.push(chunk);
-        else stop(new TrackerTransportError("Tracker output exceeds 4 MiB"));
+        else stop(new TrackerOutputLimitError());
       });
       child.stderr!.on("data", (chunk: Buffer) => {
         errorSize += chunk.length;
@@ -383,7 +526,7 @@ export class KernelBeads {
       });
     });
     await this.assertBinding(binding);
-    return JSON.parse(output);
+    return output === "epic-summary" ? result : JSON.parse(result);
   }
 }
 async function node(path: string, kind: "file" | "directory") {

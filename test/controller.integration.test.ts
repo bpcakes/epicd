@@ -1,3 +1,4 @@
+import { fixtureAccounts } from "./fixtures/accounts.js";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
@@ -76,7 +77,7 @@ function fixture(identicalFailures = 3) {
         trackerExecutable: "/usr/bin/false",
         runtimeRoot: join(root, "runtime"),
         workspaceRoot: join(root, "workspaces"),
-        authCachePath: null,
+        accounts: fixtureAccounts(),
         turnTimeoutMs: 15_000,
         herdr: null,
       },

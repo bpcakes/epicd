@@ -1,3 +1,4 @@
+import { AccountSnapshotSchema } from "./accounts.js";
 import { z } from "zod";
 
 export const IssueStatusSchema = z.enum([
@@ -225,7 +226,7 @@ export const AgentSessionContractSchema = z.discriminatedUnion("runtime", [
 ]);
 export type AgentSessionContract = z.infer<typeof AgentSessionContractSchema>;
 
-export const RUN_STATE_SCHEMA_VERSION = 3;
+export const RUN_STATE_SCHEMA_VERSION = 4;
 
 export const CommonGitDirectorySchema = z.strictObject({
   path: z.string().startsWith("/"),
@@ -240,7 +241,7 @@ export const RuntimeConfigurationSchema = z.strictObject({
   trackerExecutable: z.string().startsWith("/"),
   runtimeRoot: z.string().startsWith("/"),
   workspaceRoot: z.string().startsWith("/"),
-  authCachePath: z.string().startsWith("/").nullable(),
+  accounts: AccountSnapshotSchema,
   turnTimeoutMs: z.number().int().min(1).max(21_600_000),
   herdr: z
     .strictObject({

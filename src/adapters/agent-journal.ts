@@ -1,3 +1,6 @@
+import { validateAccountReservation } from "./accounts.js";
+import { accountBinding } from "../domain/accounts.js";
+import { RunStateSchema } from "../domain/types.js";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, join, resolve, parse as parsePath } from "node:path";
 import { lstatSync, realpathSync } from "node:fs";
@@ -900,7 +903,11 @@ export class AgentJournal {
         ...(epicRepair ? { epicRepair } : {}),
         createdAt: at,
       });
+      const accounts = this.runConfiguration(authority.runId)?.accounts;
+      const binding = accounts ? accountBinding(accounts, input.role, input.purpose) : undefined;
+      if (binding) validateAccountReservation(binding.source);
       const agent = AgentInstanceSchema.parse({
+        ...(binding ? { accountBinding: binding } : {}),
         schemaVersion: 1,
         runId: authority.runId,
         ...identity,
@@ -1395,16 +1402,27 @@ export class AgentJournal {
         throw new AgentCoordinationError("turn_not_prepared", "Bind a launch before dispatch");
       const agent = this.instance(authority.runId, identity);
       const workspace = this.workspace(authority.runId, identity);
+      const config = this.runConfiguration(authority.runId);
+      const assignment = this.assignment(authority.runId, agent.assignmentId);
+      const expectedBinding = config?.accounts
+        ? accountBinding(config.accounts, agent.role, assignment.purpose)
+        : undefined;
       if (
+        digestJson(agent.accountBinding ?? null) !== digestJson(expectedBinding ?? null) ||
+        (config !== null &&
+          manifest.authCachePath !== (expectedBinding?.source.authCachePath ?? null)) ||
         manifest.confinement.workspace !== workspace.path ||
         manifest.confinement.sourceMode !==
           (workspace.sourceMode === "immutable" ? "read-only" : "workspace-write") ||
+        digestJson(manifest.accountBinding ?? null) !== digestJson(agent.accountBinding ?? null) ||
+        (agent.accountBinding !== undefined &&
+          manifest.authCachePath !== agent.accountBinding.source.authCachePath) ||
         manifest.model !== agent.contract.effective.model ||
         manifest.reasoningEffort !== agent.contract.effective.reasoningEffort
       )
         throw new AgentCoordinationError(
           "launch_contract_mismatch",
-          "Launch must preserve the assigned workspace, source permissions, and model contract",
+          "Launch must preserve the assigned account, workspace, source permissions, and model contract",
         );
       for (const other of this.turns(authority.runId)) {
         if (!other.launch) continue;
@@ -1827,6 +1845,13 @@ export class AgentJournal {
       );
       return agent;
     });
+  }
+
+  private runConfiguration(runId: string) {
+    const row = this.db.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as {
+      state_json: string;
+    };
+    return RunStateSchema.parse(JSON.parse(row.state_json)).runtimeConfiguration;
   }
 
   private checkAssignment(

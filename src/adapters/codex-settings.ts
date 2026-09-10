@@ -1,3 +1,7 @@
+import {
+  startAccountModelDiscovery,
+  type AccountModelDiscovery,
+} from "./account-model-discovery.js";
 import { CODEX_PROCESS_SHUTDOWN_MS, runCodexCommand, startCodexProcess } from "./codex-process.js";
 import { readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -159,6 +163,7 @@ export type ResolveCodexModelOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;
   attempts?: number;
+  accountDiscovery?: AccountModelDiscovery;
 };
 
 /** Resolves the concrete model that a new Codex SDK thread would inherit. */
@@ -184,7 +189,7 @@ export async function resolveCodexModel(
           ? options.signal.reason
           : new Error("Codex model resolution was interrupted");
       }
-      if (error instanceof ModelDiscoveryFailure && !error.retryable) break;
+      if (!(error instanceof ModelDiscoveryFailure) || !error.retryable) break;
       if (attempt === attempts) break;
     }
   }
@@ -195,18 +200,26 @@ export async function resolveCodexModel(
   );
 }
 
-function resolveCodexModelOnce(
+async function resolveCodexModelOnce(
   repoPath: string,
   executable: CodexExecutable,
   options: ResolveCodexModelOptions,
 ): Promise<string> {
+  if (options.accountDiscovery && executable.args.length)
+    throw new Error("Account discovery requires the selected native executable");
+  const child = options.accountDiscovery
+    ? await startAccountModelDiscovery(
+        executable.executablePath,
+        options.accountDiscovery,
+        options.timeoutMs ?? APP_SERVER_TIMEOUT_MS,
+      )
+    : startCodexProcess(
+        executable.executablePath,
+        [...executable.args, "app-server", "--listen", "stdio://"],
+        repoPath,
+        codexProcessEnvironment(),
+      );
   return new Promise((resolve, reject) => {
-    const child = startCodexProcess(
-      executable.executablePath,
-      [...executable.args, "app-server", "--listen", "stdio://"],
-      repoPath,
-      codexProcessEnvironment(),
-    );
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     let stderr = "";
     child.stderr.setEncoding("utf8");
@@ -227,7 +240,11 @@ function resolveCodexModelOnce(
       if (transportFailureTimer) clearTimeout(transportFailureTimer);
       options.signal?.removeEventListener("abort", abort);
       lines.close();
-      child.stop(() => {
+      child.stop((cleanupError) => {
+        if (cleanupError) {
+          reject(new ModelDiscoveryFailure(cleanupError.message, false));
+          return;
+        }
         if (error) reject(error);
         else if (model) resolve(model);
         else
@@ -298,6 +315,13 @@ function resolveCodexModelOnce(
       transportFailureTimer.unref();
     };
 
+    let outputBytes = 0;
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > 2_097_152)
+        finish(new ModelDiscoveryFailure("Codex model output exceeded its byte limit", false));
+    });
+
     child.onError((error) =>
       deferTransportFailure(discoveryFailure("Could not start Codex app-server", true, error)),
     );
@@ -336,6 +360,10 @@ function resolveCodexModelOnce(
     });
     lines.on("line", (line) => {
       if (settled || !line.trim()) return;
+      if (Buffer.byteLength(line) > 65_536) {
+        finish(new ModelDiscoveryFailure("Codex model response exceeded its line limit", false));
+        return;
+      }
       let message: unknown;
       try {
         message = JSON.parse(line);
@@ -352,6 +380,10 @@ function resolveCodexModelOnce(
       if (id === 1) {
         if (rpcError(message, "initialization")) return;
         write({ method: "initialized", params: {} });
+        if (options.accountDiscovery) {
+          requestModelPage();
+          return;
+        }
         write({
           id: 2,
           method: "config/read",

@@ -1,13 +1,9 @@
-import {
-  DEFAULT_AGENT_PREFERENCES,
-  RUN_STATE_SCHEMA_VERSION,
-  type RunState,
-} from "../../../src/domain/types.js";
+import { DEFAULT_AGENT_PREFERENCES, type RunState } from "../../../src/domain/types.js";
 
 export function initialRun(runId = "orchestrator-test"): RunState {
   const at = new Date().toISOString();
   return {
-    stateSchemaVersion: RUN_STATE_SCHEMA_VERSION,
+    stateSchemaVersion: 4,
     runId,
     repoPath: `/repo/${runId}`,
     epicId: "demo",

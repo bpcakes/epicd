@@ -1,3 +1,4 @@
+import { fixtureAccounts } from "./fixtures/accounts.js";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -146,7 +147,7 @@ else: sys.exit('unexpected command')
     trackerExecutable: realpathSync(executable),
     runtimeRoot: join(root, "runtime"),
     workspaceRoot: join(root, "workspaces"),
-    authCachePath: null,
+    accounts: fixtureAccounts(),
     turnTimeoutMs: 30000,
     herdr: null,
   };

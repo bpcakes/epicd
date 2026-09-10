@@ -4,6 +4,13 @@ Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra 
 
 This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 43. Use a fresh state path; unsupported existing data is left intact.
 
+Default state lives at `$XDG_STATE_HOME/epicd/epicd.sqlite3`, or
+`~/.local/state/epicd/epicd.sqlite3` when `XDG_STATE_HOME` is unset. `--state` overrides
+that path. An unsupported-format error prints the resolved filename, a command to
+use an unused fresh path, and explicit instructions to delete the old database and
+its SQLite sidecars after stopping its controllers. Deletion discards all runs in
+that file and does not release repository run reservations.
+
 Persisted ownership fields must be explicit: missing workspace creation bindings, turn launches, native endpoint bindings or decision-attempt turn identities are invalid, not implicitly `null`. Reading incomplete records does not repair them or release their resources.
 
 The CLI and controlled runtimes are wired, but autonomous epic delivery is not yet release-ready. Independent whole-epic verification, epic-scoped repair, guarded container/root closure, atomic run completion, isolated tracker export and tracker-only delivery commits are implemented. Restricted validation access to run-created PostgreSQL fixtures is implemented under separate operator grants. Host-fixture reset/cleanup, some recovery/resource-management capabilities, and end-to-end acceptance remain unfinished. Unavailable capabilities are reported to the orchestrator, not emulated by a legacy workflow.
@@ -13,10 +20,9 @@ The CLI and controlled runtimes are wired, but autonomous epic delivery is not y
 - Linux x64, Node.js 22.12+, Git, Bubblewrap, util-linux `unshare`, and working unprivileged user/PID/mount namespaces.
 - Codex authentication and access to exactly `gpt-6-astra`. There is no coordinator model fallback.
 - `br` (Beads) and a repository with a local `.beads/beads.db`.
-- A repository-declared `.epicd/policy.json`.
 - For native Herdr: a compatible running Herdr session, its Codex integration, the native `codex` executable, and invocation from a Herdr-managed pane.
 
-The coordinator defaults to Astra/high. Supported Astra efforts are low, medium, high, xhigh, and max. Worker defaults are resolved once from the selected Codex executable unless supplied explicitly. Role preferences can change future assignments; existing agent contracts remain pinned. [Official Astra model reference](https://developers.openai.com/api/docs/models/gpt-6-astra)
+The coordinator defaults to Astra/high. Supported Astra efforts are low, medium, high, xhigh, and max. Worker defaults are resolved once with the selected implementation account in an isolated discovery home unless supplied explicitly. Role preferences can change future assignments; existing agent contracts remain pinned. [Official Astra model reference](https://developers.openai.com/api/docs/models/gpt-6-astra)
 
 ## Build and inspect
 
@@ -105,8 +111,19 @@ A replacement controller can acknowledge that receipt and inspect the actual ref
 
 Private control directories live beside the state file under `<state-path>.repository-io`; that location must be outside the checkout and Git metadata. The journal binds their filesystem identity before dispatch and records the operation and receipt identities. Control files are retained, not automatically deleted. Worker attachment cannot create missing state, initialize empty state or adopt a replaced state file. This boundary is shared by SDK and native Herdr; it does not yet supervise all controller-side Git, workspace, tracker or fixture I/O.
 
-## Declare policy
+## Repository policy
 
+You can start with `epicd` without creating a configuration file. When
+`.epicd/policy.json` is absent, starting an epic creates it with the built-in defaults:
+at most four workers, 64 task decisions and 128 epic decisions, with no declared fixtures, additional
+scratch paths or autonomous worker-setting changes. No extra repository checks
+are declared by default; normal kernel review and evidence requirements still
+apply. The generated JSON includes all defaults so you can inspect and customize
+them. Browsing alone does not create the file.
+
+To customize these defaults, edit `.epicd/policy.json` before starting a new run.
+You can also provide this file yourself. An existing file must be
+readable and valid; configuration errors do not silently fall back to defaults.
 The JSON declaration uses schema version 1. Include the checks that actually establish your repository's acceptance requirements. For example:
 
 ```json
@@ -132,11 +149,58 @@ The JSON declaration uses schema version 1. Include the checks that actually est
 
 Commands and dependencies must be available inside the isolated validation environment; host installation alone is not sufficient. Repository commands cannot access arbitrary host services, home directories, or network endpoints. There is no full-host-access bypass. Host fixture declarations do not themselves grant service authority. Explicit grants allow catalog inspection, absent-database creation and separately authorized restricted validation access; host-fixture reset and cleanup are not implemented. Separately declared check-scoped PostgreSQL services can also supply an isolated database for validation.
 
-Policy is frozen when a run is created. Editing the repository file does not change an existing run's permissions or required checks.
+The effective policy is frozen when a run is created. Editing the repository file
+does not change an existing run's
+permissions or required checks.
 
 To let the orchestrator change worker settings itself, list exact permitted model/effort pairs in `autonomousWorkerSettings`, for example `[{"model":"YOUR_WORKER_MODEL","reasoningEffort":"high"}]`. An empty or omitted list does not grant unrestricted model choice. Operator-selected initial settings remain usable; this list bounds autonomous changes, not explicit operator settings commands.
 
 ## Start and operate a run
+
+In an interactive terminal, `epicd` opens the epic browser. You can also invoke
+`epicd browse` explicitly:
+
+```bash
+epicd browse --repo /path/to/repository --state /path/to/private-state/current.sqlite3
+```
+
+To diagnose slow loading, run `epicd --trace-discovery`. It writes discovery stage
+names, durations and success/failure to stderr. These timing lines contain no
+search text, tracker payloads or error causes. Load errors identify the failed
+stage and suggest a next step; failed navigation keeps the previous page visible.
+
+Use arrows or `j`/`k` to navigate, `[`/`]` to page, and `a` to show nested epics.
+The browser loads 50 epics at a time. `/` opens a search across the tracker;
+Enter submits it, Escape cancels editing, and `c` clears the search. `r` reloads
+the current page. If navigation fails, the previous page stays visible; reload
+or navigate again to retry. Selecting a retained choice first reloads the list
+and requires a new confirmation. Search
+matches IDs, titles, descriptions and comments, including epics on unloaded pages.
+Search terms are passed to `br` as process arguments and can be visible to other
+local processes. Avoid secrets; display redaction does not make searching private.
+Epics too large to load cannot start new runs; their saved runs can still resume
+or open controls. Bounded tracker metadata preserves their actual priority and
+status; the list and confirmation show tracker status separately from run status.
+Unloaded titles and hierarchy are shown as unknown. Each page uses one metadata
+read and at most 16 detail reads. If that budget is exhausted, the remaining epics
+stay visible; search for one epic's ID to load its details separately. Other epics
+and pages stay accessible.
+Enter opens a start/resume preview; Enter or `y` confirms it. `q` closes the
+browser without starting work. Existing runs retain their recorded runtime and
+settings. A live run or one with an unanswered question opens the operator console,
+including a paused run whose question is still pending. Normal journal updates
+do not prevent opening the console; its commands obtain their own current versions.
+Other epics remain unavailable while a run owns the repository. Browsing does
+not claim tracker work or start a model; launch checks run after confirmation.
+Without a terminal, use the explicit commands below.
+Explicit `run` and `resume` commands retain automatic terminal/CI rendering;
+sessions launched from the browser use interactive rendering.
+If a launched controller fails, the browser keeps a nonzero exit status even if
+you return to the picker and quit. A later successful controller attempt replaces
+that status: 0 for normal completion, or 2 when blocked or awaiting user input.
+
+The [browser discovery contract](docs/epic-browser-contract.md) explains metadata,
+saved-run authority, and the regression coverage for partial tracker reads.
 
 Use an explicit state path outside the target repository for this experimental branch:
 
@@ -148,6 +212,98 @@ node dist/cli.js run EPIC_ID --repo /path/to/repository \
 node dist/cli.js run EPIC_ID --repo /path/to/repository \
   --state /path/to/private-state/native.sqlite3 --runtime herdr
 ```
+
+### Choose Codex accounts
+
+In `epicd`, select a new epic with Enter to open **Accounts** directly. The screen
+shows the epic title, repository, and runtime. The run starts only after you review
+your account choices and confirm **Start run**.
+`epicd run EPIC_ID` opens the same setup in a terminal; use `--headless` for
+unattended execution.
+
+The Accounts screen lets you choose source homes for
+`orchestrator`, `implementation`, and `review`. Use Up/Down and Enter to open a
+visible home picker with labels and paths. Up/Down or Tab selects a discovered
+`~/.codex` / `~/.codex-*` home or configured path; Enter applies it. Choose
+**Enter another path** (or press `e`) for a custom path. Left/Right and Home/End
+move the cursor; Backspace/Delete edits at the cursor, and Ctrl+U clears the path.
+An empty path or **Inherit** clears the override.
+
+Each choice shows its source, such as **From CODEX_HOME**, **Saved default**, or
+**Override**. **Unsaved changes** means the choices differ from saved defaults;
+they still apply to this run. `a` shows advanced classes and `d` saves defaults.
+Local path and credential checks show errors beside the affected field. A failed
+start keeps your edits open so you can correct the problem and retry.
+
+`s` opens **Review choices**. This final summary includes the epic, repository,
+runtime, and primary accounts, with inherited advanced roles collapsed (`a`
+expands them). Enter starts the run. Escape goes back one screen, including from
+the editor to the epic list. Ctrl+C exits setup and the browser.
+
+Headless starts use the same resolution rules:
+
+```bash
+epicd run EPIC_ID --repo /path/to/repository --headless \
+  --codex-home ~/.codex-main \
+  --agent-codex-home implementation=~/.codex-build \
+  --agent-codex-home review=~/.codex-review
+```
+
+`--agent-codex-home` accepts distinct classes; `review=inherit` clears that override.
+`verification` and `final_review` inherit review; `epic_repair` inherits implementation.
+A `specialist` override applies to either specialist role; otherwise specialists use
+their implementation or review role's account. These settings do not change models.
+
+Defaults live in `$XDG_CONFIG_HOME/epicd/accounts.json`, or
+`~/.config/epicd/accounts.json`. `--accounts-config <path>` selects another file;
+an explicitly selected missing file is an error. For example:
+
+```json
+{
+  "schemaVersion": 1,
+  "defaultCodexHome": null,
+  "classes": {
+    "implementation": { "codexHome": "~/.codex-build" },
+    "review": { "codexHome": "~/.codex-review", "label": "Review" }
+  }
+}
+```
+
+A null default uses the invoking `CODEX_HOME`, falling back to `~/.codex`.
+CLI overrides take precedence over the file; subsequent editor changes take
+precedence over both. Saved relative paths resolve beside the configuration file;
+CLI/editor relative paths resolve from the invoking directory. Only leading `~/`
+is expanded, with no shell interpolation. The config file must be an owned private
+regular file (0600); Save defaults creates an owner-only parent directory (0700).
+
+Each source must contain a supported file-based managed ChatGPT `auth.json` with
+account and identity-token metadata. Epicd projects only access credentials into
+its existing private agent homes. It imports neither source configuration nor
+refresh tokens. The agent's actual `CODEX_HOME` remains its private runtime home.
+
+New runs pin all selected accounts at creation and retain them through resume,
+replacement, and runtime handoff. Same-account token rotation is supported; changing
+the account or replacing its home directory requires a new run. Machine-default and
+environment changes do not redirect saved runs. Run records use version 4 with required
+account snapshots. Older run records and direct credential-file selectors are unsupported;
+there is no migration or compatibility mode.
+
+Account usage/status inspection and quota handling are deferred; this screen selects
+credentials without querying usage. Save defaults validates paths and credentials first.
+Symlinked config ancestors are supported; the final preferences file must remain a
+private regular file rather than a symlink.
+
+Worker-model discovery uses an isolated account home and supports neither
+`/etc/codex/config.toml` nor `/etc/codex/managed_config.toml`. If either exists,
+discovery reports an explicit error; `--worker-model` selects a model without that
+discovery step. System `requirements.toml`, when present, remains mounted and enforced.
+Probe storage is deleted after confirmed shutdown. A timed-out probe is retained until
+its shutdown is proven; a late result or a later discovery can then reclaim it.
+
+A missing `.epicd/policy.json` is initialized after startup validation, immediately
+before saving the new run. Rejected account, model, tracker, or runtime checks do not
+create that file. Policy publication and SQLite persistence are separate operations;
+a database failure after publication can still leave the policy file.
 
 The SDK and Herdr examples are alternatives. Before invoking either runtime, the controller acquires `refs/epicd/run-owner` in the repository's physical common Git directory. Separate state files and linked checkouts therefore contend for the same run reservation. Creating another state file does not bypass ownership. The reservation binds the run, a unique owner identity and the state file's canonical path/device/inode; copying, moving or replacing state cannot borrow it.
 

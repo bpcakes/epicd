@@ -1,6 +1,8 @@
 import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
+  existsSync,
+  readdirSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -9,10 +11,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { setImmediate } from "node:timers/promises";
+import * as Effect from "effect/Effect";
+import * as Result from "effect/Result";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
+import { KernelBeads } from "../src/adapters/kernel-beads.js";
+import * as codexSettings from "../src/adapters/codex-settings.js";
 import {
   createRun,
+  createRunEffect,
   discoverHerdr,
   sdkNativeExecutable,
   selectedCodexExecutable,
@@ -21,6 +29,7 @@ import { resolveAgentRoleSettings } from "../src/domain/types.js";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const close of cleanup.splice(0).reverse()) close();
 });
@@ -65,6 +74,21 @@ function fixture() {
       "\';;\nready) printf '[]\\n';;\n*) exit 7;;\nesac\n",
     { mode: 0o700 },
   );
+  const codexHome = join(root, "account");
+  mkdirSync(codexHome, { mode: 0o700 });
+  writeFileSync(
+    join(codexHome, "auth.json"),
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      last_refresh: "2026-09-01T00:00:00Z",
+      tokens: {
+        access_token: "fixture-access",
+        account_id: "fixture-account",
+        id_token: `e30.${Buffer.from(JSON.stringify({ sub: "fixture-member" })).toString("base64url")}.c2ln`,
+      },
+    }),
+    { mode: 0o600 },
+  );
   return {
     root,
     repo,
@@ -80,14 +104,110 @@ function fixture() {
       codexPath: codex,
       trackerPath: br,
       model: "worker",
-      authCachePath: null,
+      codexHome,
     },
   };
 }
 describe.runIf(process.platform === "linux")("fresh run bootstrap", () => {
+  it("does not initialize a missing policy when subsequent account checks reject the start", async () => {
+    const f = fixture();
+    rmSync(join(f.repo, ".epicd"), { recursive: true });
+    await expect(
+      createRun(f.store, { ...f.options, codexHome: join(f.root, "missing-account") }),
+    ).rejects.toThrow(/Directory is missing/);
+    expect(existsSync(f.policyPath)).toBe(false);
+    expect(existsSync(join(f.repo, ".epicd"))).toBe(false);
+    expect(f.store.list()).toEqual([]);
+  });
+  it("defers policy reads until execution and short-circuits later creation stages", async () => {
+    const f = fixture();
+    const graph = vi.spyOn(KernelBeads.prototype, "graph");
+    const verify = vi.spyOn(codexSettings, "verifyCodexExecutable");
+    const program = createRunEffect(f.store, f.options);
+    expect(verify).not.toHaveBeenCalled();
+    expect(f.store.list()).toEqual([]);
+    writeFileSync(f.policyPath, "{invalid");
+    const result = await Effect.runPromise(Effect.result(program));
+    if (!Result.isFailure(result)) throw new Error("Expected policy rejection");
+    expect(result.failure).toMatchObject({
+      _tag: "RunCreationFailed",
+      stage: "load_policy",
+      cause: { _tag: "RepositoryPolicyError", stage: "decode", path: f.policyPath },
+    });
+    expect(verify).not.toHaveBeenCalled();
+    expect(graph).not.toHaveBeenCalled();
+    expect(f.store.list()).toEqual([]);
+  });
+  it.each(["verify_runtime", "read_tracker", "persist_run"] as const)(
+    "retains the cause and stage when %s fails without creating a run",
+    async (stage) => {
+      const f = fixture(),
+        cause = new Error("injected creation failure");
+      const graph = vi.spyOn(KernelBeads.prototype, "graph");
+      const persist = vi.spyOn(f.store, "create");
+      if (stage === "verify_runtime")
+        vi.spyOn(codexSettings, "verifyCodexExecutable").mockRejectedValueOnce(cause);
+      if (stage === "read_tracker") graph.mockRejectedValueOnce(cause);
+      if (stage === "persist_run")
+        persist.mockImplementationOnce(() => {
+          throw cause;
+        });
+      await expect(createRun(f.store, f.options)).rejects.toMatchObject({
+        _tag: "RunCreationFailed",
+        stage,
+        cause,
+      });
+      if (stage === "verify_runtime") expect(graph).not.toHaveBeenCalled();
+      if (stage !== "persist_run") expect(persist).not.toHaveBeenCalled();
+      expect(f.store.list()).toEqual([]);
+    },
+  );
+  it("waits for cancelled graph I/O to settle and never persists its successful result", async () => {
+    const f = fixture(),
+      cancellation = new AbortController();
+    const original = KernelBeads.prototype.graph;
+    let graphReady = false;
+    let finish!: () => void;
+    const held = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    vi.spyOn(KernelBeads.prototype, "graph").mockImplementationOnce(async function (
+      this: KernelBeads,
+      ...args
+    ) {
+      const value = await original.apply(this, args);
+      graphReady = true;
+      await held;
+      return value;
+    });
+    const work = createRun(f.store, f.options, cancellation.signal);
+    let settled = false;
+    void work.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    try {
+      await expect.poll(() => graphReady).toBe(true);
+      cancellation.abort(new Error("operator stopped creation"));
+      await setImmediate();
+      expect(settled).toBe(false);
+      expect(f.store.list()).toEqual([]);
+      finish();
+      await expect(work).rejects.toThrow("operator stopped creation");
+      expect(f.store.list()).toEqual([]);
+    } finally {
+      finish();
+      await work.catch(() => {});
+    }
+  });
   it("freezes runtime paths, selected epic, policy and baseline without claiming tasks or changing user files", async () => {
     const f = fixture(),
       baseline = f.git("rev-parse", "HEAD");
+    const declaredPolicy = readFileSync(f.policyPath, "utf8");
     writeFileSync(join(f.repo, "app.txt"), "user-owned change\n");
     const run = await createRun(f.store, f.options);
     expect(run).toMatchObject({
@@ -104,27 +224,74 @@ describe.runIf(process.platform === "linux")("fresh run bootstrap", () => {
     expect(run.runtimeConfiguration).toMatchObject({
       executable: f.codex,
       trackerExecutable: f.br,
-      authCachePath: null,
       herdr: null,
     });
     expect(f.store.orchestration.tracker.configured(run.runId)).toBe(true);
     expect(() => f.store.orchestration.tracker.assertTaskOwned(run.runId, "unclaimed")).toThrow();
     expect(f.store.orchestration.tracker.operations(run.runId)).toEqual([]);
     expect(f.store.orchestration.agents.instances(run.runId)).toEqual([]);
+    expect(readFileSync(f.policyPath, "utf8")).toBe(declaredPolicy);
     writeFileSync(f.policyPath, JSON.stringify({ schemaVersion: 1 }));
     expect(f.store.orchestration.policy(run.runId).budgets.epicDecisions).toBe(8);
     expect(f.git("rev-parse", "HEAD")).toBe(baseline);
     expect(readFileSync(join(f.repo, "app.txt"), "utf8")).toBe("user-owned change\n");
   });
-  it("rejects an invalid policy and never starts an unconfigured run", async () => {
+  it.each(["directory", "file"])(
+    "bootstraps a policy with frozen defaults when the policy %s is absent",
+    async (absent) => {
+      const f = fixture();
+      rmSync(absent === "directory" ? join(f.repo, ".epicd") : f.policyPath, { recursive: true });
+      const baseline = f.git("rev-parse", "HEAD");
+      writeFileSync(join(f.repo, "app.txt"), "user-owned change\n");
+      const run = await createRun(f.store, f.options);
+      expect(run.epicId).toBe("demo");
+      expect(f.store.list()).toHaveLength(1);
+      const policy = f.store.orchestration.policy(run.runId);
+      expect(policy).toMatchObject({
+        schemaVersion: 1,
+        budgets: { maxWorkers: 4, taskDecisions: 64, epicDecisions: 128 },
+        requiredChecks: [],
+        fixtures: [],
+        fixtureValidation: [],
+        validationServices: [],
+        writableScratch: [],
+        autonomousWorkerSettings: [],
+      });
+      const generated = readFileSync(f.policyPath, "utf8");
+      expect(JSON.parse(generated)).toEqual(policy);
+      expect(generated).toBe(JSON.stringify(policy, null, 2) + "\n");
+      expect(readdirSync(join(f.repo, ".epicd"))).toEqual(["policy.json"]);
+      expect(f.git("rev-parse", "HEAD")).toBe(baseline);
+      expect(readFileSync(join(f.repo, "app.txt"), "utf8")).toBe("user-owned change\n");
+      writeFileSync(f.policyPath, JSON.stringify({ schemaVersion: 1, budgets: { maxWorkers: 1 } }));
+      expect(f.store.orchestration.policy(run.runId)).toEqual(policy);
+    },
+  );
+  it.each([
+    JSON.stringify({ schemaVersion: 1, coordinator: { model: "wrong-model" } }),
+    '{"schemaVersion":',
+  ])("rejects an invalid explicit policy instead of using defaults (%s)", async (source) => {
     const f = fixture();
-    writeFileSync(
-      f.policyPath,
-      JSON.stringify({ schemaVersion: 1, coordinator: { model: "wrong-model" } }),
+    writeFileSync(f.policyPath, source);
+    await expect(createRun(f.store, f.options)).rejects.toThrow(
+      `Invalid repository policy at ${JSON.stringify(f.policyPath)}`,
     );
-    await expect(createRun(f.store, f.options)).rejects.toThrow();
+    expect(readFileSync(f.policyPath, "utf8")).toBe(source);
     expect(f.store.list()).toEqual([]);
   });
+  it.each(["directory", "dangling symlink"])(
+    "rejects an unreadable policy %s instead of using defaults",
+    async (kind) => {
+      const f = fixture();
+      rmSync(f.policyPath);
+      if (kind === "directory") mkdirSync(f.policyPath);
+      else symlinkSync(join(f.root, "missing-policy.json"), f.policyPath);
+      await expect(createRun(f.store, f.options)).rejects.toThrow(
+        `Cannot read or initialize repository policy at ${JSON.stringify(f.policyPath)}`,
+      );
+      expect(f.store.list()).toEqual([]);
+    },
+  );
   it("preserves existing run ownership and does not convert it on a second start", async () => {
     const f = fixture();
     const first = await createRun(f.store, f.options);

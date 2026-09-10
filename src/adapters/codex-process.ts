@@ -40,7 +40,7 @@ export type CodexProcess = {
   stderr: Readable;
   onError(listener: (error: Error) => void): void;
   onClose(listener: (code: number | null) => void): void;
-  stop(done: () => void): void;
+  stop(done: (error?: Error) => void): void;
 };
 
 /** Run a finite Codex command with the same descendant ownership as model discovery. */

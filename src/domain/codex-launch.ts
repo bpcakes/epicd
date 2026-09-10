@@ -1,3 +1,4 @@
+import { AccountBindingSchema } from "./accounts.js";
 import { z } from "zod";
 import { isAbsolute, resolve } from "node:path";
 import { ModelIdSchema, ReasoningEffortSchema } from "./types.js";
@@ -10,23 +11,30 @@ export const LaunchPathSchema = z
   .refine(
     (path) => isAbsolute(path) && resolve(path) === path && path !== "/" && !path.includes("\0"),
   );
-export const CodexLaunchSchema = z.strictObject({
-  generation: z.string().uuid(),
-  confinement: z.strictObject({
-    executable: LaunchPathSchema,
-    workspace: LaunchPathSchema,
-    sourceMode: z.enum(["read-only", "workspace-write"]),
-    providerHome: LaunchPathSchema,
-    scratch: LaunchPathSchema,
-    artifacts: LaunchPathSchema,
-  }),
-  model: ModelIdSchema,
-  reasoningEffort: ReasoningEffortSchema,
-  /** Only the cache pathname is persisted, never credentials. */
-  authCachePath: LaunchPathSchema.nullable(),
-  controlDirectory: LaunchPathSchema,
-  reviewPacket: ReviewPacketBindingSchema.nullable(),
-});
+export const CodexLaunchSchema = z
+  .strictObject({
+    generation: z.string().uuid(),
+    confinement: z.strictObject({
+      executable: LaunchPathSchema,
+      workspace: LaunchPathSchema,
+      sourceMode: z.enum(["read-only", "workspace-write"]),
+      providerHome: LaunchPathSchema,
+      scratch: LaunchPathSchema,
+      artifacts: LaunchPathSchema,
+    }),
+    model: ModelIdSchema,
+    reasoningEffort: ReasoningEffortSchema,
+    /** Only the cache pathname is persisted, never credentials. */
+    authCachePath: LaunchPathSchema.nullable(),
+    accountBinding: AccountBindingSchema.optional(),
+    controlDirectory: LaunchPathSchema,
+    reviewPacket: ReviewPacketBindingSchema.nullable(),
+  })
+  .refine(
+    (launch) =>
+      !launch.accountBinding || launch.authCachePath === launch.accountBinding.source.authCachePath,
+    "Launch cache must match its frozen account binding",
+  );
 export type CodexLaunch = z.infer<typeof CodexLaunchSchema>;
 
 export const CodexLaunchStopSchema = z

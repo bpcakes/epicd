@@ -66,7 +66,8 @@ export class ControlledLaunches {
       },
       model: agent.contract.effective.model,
       reasoningEffort: agent.contract.effective.reasoningEffort,
-      authCachePath: this.options.authCachePath,
+      authCachePath: agent.accountBinding?.source.authCachePath ?? this.options.authCachePath,
+      ...(agent.accountBinding ? { accountBinding: agent.accountBinding } : {}),
       controlDirectory: join(home, "launches", identity.turnId),
       reviewPacket: packet === null ? null : reviewPacketBinding(packet),
     });

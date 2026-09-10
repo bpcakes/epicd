@@ -108,7 +108,33 @@ elif mode == 'confinement':
     except OSError: pass
     (directory/'confinement-result').write_text(json.dumps({'escaped':escaped,'foreignEnv':os.environ.get('EPICD_TRAP')}))
     print('[]')
-elif args[0] == 'show': print(json.dumps([row(by_id(id)) for id in args[1:args.index('--db')]]))
+elif args[0] in ('list', 'search'):
+    epics = sorted([x for x in data if x['issue_type'] == 'epic' and x['status'] != 'closed'], key=lambda x: (x['priority'], x['id']))
+    if args[0] == 'search': epics = [x for x in epics if args[-1].lower() in (x['id']+' '+x['title']+' '+x['description']).lower()]
+    offset, limit = int(args[args.index('--offset')+1]), int(args[args.index('--limit')+1])
+    if mode == 'page-overflow': limit += 1
+    selected = epics[offset:offset+limit]
+    if mode == 'duplicate-page' and len(selected) > 1: selected[1] = selected[0]
+    if '--fields' in args:
+        print('id' if mode == 'summary-header' else 'id,priority,status,issue_type')
+        if mode == 'summary-priority': selected[0]['priority'] = 5
+        if mode == 'summary-status': selected[0]['status'] = 'invented'
+        for x in selected: print(','.join(str(x[k]) for k in ['id','priority','status','issue_type']))
+        sys.exit(0)
+    issues = [{k:v for k,v in x.items() if k != 'parents'} for x in selected]
+    if mode == 'large-details': issues = [{k:v for k,v in x.items() if k != 'inherited_context'} for x in issues]
+    result = issues if mode == 'array-page' else {'issues':issues,'offset':offset+(1 if mode == 'wrong-offset' else 0),'limit':limit,'has_more':offset+limit < len(epics)}
+    print(json.dumps(result))
+elif args[0] == 'show':
+    selected = [row(by_id(id)) for id in args[1:args.index('--db')]]
+    if mode == 'duplicate-details' and len(selected) > 1: selected[1] = selected[0]
+    if mode == 'missing-details': selected = selected[:-1]
+    if mode == 'crowded-details':
+        large = 'x' * (5 * 1024 * 1024)
+        for x in selected:
+            if x['id'] != 'epic-0059': x['inherited_context'] = large
+        json.dump(selected, sys.stdout)
+    else: print(json.dumps(selected))
 elif args[0] == 'ready': print(json.dumps([row(x) for x in data if x['id'] != 'demo' and x['id'] in reachable and x['status'] == 'open' and not x['assignee'] and not blocked(x)]))
 elif args[0] == 'update':
     x = by_id(args[1])
@@ -221,6 +247,298 @@ const waitFor = async (condition: () => boolean) => {
 describe.skipIf(process.platform !== "linux")(
   "durable tracker graph and ownership capabilities",
   () => {
+    it("lists bounded metadata with real parent edges and no tracker mutation", async () => {
+      const s = fixture();
+      const before = readFileSync(join(s.storage, "data.json"), "utf8");
+      const { epics, nextOffset } = await s.transport.listOpenEpics(
+        await s.transport.bind(s.repo),
+        new AbortController().signal,
+      );
+      expect(epics.map((epic) => epic.id)).toEqual(["container", "demo"]);
+      expect(nextOffset).toBeNull();
+      expect(epics[0]!.parentIds).toEqual(["demo"]);
+      expect(epics[0]!.details).toBe("available");
+      const commands = readFileSync(join(s.storage, "commands.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      expect(commands.map((args) => args[0])).toEqual(["list", "show"]);
+      expect(commands[0]).toEqual([
+        "list",
+        "--type",
+        "epic",
+        "--sort",
+        "priority",
+        "--limit",
+        "51",
+        "--offset",
+        "0",
+        "--db",
+        "/workspace/.beads/beads.db",
+        "--no-auto-import",
+        "--no-auto-flush",
+        "--format",
+        "csv",
+        "--fields",
+        "id,priority,status,issue_type",
+      ]);
+      expect(readFileSync(join(s.storage, "data.json"), "utf8")).toBe(before);
+    });
+
+    it("loads bounded pages and searches beyond 1000 epics with only two commands per page", async () => {
+      const s = fixture();
+      const data = Array.from({ length: 1105 }, (_, index) => ({
+        ...task(`epic-${String(index).padStart(4, "0")}`, []),
+        issue_type: "epic",
+      }));
+      writeFileSync(join(s.storage, "data.json"), JSON.stringify(data));
+      const binding = await s.transport.bind(s.repo),
+        signal = new AbortController().signal;
+      const checks = vi.spyOn(s.transport, "assertBinding");
+      const first = await s.transport.listOpenEpics(binding, signal);
+      expect(first.epics.map((epic) => epic.id)).toEqual(data.slice(0, 50).map((epic) => epic.id));
+      expect(first.nextOffset).toBe(50);
+      expect(checks).toHaveBeenCalledTimes(6);
+      const next = await s.transport.listOpenEpics(binding, signal, { offset: first.nextOffset! });
+      expect(next.epics.map((epic) => epic.id)).toEqual(data.slice(50, 100).map((epic) => epic.id));
+      const last = await s.transport.listOpenEpics(binding, signal, { offset: 1100 });
+      expect(last.epics.map((epic) => epic.id)).toEqual(data.slice(1100).map((epic) => epic.id));
+      expect(last.nextOffset).toBeNull();
+      const searched = await s.transport.listOpenEpics(binding, signal, { search: "epic-1104" });
+      expect(searched.epics.map((epic) => epic.id)).toEqual(["epic-1104"]);
+      const commands = readFileSync(join(s.storage, "commands.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      expect(commands.map((args) => args[0])).toEqual([
+        "list",
+        "show",
+        "list",
+        "show",
+        "list",
+        "show",
+        "search",
+        "show",
+      ]);
+      expect(commands[6]!.slice(-2)).toEqual(["--", "epic-1104"]);
+      expect(JSON.parse(readFileSync(join(s.storage, "data.json"), "utf8"))).toEqual(data);
+    });
+
+    it.each(["description", "inherited_context"])(
+      "splits oversized browser reads (%s) while preserving every epic and the next page",
+      async (field) => {
+        const s = fixture();
+        const data = Array.from({ length: 60 }, (_, index) => ({
+          ...task(`epic-${String(index).padStart(4, "0")}`, []),
+          issue_type: "epic",
+          [field]: "x".repeat(100 * 1024),
+        }));
+        writeFileSync(join(s.storage, "data.json"), JSON.stringify(data));
+        if (field === "inherited_context") writeFileSync(join(s.storage, "mode"), "large-details");
+        const binding = await s.transport.bind(s.repo),
+          signal = new AbortController().signal;
+        const first = await s.transport.listOpenEpics(binding, signal);
+        expect(first.epics.map((epic) => epic.id)).toEqual(
+          data.slice(0, 50).map((epic) => epic.id),
+        );
+        expect(first.nextOffset).toBe(50);
+        const last = await s.transport.listOpenEpics(binding, signal, {
+          offset: first.nextOffset!,
+        });
+        expect(last.epics.map((epic) => epic.id)).toEqual(data.slice(50).map((epic) => epic.id));
+        expect(last.nextOffset).toBeNull();
+        const commands = readFileSync(join(s.storage, "commands.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as string[]);
+        const shows = commands.filter((args) => args[0] === "show");
+        expect(shows.map((args) => args.indexOf("--db") - 1)).toEqual([50, 25, 25, 10]);
+        const lists = commands.filter((args) => args[0] === "list");
+        expect(
+          lists.map((args) => [
+            args[args.indexOf("--offset") + 1],
+            args[args.indexOf("--limit") + 1],
+          ]),
+        ).toEqual([
+          ["0", "51"],
+          ["50", "51"],
+        ]);
+        expect(JSON.parse(readFileSync(join(s.storage, "data.json"), "utf8"))).toEqual(data);
+      },
+    );
+
+    it.each([
+      { field: "description", position: 50, mode: "" },
+      { field: "description", position: 0, mode: "" },
+      { field: "inherited_context", position: 50, mode: "large-details" },
+    ])(
+      "isolates an oversized $field at position $position ($mode) without blocking later pages",
+      async ({ field, position, mode }) => {
+        const s = fixture();
+        const data = Array.from({ length: 105 }, (_, index) => ({
+          ...task(`epic-${String(index).padStart(4, "0")}`, []),
+          issue_type: "epic",
+          status: index === position ? "deferred" : "open",
+          [field]: index === position ? "x".repeat(5 * 1024 * 1024) : "short",
+        }));
+        writeFileSync(join(s.storage, "data.json"), JSON.stringify(data));
+        writeFileSync(join(s.storage, "mode"), mode);
+        const binding = await s.transport.bind(s.repo),
+          signal = new AbortController().signal;
+        const pages = [];
+        for (const offset of [0, 50, 100]) {
+          const page = await s.transport.listOpenEpics(binding, signal, { offset });
+          expect(page.epics.map((epic) => epic.id).sort()).toEqual(
+            data.slice(offset, offset + 50).map((epic) => epic.id),
+          );
+          expect(
+            page.epics.filter((epic) => epic.details === "too_large").map((epic) => epic.id),
+          ).toEqual(offset === Math.floor(position / 50) * 50 ? [data[position]!.id] : []);
+          expect(page.nextOffset).toBe(offset < 100 ? offset + 50 : null);
+          pages.push(page);
+        }
+        expect(pages.flatMap((page) => page.epics).length).toBe(105);
+        const searched = await s.transport.listOpenEpics(binding, signal, {
+          search: data[position]!.id,
+        });
+        expect(searched.epics.map((epic) => epic.id)).toEqual([data[position]!.id]);
+        expect(
+          searched.epics.filter((epic) => epic.details === "too_large").map((epic) => epic.id),
+        ).toEqual([data[position]!.id]);
+        expect(searched.nextOffset).toBeNull();
+        expect(searched.epics[0]).toEqual({
+          id: data[position]!.id,
+          title: null,
+          priority: 1,
+          status: "deferred",
+          details: "too_large",
+          parentIds: null,
+        });
+        const commands = readFileSync(join(s.storage, "commands.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as string[]);
+        if (field === "description")
+          expect(commands.some((args) => args.includes("--fields"))).toBe(true);
+        // Page 1 reads only bounded lookahead metadata, never next-page details.
+        if (position === 50 && mode === "")
+          expect(commands.slice(0, 2).map((args) => args[0])).toEqual(["list", "show"]);
+        expect(JSON.parse(readFileSync(join(s.storage, "data.json"), "utf8"))).toEqual(data);
+      },
+    );
+
+    it("bounds detail recovery on crowded pages and permits an unread epic to load through search", async () => {
+      const s = fixture();
+      const data = Array.from({ length: 60 }, (_, index) => ({
+        ...task(`epic-${String(index).padStart(4, "0")}`, []),
+        issue_type: "epic",
+        status: "deferred",
+      }));
+      writeFileSync(join(s.storage, "data.json"), JSON.stringify(data));
+      s.mode("crowded-details");
+      const binding = await s.transport.bind(s.repo),
+        signal = new AbortController().signal;
+      const commands = s.commands;
+      for (const offset of [0, 50]) {
+        const before = commands().length;
+        const page = await s.transport.listOpenEpics(binding, signal, { offset });
+        expect(page.epics.map((epic) => epic.id)).toEqual(
+          data.slice(offset, offset + 50).map((epic) => epic.id),
+        );
+        expect(page.nextOffset).toBe(offset === 0 ? 50 : null);
+        expect(page.epics.some((epic) => epic.details === "too_large")).toBe(true);
+        expect(page.epics.some((epic) => epic.details === "budget_exhausted")).toBe(true);
+        expect(page.epics.every((epic) => epic.priority === 1 && epic.status === "deferred")).toBe(
+          true,
+        );
+        const reads = commands().slice(before);
+        expect(reads).toHaveLength(17);
+        expect(reads[0]).toContain("id,priority,status,issue_type");
+        expect(reads.filter((args) => args[0] === "show")).toHaveLength(16);
+        if (offset === 50)
+          expect(page.epics.at(-1)).toMatchObject({
+            id: "epic-0059",
+            details: "budget_exhausted",
+            parentIds: null,
+          });
+      }
+      const before = commands().length;
+      const selected = await s.transport.listOpenEpics(binding, signal, { search: "epic-0059" });
+      expect(selected.epics).toEqual([
+        {
+          id: "epic-0059",
+          title: "epic-0059",
+          priority: 1,
+          status: "deferred",
+          details: "available",
+          parentIds: [],
+        },
+      ]);
+      expect(selected.nextOffset).toBeNull();
+      expect(
+        commands()
+          .slice(before)
+          .map((args) => args[0]),
+      ).toEqual(["search", "show"]);
+      expect(JSON.parse(readFileSync(join(s.storage, "data.json"), "utf8"))).toEqual(data);
+    });
+
+    it.each(["summary-header", "summary-priority", "summary-status"])(
+      "rejects invalid bounded metadata (%s) instead of inventing defaults",
+      async (mode) => {
+        const s = fixture();
+        writeFileSync(
+          join(s.storage, "data.json"),
+          JSON.stringify([
+            { ...task("large", []), issue_type: "epic", description: "x".repeat(5 * 1024 * 1024) },
+          ]),
+        );
+        s.mode(mode);
+        const page = s.transport.listOpenEpics(
+          await s.transport.bind(s.repo),
+          new AbortController().signal,
+        );
+        if (mode === "summary-header")
+          await expect(page).rejects.toThrow(
+            "Tracker summary projection returned an invalid header",
+          );
+        else
+          await expect(page).rejects.toMatchObject({
+            issues: [
+              expect.objectContaining({
+                code: "invalid_value",
+                path: [mode === "summary-priority" ? 1 : 2],
+              }),
+            ],
+          });
+      },
+    );
+
+    it.each([
+      { mode: "duplicate-page", message: "unique epic identities" },
+      { mode: "duplicate-details", message: "exactly the requested epics" },
+      { mode: "missing-details", message: "exactly the requested epics" },
+      { mode: "page-overflow", message: "requested 51 epic page entries" },
+    ])(
+      "rejects malformed browser pages ($mode) without returning partial choices",
+      async ({ mode, message }) => {
+        const s = fixture();
+        writeFileSync(
+          join(s.storage, "data.json"),
+          JSON.stringify(
+            Array.from({ length: 60 }, (_, i) => ({
+              ...task(`epic-${i}`, []),
+              issue_type: "epic",
+            })),
+          ),
+        );
+        writeFileSync(join(s.storage, "mode"), mode);
+        await expect(
+          s.transport.listOpenEpics(await s.transport.bind(s.repo), new AbortController().signal),
+        ).rejects.toThrow(message);
+      },
+    );
+
     it("uses actual parent-child edges, includes nested work, and excludes a dotted-ID impostor", async () => {
       const s = fixture();
       success(await s.dispatch({ kind: "refresh_tracker" }));
@@ -727,6 +1045,160 @@ describe.skipIf(process.platform !== "linux")(
 describe.skipIf(!process.env.EPICD_TEST_BR_PATH || process.platform !== "linux")(
   "installed Beads CLI with disposable storage",
   () => {
+    it("preserves oversized epic metadata with the installed CLI's bounded projection", async () => {
+      const root = mkdtempSync("/var/tmp/epicd-real-browser-");
+      roots.push(root);
+      const fixtureHome = join(root, "private-home");
+      mkdirSync(fixtureHome);
+      const executable = realpathSync(process.env.EPICD_TEST_BR_PATH!);
+      const br = (args: string[]) =>
+        execFileSync(executable, [...args, "--json"], {
+          cwd: root,
+          env: { PATH: process.env.PATH, HOME: fixtureHome, RUST_LOG: "error" },
+          encoding: "utf8",
+          timeout: 30000,
+          maxBuffer: 16 * 1024 * 1024,
+        });
+      br(["init", "--prefix", "demo"]);
+      const body = join(root, "body.txt");
+      writeFileSync(body, "x".repeat(5 * 1024 * 1024));
+      const large = JSON.parse(
+        br([
+          "create",
+          "Large epic",
+          "--type",
+          "epic",
+          "--priority",
+          "0",
+          "--description-file",
+          body,
+        ]),
+      ) as { id: string };
+      const normal = JSON.parse(
+        br(["create", "Normal epic", "--type", "epic", "--priority", "1"]),
+      ) as { id: string };
+      br(["update", large.id, "--status", "deferred"]);
+      const transport = new KernelBeads(executable),
+        binding = await transport.bind(root),
+        signal = new AbortController().signal;
+      const page = await transport.listOpenEpics(binding, signal);
+      expect(page.epics.map((epic) => epic.id)).toEqual([large.id, normal.id]);
+      expect(page.epics[0]).toEqual({
+        id: large.id,
+        title: null,
+        priority: 0,
+        status: "deferred",
+        details: "too_large",
+        parentIds: null,
+      });
+      expect(
+        page.epics.filter((epic) => epic.details === "too_large").map((epic) => epic.id),
+      ).toEqual([large.id]);
+      expect(page.nextOffset).toBeNull();
+      const searched = await transport.listOpenEpics(binding, signal, { search: large.id });
+      expect(searched.epics.map((epic) => epic.id)).toEqual([large.id]);
+      expect(searched.epics[0]).toEqual(page.epics[0]);
+      expect(
+        searched.epics.filter((epic) => epic.details === "too_large").map((epic) => epic.id),
+      ).toEqual([large.id]);
+      expect(searched.nextOffset).toBeNull();
+    });
+
+    it("pages the installed CLI's list and search without hydrating off-page records", async () => {
+      const root = mkdtempSync("/var/tmp/epicd-real-pages-");
+      roots.push(root);
+      const fixtureHome = join(root, "private-home");
+      mkdirSync(fixtureHome);
+      const executable = realpathSync(process.env.EPICD_TEST_BR_PATH!);
+      const br = (args: string[]) =>
+        execFileSync(executable, [...args, "--json"], {
+          cwd: root,
+          env: { PATH: process.env.PATH, HOME: fixtureHome, RUST_LOG: "error" },
+          encoding: "utf8",
+          timeout: 30000,
+        });
+      br(["init", "--prefix", "demo"]);
+      const ids = Array.from(
+        { length: 55 },
+        (_, index) =>
+          (
+            JSON.parse(
+              br(["create", `Paging epic ${index}`, "--type", "epic", "--priority", "1"]),
+            ) as { id: string }
+          ).id,
+      );
+      // Equal priorities sort by creation time descending, then identity. Compare
+      // page membership separately from the browser's within-page display sort.
+      const expected = ids.toReversed();
+      const transport = new KernelBeads(executable),
+        binding = await transport.bind(root),
+        signal = new AbortController().signal;
+      for (const search of ["", "Paging epic"]) {
+        const first = await transport.listOpenEpics(binding, signal, { search });
+        expect(first.nextOffset).toBe(50);
+        expect(first.epics.map((epic) => epic.id).sort()).toEqual(expected.slice(0, 50).sort());
+        const last = await transport.listOpenEpics(binding, signal, { offset: 50, search });
+        expect(last.nextOffset).toBeNull();
+        expect(last.epics.map((epic) => epic.id).sort()).toEqual(expected.slice(50).sort());
+        expect(new Set([...first.epics, ...last.epics].map((epic) => epic.id)).size).toBe(55);
+      }
+
+      // A last-priority record with an invalid timestamp is a deterministic read
+      // canary: SQLite can sort past it, but the CLI cannot hydrate it as an Issue.
+      // Only this disposable fixture is corrupted, after checking both full pages.
+      const canary = JSON.parse(
+        br(["create", "Paging epic canary", "--type", "epic", "--priority", "4"]),
+      ) as { id: string };
+      const db = new Database(join(root, ".beads", "beads.db"));
+      try {
+        expect(
+          db
+            .prepare("UPDATE issues SET created_at = ? WHERE id = ?")
+            .run("unread-off-page-canary", canary.id).changes,
+        ).toBe(1);
+      } finally {
+        db.close();
+      }
+      for (const search of ["", "Paging epic"]) {
+        // Negative control: this option moves LIMIT/OFFSET after hydration in br.
+        // Require the specific decoder failure so a broken fixture cannot pass.
+        expect(() =>
+          execFileSync(
+            executable,
+            [
+              search ? "search" : "list",
+              "--type",
+              "epic",
+              "--deferred",
+              "--sort",
+              "priority",
+              "--limit",
+              "51",
+              "--offset",
+              "0",
+              "--format",
+              "csv",
+              "--fields",
+              "id,priority,status,issue_type",
+              "--no-auto-import",
+              "--no-auto-flush",
+              ...(search ? ["--", search] : []),
+            ],
+            {
+              cwd: root,
+              env: { PATH: process.env.PATH, HOME: fixtureHome, RUST_LOG: "error" },
+              encoding: "utf8",
+              stdio: "pipe",
+              timeout: 30000,
+            },
+          ),
+        ).toThrow("unparseable datetime: unread-off-page-canary");
+        const first = await transport.listOpenEpics(binding, signal, { search });
+        expect(first.nextOffset).toBe(50);
+        expect(first.epics.map((epic) => epic.id).sort()).toEqual(expected.slice(0, 50).sort());
+      }
+    });
+
     it("journals a real non-dotted child claim through the confined transport", async () => {
       const root = mkdtempSync("/var/tmp/epicd-real-beads-");
       roots.push(root);

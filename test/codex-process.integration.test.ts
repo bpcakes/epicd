@@ -121,7 +121,9 @@ describe("Codex app-server process cleanup", () => {
       try {
         if (timing === "before request") process.kill(pids.supervisor, "SIGSTOP");
         const terminating = timing === "during grace" ? once(server.stdout, "data") : null;
-        const stopped = new Promise<void>((resolve) => server.stop(resolve));
+        const stopped = new Promise<void>((resolve, reject) =>
+          server.stop((error) => (error ? reject(error) : resolve())),
+        );
         if (timing === "during grace") {
           await terminating;
           process.kill(pids.supervisor, "SIGSTOP");
@@ -385,13 +387,17 @@ process.stdin.resume();
       childPid = Number(readFileSync(childPidPath, "utf8"));
       expect(processExists(parentPid)).toBe(true);
       expect(processExists(childPid)).toBe(true);
-      await new Promise<void>((resolve) => server.stop(resolve));
+      await new Promise<void>((resolve, reject) =>
+        server.stop((error) => (error ? reject(error) : resolve())),
+      );
       await waitForProcessExit(parentPid);
       await waitForProcessExit(childPid);
       expect(processExists(parentPid)).toBe(false);
       expect(processExists(childPid)).toBe(false);
     } finally {
-      await new Promise<void>((resolve) => server.stop(resolve));
+      await new Promise<void>((resolve, reject) =>
+        server.stop((error) => (error ? reject(error) : resolve())),
+      );
       if (previousParentPidPath === undefined) delete process.env.EPICD_TEST_PARENT_PID;
       else process.env.EPICD_TEST_PARENT_PID = previousParentPidPath;
       if (previousChildPidPath === undefined) delete process.env.EPICD_TEST_CHILD_PID;

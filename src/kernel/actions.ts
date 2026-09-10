@@ -175,8 +175,19 @@ export class ActionKernel {
         );
       const latestResult = turns.findLast((turn) => turn.result !== null);
       const resultText = latestResult ? JSON.stringify(latestResult.result) : null;
+      const { accountBinding: privateBinding, ...publicAgent } = agent;
       const content = {
-        agent,
+        agent: {
+          ...publicAgent,
+          ...(privateBinding
+            ? {
+                account: {
+                  accountClass: privateBinding.accountClass,
+                  label: privateBinding.source.label,
+                },
+              }
+            : {}),
+        },
         assignment: journal.agents.assignment(authority.runId, agent.assignmentId),
         messages: journal.agents
           .messages(authority.runId, agent)

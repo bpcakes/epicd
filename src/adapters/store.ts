@@ -238,6 +238,15 @@ export function defaultStatePath(): string {
   return join(stateRoot, "epicd", "epicd.sqlite3");
 }
 
+export class UnsupportedStateFormatError extends Error {
+  constructor(readonly path: string) {
+    super(
+      "This Epicd state format is unsupported. Use a fresh state path; existing data was not migrated or deleted.",
+    );
+    this.name = "UnsupportedStateFormatError";
+  }
+}
+
 export class StateStore {
   readonly path: string;
   private readonly db: Database.Database;
@@ -298,9 +307,7 @@ export class StateStore {
             }[])
           : [];
         if (versions.length !== 1 || versions[0]?.version !== ORCHESTRATION_SCHEMA_VERSION)
-          throw new Error(
-            "This Epicd state format is unsupported. Use a fresh state path; existing data was not migrated or deleted.",
-          );
+          throw new UnsupportedStateFormatError(this.fileIdentity.path);
         this.db.exec("COMMIT");
         return;
       }

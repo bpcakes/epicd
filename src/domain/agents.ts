@@ -1,3 +1,4 @@
+import { AccountBindingSchema } from "./accounts.js";
 import { z } from "zod";
 import { TurnIdentitySchema } from "./orchestration.js";
 import { AgentRoleSchema, AgentSessionContractSchema } from "./types.js";
@@ -93,6 +94,7 @@ export const AgentInstanceSchema = AgentIdentitySchema.extend({
   role: AgentRoleSchema,
   ...WorkspaceIdentitySchema.shape,
   assignmentId: Id,
+  accountBinding: AccountBindingSchema.optional(),
   contract: AgentSessionContractSchema,
   confinementProfile: z.string().min(1).max(256),
   provider: ProviderIdentitySchema.nullable(),
