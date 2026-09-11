@@ -3,8 +3,11 @@ import { render } from "ink";
 import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Result from "effect/Result";
 import type { EpicBrowserItem } from "../epic-browser.js";
 import { EpicPicker, type EpicBrowserQuery } from "./epic-picker.js";
+import { inkLifecycle, type TerminalState } from "./ink-lifecycle.js";
+import { errorDetail } from "../util/error-detail.js";
 
 export type EpicPickerEvent =
   | { kind: "select"; item: EpicBrowserItem }
@@ -16,9 +19,14 @@ export class EpicPickerFailed extends Data.TaggedError("EpicPickerFailed")<{
   readonly stage: "render" | "wait" | "cleanup";
   readonly cause: unknown;
   readonly message: string;
+  readonly terminalState: TerminalState;
 }> {
-  constructor(options: { stage: "render" | "wait" | "cleanup"; cause: unknown }) {
-    const detail = options.cause instanceof Error ? options.cause.message : String(options.cause);
+  constructor(options: {
+    stage: "render" | "wait" | "cleanup";
+    cause: unknown;
+    terminalState: TerminalState;
+  }) {
+    const detail = errorDetail(options.cause);
     super({ ...options, message: `Epic picker ${options.stage} failed: ${detail}` });
   }
 }
@@ -37,7 +45,7 @@ export function pickEpicEffect(
     const stop = () => {
       finish({ kind: "quit" });
     };
-    return yield* Effect.acquireUseRelease(
+    const result = yield* Effect.acquireUseRelease(
       Effect.try({
         try: () => {
           const ui = render(
@@ -53,37 +61,61 @@ export function pickEpicEffect(
             />,
             { exitOnCtrlC: false, interactive: true },
           );
-          signal.addEventListener("abort", stop, { once: true });
-          if (signal.aborted) stop();
-          return { ui, exited: undefined as Promise<unknown> | undefined };
+          return inkLifecycle(ui);
         },
-        catch: (cause) => new EpicPickerFailed({ stage: "render", cause }),
+        catch: (cause) =>
+          new EpicPickerFailed({ stage: "render", cause, terminalState: "unknown" }),
       }),
       (session) =>
-        Effect.gen(function* () {
-          yield* Effect.try({
-            try: () => {
-              session.exited = session.ui.waitUntilExit();
-              void session.exited.then(stop, (cause) =>
-                Deferred.doneUnsafe(
-                  selection,
-                  Effect.fail(new EpicPickerFailed({ stage: "wait", cause })),
-                ),
-              );
-            },
-            catch: (cause) => new EpicPickerFailed({ stage: "wait", cause }),
-          });
-          return yield* Deferred.await(selection);
-        }),
+        Effect.result(
+          Effect.gen(function* () {
+            yield* Effect.try({
+              try: () => {
+                signal.addEventListener("abort", stop, { once: true });
+                if (signal.aborted) stop();
+                void session.exited.then((outcome) => {
+                  if (Result.isFailure(outcome))
+                    Deferred.doneUnsafe(
+                      selection,
+                      Effect.fail(
+                        new EpicPickerFailed({
+                          stage: outcome.failure.stage,
+                          cause: outcome.failure.cause,
+                          terminalState: outcome.failure.terminalState,
+                        }),
+                      ),
+                    );
+                  else stop();
+                });
+              },
+              catch: (cause) =>
+                new EpicPickerFailed({ stage: "wait", cause, terminalState: "unknown" }),
+            });
+            return yield* Deferred.await(selection);
+          }),
+        ),
       (session) =>
-        Effect.tryPromise({
-          try: async () => {
-            signal.removeEventListener("abort", stop);
-            session.ui.unmount();
-            await (session.exited ?? session.ui.waitUntilExit());
-          },
-          catch: (cause) => new EpicPickerFailed({ stage: "cleanup", cause }),
-        }),
+        session.release(Effect.void, [() => signal.removeEventListener("abort", stop)]).pipe(
+          Effect.mapError(
+            (failure) =>
+              new EpicPickerFailed({
+                stage: failure.stage,
+                cause: failure.cause,
+                terminalState: failure.terminalState,
+              }),
+          ),
+        ),
     );
+    // Reaching this point proves release succeeded. A failed use can now report
+    // a released terminal; release failures already propagated from the bracket.
+    if (Result.isFailure(result))
+      return yield* Effect.fail(
+        new EpicPickerFailed({
+          stage: result.failure.stage,
+          cause: result.failure.cause,
+          terminalState: "released",
+        }),
+      );
+    return result.success;
   });
 }

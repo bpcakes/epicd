@@ -7,7 +7,7 @@ import { render } from "ink";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import { StateStore, UnsupportedStateFormatError, defaultStatePath } from "./adapters/store.js";
-import { selectAccounts } from "./tui/account-editor-session.js";
+import { AccountSelectionFailed, selectAccountsEffect } from "./tui/account-editor-session.js";
 import { loadAccountDraft } from "./adapters/accounts.js";
 import { frozenAccountSummary, type AccountOverrides } from "./domain/accounts.js";
 import { createRun } from "./bootstrap.js";
@@ -26,6 +26,7 @@ import { RunView } from "./tui/run-view.js";
 import { OperatorView } from "./tui/operator-view.js";
 import { runDoctor } from "./doctor.js";
 import { redactSensitiveText } from "./util/redact.js";
+import { errorDetail } from "./util/error-detail.js";
 import {
   assertEpicBrowserSelection,
   browserTimingTracer,
@@ -33,7 +34,7 @@ import {
   type EpicBrowserSnapshot,
 } from "./epic-browser.js";
 import type { EpicBrowserQuery } from "./tui/epic-picker.js";
-import { pickEpicEffect } from "./tui/epic-picker-session.js";
+import { EpicPickerFailed, pickEpicEffect } from "./tui/epic-picker-session.js";
 import { EPIC_PAGE_SIZE } from "./domain/epic-discovery.js";
 
 type BaseOptions = { state: string };
@@ -199,22 +200,36 @@ async function startRun(
     );
   let run: Awaited<ReturnType<typeof createRun>> | undefined;
   if (!options.headless && process.stdin.isTTY && process.stdout.isTTY) {
-    const selection = await selectAccounts(epicId, accountOverrides, configPath, signal, {
-      ...(epicTitle !== undefined ? { epicTitle } : {}),
-      repoPath: resolve(options.repo),
-      runtime: options.runtime,
-      start: async (draft, setupSignal) => {
-        run = await create(draft, setupSignal);
-      },
-    });
-    if (selection === "quit") return "quit" as const;
-    if (selection === null || signal?.aborted) return false;
+    const selected = await Effect.runPromise(
+      Effect.result(
+        selectAccountsEffect(epicId, accountOverrides, configPath, signal, {
+          ...(epicTitle !== undefined ? { epicTitle } : {}),
+          repoPath: resolve(options.repo),
+          runtime: options.runtime,
+          start: async (draft, setupSignal) => {
+            run = await create(draft, setupSignal);
+          },
+        }),
+      ),
+    );
+    // Retain the failure classification until the browser has decided whether
+    // the terminal is reusable. The external Promise API still unwraps causes.
+    if (Result.isFailure(selected)) {
+      if (run) throw new RunSetupFailed(run.runId, options.state, selected.failure);
+      throw selected.failure;
+    }
+    const selection = selected.success;
+    if (run && signal?.aborted) throw new RunSetupFailed(run.runId, options.state, signal.reason);
+    if (selection === "quit" || selection === null || signal?.aborted) {
+      if (run) process.stderr.write(createdRunRecovery(run.runId, options.state) + "\n");
+      return selection === "quit" ? ("quit" as const) : false;
+    }
   } else {
     run = await create(await loadAccountDraft(accountOverrides, configPath), signal);
   }
   if (!run) throw new Error("Account setup completed without creating a run");
   process.stdout.write(`Created run ${run.runId}\n`);
-  signal?.throwIfAborted();
+  if (signal?.aborted) throw new RunSetupFailed(run.runId, options.state, signal.reason);
   await launch(store, run.runId, options);
   return true;
 }
@@ -368,7 +383,16 @@ async function browseEpics(store: StateStore, options: StartOptions) {
               }),
             ),
           );
-          if (cancellation.signal.aborted) return;
+          // Cancellation does not make an incompletely released terminal safe.
+          if (Result.isFailure(launched) && hasUnknownTerminalState(launched.failure))
+            return yield* Effect.fail(launched.failure);
+          if (cancellation.signal.aborted) {
+            // Cancellation stops future work; it cannot erase a committed run's
+            // recovery information. Let the executable report that outcome.
+            if (Result.isFailure(launched) && launched.failure instanceof RunSetupFailed)
+              return yield* Effect.fail(launched.failure);
+            return;
+          }
           if (Result.isSuccess(launched)) {
             if (launched.success === "back") {
               error = undefined;
@@ -377,7 +401,10 @@ async function browseEpics(store: StateStore, options: StartOptions) {
             return;
           }
           const failure = launched.failure;
-          error = redactSensitiveText(failure instanceof Error ? failure.message : String(failure));
+          // Retain committed-run instructions outside the disposable picker view.
+          if (failure instanceof RunSetupFailed)
+            process.stderr.write(createdRunRecovery(failure.runId, failure.statePath) + "\n");
+          error = cliFailureMessage(failure);
         }
       }),
     ({ cancellation, stop }) =>
@@ -694,17 +721,83 @@ export function createProgram() {
   return program;
 }
 
+function createdRunRecovery(runId: string, statePath: string): string {
+  const path = resolve(statePath);
+  const prefix = `Created run ${runId}. No controller started.`;
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(path)) {
+    const displayed = JSON.stringify(path).replace(
+      /[\u007f-\u009f]/g,
+      (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+    return `${prefix}\nState file: ${displayed}\nResume with epicd resume ${runId}, supplying that path with --state.`;
+  }
+  const quoted = "'" + path.replaceAll("'", "'\\''") + "'";
+  return `${prefix}\nResume with: epicd resume ${runId} --state ${quoted}`;
+}
+
+class RunSetupFailed extends Error {
+  constructor(
+    readonly runId: string,
+    readonly statePath: string,
+    cause: unknown,
+  ) {
+    // Put the durable outcome first so diagnostic clipping cannot hide the run.
+    super(`${createdRunRecovery(runId, statePath)}\n${errorDetail(cause)}`, { cause });
+    this.name = "RunSetupFailed";
+  }
+}
+
+function cliFailureMessage(error: unknown): string {
+  let message: string;
+  if (error instanceof RunSetupFailed) {
+    // The operator-supplied filename is command data, not free-form error text.
+    // Redacting a shell-quoted path can corrupt its value and closing quote.
+    message = `${createdRunRecovery(error.runId, error.statePath)}\n${redactSensitiveText(errorDetail(error.cause))}`;
+  } else
+    message =
+      error instanceof UnsupportedStateFormatError
+        ? unsupportedStateAdvice(error)
+        : redactSensitiveText(errorDetail(error));
+  // Keep diagnostic line breaks, but never let cause text move the cursor or
+  // erase recovery instructions. This applies to every CLI failure formatter.
+  return message.replace(
+    /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g,
+    (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+function hasUnknownTerminalState(error: unknown): boolean {
+  const failure = error instanceof RunSetupFailed ? error.cause : error;
+  return (
+    (failure instanceof EpicPickerFailed || failure instanceof AccountSelectionFailed) &&
+    failure.terminalState === "unknown"
+  );
+}
+
+/** Executable boundary only; embedded createProgram callers receive the typed error. */
+export function reportCliFailure(error: unknown): void {
+  const diagnostic = `epicd: ${cliFailureMessage(error)}\n`;
+  process.exitCode = 1;
+  if (hasUnknownTerminalState(error)) {
+    // All command scopes and owned work have drained before parseAsync rejects.
+    // A broken Ink instance can still hold stdin open. Exit after flushing the
+    // diagnostic rather than relying on its incomplete teardown to release it.
+    // A stalled asynchronous pipe must not keep the broken executable alive.
+    // Give output one second; the fallback may truncate an undeliverable message.
+    const deadline = setTimeout(() => process.exit(1), 1_000);
+    deadline.unref();
+    try {
+      process.stderr.write(diagnostic, () => {
+        clearTimeout(deadline);
+        process.exit(1);
+      });
+    } catch {
+      clearTimeout(deadline);
+      process.exit(1);
+    }
+  } else process.stderr.write(diagnostic);
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
-  createProgram()
-    .parseAsync()
-    .catch((error) => {
-      process.stderr.write(
-        `epicd: ${
-          error instanceof UnsupportedStateFormatError
-            ? unsupportedStateAdvice(error)
-            : redactSensitiveText(error instanceof Error ? error.message : String(error))
-        }\n`,
-      );
-      process.exitCode = 1;
-    });
+  createProgram().parseAsync().catch(reportCliFailure);
 }

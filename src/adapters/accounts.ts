@@ -1,9 +1,23 @@
 import { lstatSync, realpathSync } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  realpath,
+  rename,
+  unlink,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
+import * as Result from "effect/Result";
+import { errorDetail } from "../util/error-detail.js";
 import {
   readCodexAccessCache,
   readCodexAccessCacheSync,
@@ -61,43 +75,119 @@ export async function loadAccountPreferences(
     throw new Error(`Cannot read account preferences at ${path}: ${detail}`);
   }
 }
+export class AccountPreferencesSaveFailed extends Data.TaggedError("AccountPreferencesSaveFailed")<{
+  readonly stage:
+    | "validate"
+    | "prepare"
+    | "read_existing"
+    | "open"
+    | "write"
+    | "sync"
+    | "publish"
+    | "close"
+    | "cleanup";
+  readonly cause: unknown;
+  readonly message: string;
+}> {
+  constructor(options: { stage: AccountPreferencesSaveFailed["stage"]; cause: unknown }) {
+    const detail = errorDetail(options.cause);
+    super({ ...options, message: `Account preferences ${options.stage} failed: ${detail}` });
+  }
+}
+
+/** Atomic replacement; interruption waits for each I/O and for publication's directory sync. */
+export function saveAccountPreferencesEffect(
+  preferences: AccountPreferences,
+  inputPath?: string,
+): Effect.Effect<void, AccountPreferencesSaveFailed> {
+  const io = <A>(stage: AccountPreferencesSaveFailed["stage"], run: () => Promise<A>) =>
+    Effect.uninterruptible(
+      Effect.tryPromise({
+        try: run,
+        catch: (cause) => new AccountPreferencesSaveFailed({ stage, cause }),
+      }),
+    );
+  const unwrap = <A>(result: Result.Result<A, AccountPreferencesSaveFailed>) =>
+    Result.isFailure(result) ? Effect.fail(result.failure) : Effect.succeed(result.success);
+  const withFile = (
+    path: string,
+    flags: string,
+    mode: number | undefined,
+    use: (file: FileHandle) => Effect.Effect<void, AccountPreferencesSaveFailed>,
+  ) =>
+    Effect.acquireUseRelease(
+      io("open", () => open(path, flags, mode)),
+      (file) => Effect.result(use(file)),
+      (file) => io("close", () => file.close()),
+    ).pipe(Effect.flatMap(unwrap));
+  return Effect.gen(function* () {
+    const input = inputPath ?? defaultAccountsPath();
+    const bytes = yield* Effect.try({
+      try: () => JSON.stringify(AccountPreferencesSchema.parse(preferences), null, 2) + "\n",
+      catch: (cause) => new AccountPreferencesSaveFailed({ stage: "validate", cause }),
+    });
+    const parent = yield* io("prepare", async () => {
+      await mkdir(dirname(input), { recursive: true, mode: 0o700 });
+      const parent = await realpath(dirname(input));
+      const info = await lstat(parent);
+      if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)
+        throw new Error(
+          "Account preferences directory must be a real, owned directory with mode 0700",
+        );
+      return parent;
+    });
+    const path = join(parent, basename(input));
+    yield* io("read_existing", async () => {
+      AccountPreferencesSchema.parse(JSON.parse(await readOwnerFile(path, 64 * 1024)));
+    }).pipe(
+      Effect.catchTag("AccountPreferencesSaveFailed", (error) =>
+        error.cause instanceof Error && "code" in error.cause && error.cause.code === "ENOENT"
+          ? Effect.void
+          : Effect.fail(error),
+      ),
+    );
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    yield* Effect.acquireUseRelease(
+      Effect.succeed(temporary),
+      () =>
+        Effect.result(
+          Effect.gen(function* () {
+            yield* withFile(temporary, "wx", 0o600, (file) =>
+              Effect.gen(function* () {
+                yield* io("write", () => file.writeFile(bytes));
+                yield* io("sync", () => file.sync());
+              }),
+            );
+            // Once publication starts, finish its durability step before honoring interruption.
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                yield* io("publish", () => rename(temporary, path));
+                yield* withFile(parent, "r", undefined, (directory) =>
+                  io("sync", () => directory.sync()),
+                );
+              }),
+            );
+          }),
+        ),
+      () =>
+        io("cleanup", async () => {
+          await unlink(temporary).catch((error) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+        }),
+    ).pipe(Effect.flatMap(unwrap));
+  });
+}
+
+/** Existing callers keep the Promise API and the original rejection value. */
 export async function saveAccountPreferences(
   preferences: AccountPreferences,
   path = defaultAccountsPath(),
-) {
-  const bytes = JSON.stringify(AccountPreferencesSchema.parse(preferences), null, 2) + "\n";
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const parent = await realpath(dirname(path));
-  const info = await lstat(parent);
-  if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)
-    throw new Error("Account preferences directory must be a real, owned directory with mode 0700");
-  path = join(parent, basename(path));
-  try {
-    AccountPreferencesSchema.parse(JSON.parse(await readOwnerFile(path, 64 * 1024)));
-  } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-  }
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  try {
-    const file = await open(temporary, "wx", 0o600);
-    try {
-      await file.writeFile(bytes);
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, path);
-    const directory = await open(parent, "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  } finally {
-    await unlink(temporary).catch((error) => {
-      if (error.code !== "ENOENT") throw error;
-    });
-  }
+): Promise<void> {
+  const result = await Effect.runPromise(
+    Effect.result(saveAccountPreferencesEffect(preferences, path)),
+  );
+  if (Result.isFailure(result)) throw result.failure.cause;
 }
 export async function loadAccountDraft(
   overrides: AccountOverrides = {},

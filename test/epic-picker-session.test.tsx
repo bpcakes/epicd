@@ -43,7 +43,9 @@ function fixture(autoExit = true) {
       rerender: vi.fn(),
       cleanup: vi.fn(),
       clear: vi.fn(),
-      waitUntilRenderFlush: async () => {},
+      waitUntilRenderFlush: async () => {
+        await exited.catch(() => {});
+      },
     };
   });
   const program = pickEpicEffect(
@@ -158,6 +160,18 @@ it("reports render failure without leaving an abort listener", async () => {
   f.close();
 });
 
+it("releases the picker after abort listener registration fails", async () => {
+  const f = fixture(),
+    cause = new Error("abort registration failed");
+  vi.spyOn(f.cancellation.signal, "addEventListener").mockImplementation(() => {
+    throw cause;
+  });
+  const result = await Effect.runPromise(Effect.result(f.program));
+  if (!Result.isFailure(result)) throw new Error("Expected registration failure");
+  expect(result.failure).toMatchObject({ stage: "wait", cause, terminalState: "released" });
+  expect(f.unmount).toHaveBeenCalledOnce();
+});
+
 it("unmounts and removes listeners when waiting for Ink fails", async () => {
   const f = fixture(),
     cause = new Error("terminal disconnected");
@@ -167,8 +181,97 @@ it("unmounts and removes listeners when waiting for Ink fails", async () => {
   f.fail(cause);
   const result = await work;
   if (!Result.isFailure(result)) throw new Error("Expected terminal failure");
+  expect(result.failure.stage).toBe("wait");
+  expect(result.failure.terminalState).toBe("released");
   expect(result.failure.cause).toBe(cause);
   expect(f.unmount).toHaveBeenCalledOnce();
   expect(f.waitUntilExit).toHaveBeenCalledOnce();
   expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+});
+
+it.each(["after selection", "synchronous", "unmount"] as const)(
+  "preserves the origin and cause of %s failures",
+  async (timing) => {
+    const f = fixture(false),
+      cause = new Error("terminal failed");
+    const remove = vi.spyOn(f.cancellation.signal, "removeEventListener");
+    if (timing === "synchronous")
+      f.waitUntilExit.mockImplementationOnce(() => {
+        throw cause;
+      });
+    if (timing === "unmount")
+      f.unmount.mockImplementationOnce(() => {
+        throw cause;
+      });
+    const work = Effect.runPromise(Effect.result(f.program));
+    let settled = false;
+    void work.then(() => {
+      settled = true;
+    });
+    try {
+      await expect.poll(() => f.props()).toBeDefined();
+      if (timing !== "synchronous") f.props().onSelect(item);
+      await expect.poll(() => f.unmount.mock.calls.length).toBe(1);
+      if (timing === "after selection") f.fail(cause);
+      if (timing === "synchronous") f.close();
+      // Failed unmount does not settle exited; a wait failure still needs flush evidence.
+      await expect.poll(() => settled).toBe(true);
+      const result = await work;
+      if (!Result.isFailure(result)) throw new Error("Expected terminal failure");
+      expect(result.failure.stage).toBe(timing === "unmount" ? "cleanup" : "wait");
+      expect(result.failure.terminalState).toBe(timing === "unmount" ? "unknown" : "released");
+      expect(result.failure.cause).toBe(cause);
+      expect(f.waitUntilExit).toHaveBeenCalledOnce();
+      expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+    } finally {
+      f.cancellation.abort();
+      f.close();
+      await work;
+    }
+  },
+);
+
+it("reports cleanup failure when both exit and unmount fail", async () => {
+  const f = fixture(false),
+    cause = new Error("unmount failed");
+  f.unmount.mockImplementationOnce(() => {
+    throw cause;
+  });
+  const work = Effect.runPromise(Effect.result(f.program));
+  await expect.poll(() => f.props()).toBeDefined();
+  f.fail(new Error("renderer failed first"));
+  const result = await work;
+  if (!Result.isFailure(result)) throw new Error("Expected cleanup failure");
+  expect(result.failure.stage).toBe("cleanup");
+  expect(result.failure.terminalState).toBe("unknown");
+  expect(result.failure.cause).toBe(cause);
+  expect(f.unmount).toHaveBeenCalledOnce();
+});
+
+it("still unmounts and awaits exit when abort listener removal fails", async () => {
+  const f = fixture(false),
+    cause = new Error("abort listener cleanup failed");
+  const remove = f.cancellation.signal.removeEventListener.bind(f.cancellation.signal);
+  vi.spyOn(f.cancellation.signal, "removeEventListener").mockImplementation((...args) => {
+    remove(...args);
+    throw cause;
+  });
+  const work = Effect.runPromise(Effect.result(f.program));
+  let settled = false;
+  void work.then(() => {
+    settled = true;
+  });
+  try {
+    await expect.poll(() => f.props()).toBeDefined();
+    f.props().onQuit();
+    await expect.poll(() => f.unmount.mock.calls.length).toBe(1);
+    expect(settled).toBe(false);
+    f.close();
+    const result = await work;
+    if (!Result.isFailure(result)) throw new Error("Expected cleanup failure");
+    expect(result.failure).toMatchObject({ stage: "cleanup", cause, terminalState: "unknown" });
+  } finally {
+    f.close();
+    await work;
+  }
 });
