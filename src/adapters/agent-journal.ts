@@ -23,6 +23,10 @@ import {
   type WorkspaceRecord,
 } from "../domain/agents.js";
 import {
+  EssentialTurnFailureSchema,
+  type EssentialTurnFailure,
+} from "../domain/provider-failure.js";
+import {
   sameTurn,
   TurnIdentitySchema,
   type ControllerAuthority,
@@ -1560,6 +1564,52 @@ export class AgentJournal {
     });
   }
 
+  /** Trusted provider adapters only: preserves the first exact-launch provider cause. */
+  recordEssentialFailure(
+    authority: ControllerAuthority,
+    identity: TurnIdentity,
+    input: EssentialTurnFailure,
+  ): TurnRecord {
+    return this.access.transaction(authority, () => {
+      const turn = this.turn(authority.runId, identity);
+      const failure = EssentialTurnFailureSchema.parse(input);
+      const agent = this.instance(authority.runId, identity);
+      if (
+        !sameTurn(failure.identity, identity) ||
+        agent.contract.runtime !== "sdk" ||
+        !turn.launch ||
+        turn.launch.manifest.generation !== failure.launchGeneration ||
+        turn.launch.stop ||
+        turn.stopEvidence ||
+        turn.status === "prepared" ||
+        (failure.providerSessionId !== null &&
+          (agent.provider?.runtime !== "sdk" ||
+            agent.provider.sessionId !== failure.providerSessionId))
+      )
+        throw new AgentCoordinationError(
+          "failure_not_current",
+          "Provider failure needs the exact active unstopped SDK launch",
+        );
+      this.requireCurrent(turn);
+      if (turn.essentialFailure && digestJson(turn.essentialFailure) !== digestJson(failure))
+        throw new AgentCoordinationError(
+          "failure_conflict",
+          "The first provider failure for a turn is immutable",
+        );
+      if (!turn.essentialFailure) {
+        turn.essentialFailure = failure;
+        this.saveTurn(turn);
+        this.event(
+          authority,
+          "agent.provider_failure",
+          `${failure.category}/${failure.evidence} from ${failure.source}`,
+          identity,
+        );
+      }
+      return turn;
+    });
+  }
+
   acknowledgePrompt(
     authority: ControllerAuthority,
     identity: TurnIdentity,
@@ -1935,6 +1985,10 @@ export class AgentJournal {
       (turn.launch &&
         (digestJson(turn.launch.manifest) !== turn.launch.manifestDigest ||
           (turn.launch.stop && turn.launch.stop.generation !== turn.launch.manifest.generation))) ||
+      (turn.essentialFailure !== undefined &&
+        (!sameTurn(turn.identity, turn.essentialFailure.identity) ||
+          !turn.launch ||
+          turn.essentialFailure.launchGeneration !== turn.launch.manifest.generation)) ||
       turn.prompt.assignment.assignmentId !== turn.identity.assignmentId ||
       terminal(turn) !== ["completed", "failed", "cancelled"].includes(turn.status) ||
       (turn.resultEligible &&

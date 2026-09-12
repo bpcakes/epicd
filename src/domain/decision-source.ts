@@ -17,6 +17,25 @@ export const DecisionSourceFailureCodeSchema = z.enum([
 ]);
 export type DecisionSourceFailureCode = z.infer<typeof DecisionSourceFailureCodeSchema>;
 
+/** Provider failures retain finer categories than the decision loop currently acts on. */
+export const ProviderFailureCategorySchema = z.enum([
+  ...DecisionSourceFailureCodeSchema.options,
+  "context_window",
+  "session_budget",
+]);
+export type ProviderFailureCategory = z.infer<typeof ProviderFailureCategorySchema>;
+
+export function decisionSourceCodeForProviderFailure(
+  category: ProviderFailureCategory,
+): DecisionSourceFailureCode {
+  // A durable provider failure may follow prompt acknowledgement. The loop's
+  // `transient` code retries automatically, so throttling stays classified on
+  // the turn but cannot itself authorize a replay.
+  return category === "transient" || category === "context_window" || category === "session_budget"
+    ? "runtime"
+    : category;
+}
+
 /**
  * Trusted adapters only: this exception asserts that the failed request has settled.
  * Do not infer it from model prose, HTTP 429 alone, or a settled Herdr screen.
@@ -48,6 +67,18 @@ export const DecisionSourceOutcomeSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("indeterminate"), detail: z.string().max(8000) }),
 ]);
 export type DecisionSourceOutcome = z.infer<typeof DecisionSourceOutcomeSchema>;
+
+export function decisionSourceFailureForProviderFailure(failure: {
+  category: ProviderFailureCategory;
+  message: string;
+}): Extract<DecisionSourceOutcome, { kind: "failure" }> {
+  return {
+    kind: "failure",
+    code: decisionSourceCodeForProviderFailure(failure.category),
+    detail: failure.message,
+    retryAfterMs: null,
+  };
+}
 
 export const DecisionSourceAttemptSchema = z.strictObject({
   attemptId: z.string().uuid(),

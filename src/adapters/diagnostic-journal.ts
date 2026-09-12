@@ -83,7 +83,7 @@ export class DiagnosticJournal {
     if (parsed.identity && parsed.identity.runId !== authority.runId)
       throw new Error("Diagnostic belongs to a different run");
     // Keep only a digest of raw input: redaction must not make conflicting source-event reuse look identical.
-    const inputDigest = digestJson({ input, text, sourceTruncated });
+    const inputDigest = diagnosticInputDigest(input, text, sourceTruncated);
     return this.port.transaction(authority, () => {
       if (parsed.identity) this.port.turn(authority.runId, parsed.identity);
       const previous = this.db
@@ -176,6 +176,23 @@ export class DiagnosticJournal {
     return page;
   }
 
+  /** Match original input, never the redacted or clipped display artifact.
+   * Callers must still append the selected input to check authority and replay it.
+   */
+  matchesInput(
+    runId: string,
+    input: Omit<ObservationInput, "artifactIds">,
+    text: string,
+    sourceTruncated = false,
+  ): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT input_digest FROM diagnostic_artifacts WHERE run_id = ? AND source = ? AND source_event_id = ?",
+      )
+      .get(runId, input.source, input.sourceEventId) as { input_digest: string } | undefined;
+    return row?.input_digest === diagnosticInputDigest(input, text, sourceTruncated);
+  }
+
   /** Complete retained content, still redacted and potentially originally truncated. */
   retained(runId: string, artifactId: string) {
     const row = this.db
@@ -217,6 +234,14 @@ export class DiagnosticJournal {
       throw new Error("Retained diagnostic failed its content integrity check");
     return artifact;
   }
+}
+
+function diagnosticInputDigest(
+  input: Omit<ObservationInput, "artifactIds">,
+  text: string,
+  sourceTruncated: boolean,
+): string {
+  return digestJson({ input, text, sourceTruncated });
 }
 
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");

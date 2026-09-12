@@ -4,6 +4,7 @@ import {
   DecisionSourceAttemptSchema,
   DecisionSourceOutcomeSchema,
   MAX_DECISION_SOURCE_ATTEMPTS,
+  decisionSourceFailureForProviderFailure,
   type DecisionExecution,
   type DecisionSourceAttempt,
   type DecisionSourceOutcome,
@@ -286,8 +287,9 @@ export class DecisionJournal {
       const turn = this.linkedTurn(authority.runId, attempt);
       if (!turn.stopEvidence) throw new Error("Decision source turn has no confirmed stop");
       const decision = OrchestratorDecisionSchema.safeParse(turn.result);
-      attempt.outcome =
-        turn.status === "cancelled"
+      attempt.outcome = turn.essentialFailure
+        ? decisionSourceFailureForProviderFailure(turn.essentialFailure)
+        : turn.status === "cancelled"
           ? {
               kind: "invalid_output",
               detail:

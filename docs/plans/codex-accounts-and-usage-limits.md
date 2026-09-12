@@ -2,15 +2,15 @@
 
 ## Current delivery scope
 
-The requested implementation delivers T1, T2, and the selection-only portion of T5.
+The implementation to date delivers T1, T2, T4, and the selection-only portion of T5.
 T5 covers choosing homes, inheritance, confirmation, CLI selectors, and Save defaults.
-Usage/status inspection and Refresh are deferred to T9; quota handling remains in T3/T4/T6/T7/T8.
+Usage/status inspection and Refresh are deferred to T9; remaining quota work is in T3/T6/T7/T8.
 Selected-account default-model discovery belongs to T2 so routing is complete without T3.
 The broader workflows and status contracts below remain the specification for that deferred work.
 
-### Delivered and verified — 2026-09-10
+### Delivered and verified — 2026-09-12
 
-T1, T2, and selection-only T5 are implemented. T9 and the quota/status tasks remain open.
+T1, T2, T4, and selection-only T5 are implemented. T3, T6, T7, T8, and T9 remain open.
 Runs use v4 account snapshots. The sole operator explicitly removed legacy credential
 and migration requirements on 2026-09-10: no `--auth-cache`, v3 reader, or global cache mode.
 The README documents selectors, inheritance, saving defaults, private homes, and resume.
@@ -25,18 +25,18 @@ The README documents selectors, inheritance, saving defaults, private homes, and
   `test/runtime-handoff.integration.test.ts` preserves v4 selections across SDK/Herdr handoff.
 - Selection: Ink, CLI, and real PTY tests cover choosing three homes, inheritance,
   explicit saving, exact creation-time persistence, cancellation, and terminal cleanup.
+- Provider failures: live and recovered decision settlement preserve the same durable cause,
+  transcript snapshots require an active prompt-bound turn, provider-code categories are
+  schema-checked, and cleanup-only failures produce one supplemental observation.
 
-Validation: build, typecheck, and repository formatting checks passed. The full non-live run
-reported 1,381 passed, 88 skipped, and four failures. Three scope-closure cases failed during
-an overlapping rebuild and passed on a subsequent unchanged-code rerun; their retained
-errors report interrupted fixture operations, so the rebuild attribution remains an inference.
-The fourth failure was an outdated resume-summary expectation, corrected to assert the new
-account summary; all 16 browser tests then passed. Across the full run and these targeted
-reruns, all 1,385 executed cases passed. Live provider/native-session tests were not enabled.
+Validation: build, typecheck, repository formatting, and the full non-live suite passed;
+the full run reported 1,550 passed and 88 skipped. Live provider/native-session tests were
+not enabled.
 
 ## Ownership and scope
 
-Status: reviewed plan; implementation has not started.
+Status: T1, T2, T4, and selection-only T5 are implemented. T3, T6, T7, T8,
+and T9 remain open and were reconciled against the repository on 2026-09-12.
 Created: 2026-09-10.
 Repository: Epicd, `/home/aa/Documents/epicd`.
 Epic: `epicd-szo` — inspect with `br show epicd-szo`.
@@ -1386,7 +1386,7 @@ Accepted: correct read-versus-write and temporary-versus-retained probe wording.
 A focused follow-up checked the native absent-result branch against current source.
 Accepted: completed-turn/readiness guard and a final result re-read before quota-directed stop.
 A valid result arriving during a query wins; quota snapshots cannot abort a productive native turn.
-DAG and five rationale checks passed without changing the eight-task decomposition.
+DAG and five rationale checks passed without changing the then-eight-task decomposition.
 Changes are bounded contract tightening; the native guard received one substantive narrowing.
 A final independent review is still required before claiming steady state.
 
@@ -1403,16 +1403,18 @@ native evidence gaps, and the advisory nature of unassociated or stale quota sna
 
 ### Delivery graph verification after conversion
 
-Created epic `epicd-szo` with eight open P1 delivery tasks and 13 blocking edges.
+The epic was initially created with eight P1 delivery tasks; T9 was subsequently
+split from T5. As reconciled on 2026-09-12, it has nine children, of which T1,
+T2, T4, and T5 are closed and five remain open, with 15 task-dependency edges.
 Performed six graph checks against the actual Beads records and exported JSONL:
 
-1. Parentage/scope: one epic, eight concrete delivery children, no planning-only tasks.
+1. Parentage/scope: one epic, nine concrete delivery children, no planning-only tasks.
 2. Dependencies: every stored blocker matches the plan; cycle detection reports zero cycles.
-3. Readiness: only `epicd-szo.1` and `epicd-szo.4` are initially ready.
+3. Readiness: T1 and T4 were initially ready; the current open ready task is T3.
 4. Self-containment: task bodies retain normative contracts, rationales, and acceptance;
    all descriptions stay below the tracker's 32768-character limit.
 5. Traceability: 71 distinct acceptance scenarios have delivery owners and all task IDs resolve.
-6. Export consistency: live records and `.beads/issues.jsonl` agree for all nine issue bodies.
+6. Export consistency: live records and `.beads/issues.jsonl` agree for all ten issue bodies.
 
 Use `br ready --type task --parent epicd-szo --json` to select initial work.
 Use `br show epicd-szo` to inspect the overall outcome and delivery IDs.

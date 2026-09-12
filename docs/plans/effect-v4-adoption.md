@@ -5,20 +5,24 @@ Investigated 2026-09-09 on `feature/always-engaged-orchestrator`, at HEAD
 changes. The initial pilot and subsequent slices are implemented; see the
 current status and historical implementation records below.
 
-## Current status — 2026-09-10
+## Current status — 2026-09-11
 
 Baseline verified against `33eef1e2094193b2731c11d2849ab1747f6ec6d1`;
 the account-session and preference-save follow-up below is implemented on top of it:
 
 | Area                                        | Status                                                                                                                      |
 | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Doctor                                      | Implemented: lazy typed checks with the existing Promise rejection contract.                                                |
+| Doctor                                      | Implemented: lazy typed checks, direct finite-command composition, and the existing Promise rejection contract.             |
 | Shared runtime discovery                    | Implemented: composable Effects and Promise adapters for existing callers.                                                  |
 | Epic browser discovery                      | Implemented: typed stages, bounded tracker pages, and optional safe timing traces.                                          |
 | Repository policy and run creation          | Implemented: scoped temporary files, read-only policy preflight, and sequential creation.                                   |
 | Epic picker and browser loop                | Implemented: scoped Ink and signal-handler lifetimes; controller launch remains Promise-based.                              |
 | Account editor session                      | Implemented in the follow-up: Deferred selection, scoped Ink/listeners, and explicit pending-operation drain.               |
 | Account preferences saving                  | Implemented in the follow-up: scoped handles and temporary-file cleanup, typed failures, and interruption-safe publication. |
+| Operator console                            | Implemented: bracketed Ink, signal, cancellation, request-drain, and terminal-flush lifetime.                               |
+| Finite Codex commands                       | Implemented: callback Effect with scoped process cleanup; Promise adapters remain.                                          |
+| Codex model discovery                       | Implemented: typed retryability with one scoped process per attempt and retained Promise behavior.                          |
+| Runtime handoff                             | Implemented: typed stages and a scoped controller lease; admission and the final SQLite transaction are unchanged.          |
 | Receipt reader                              | Evaluated; retain its existing `try/finally`. Reconsider only when a composed read operation needs the scope.               |
 | Controller concurrency and durable recovery | Deferred; require a separate proposal preserving original stop proof and settlement.                                        |
 
@@ -26,6 +30,39 @@ The initial investigation, Steps 1 and 2, and dated implementation records below
 preserve the reasoning and validation history. They are not instructions to repeat
 completed work. The receipt-reader evaluation is also complete. Controller
 concurrency and durable recovery remain deferred beyond the recorded slices.
+
+## Lifecycle and upward-composition follow-up — 2026-09-11
+
+The next incremental adoption keeps all CLI-facing Promise contracts while moving
+four resource-owning paths behind lazy Effect APIs:
+
+- `operatorConsoleEffect` now shares `inkLifecycle`'s failure-origin and terminal-state
+  handling. Its finalizer removes signal listeners, aborts new work, unmounts Ink,
+  drains `RunOperator.settle()`, and waits for terminal output to flush.
+- `runCodexCommandEffect` and `verifyCodexExecutableEffect` bracket the supervised
+  process and wait for `child.stop` on success, failure, or fiber interruption.
+  Doctor and run creation compose the verification Effect directly.
+- `resolveCodexModelEffect` retains the existing JSON-RPC limits and Promise error
+  messages while exposing typed configuration/discovery failures. Retryable protocol
+  attempts wait for the preceding process release to settle before the next attempt starts.
+- `handoffRuntimeEffect` scopes the controller lease and identifies preflight,
+  repository, admission, transaction, and release failures by stage. The existing
+  repository-admission calls and `journal.handoffRuntime` transaction remain in the
+  same order.
+
+Herdr discovery still uses the existing `runCommand` Promise boundary. Its commands
+retain their ten-second timeout request, but fiber interruption is not proof that the
+active command or descendant-held pipes have drained. Migrating that legacy boundary
+to supervised process-group ownership remains a separate adoption slice.
+
+Focused regressions cover signal-driven operator shutdown with admitted requests,
+Ink wait/unmount/flush and listener-removal failures, process-tree interruption,
+retry release ordering, typed verification/model failures, and handoff lease release.
+
+Validation completed with build, typecheck, formatting, and all focused migration
+tests passing. The full repository run passed 1,507 tests with 88 skipped and one
+unrelated publication integration timeout under sustained host I/O pressure; that
+exact timed-out test passed immediately in isolation (14.8 seconds).
 
 ## Version and compatibility
 

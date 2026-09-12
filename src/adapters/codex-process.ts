@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
+import * as Result from "effect/Result";
 import { CommandError, type CommandOptions, type CommandResult } from "../util/command.js";
 
 const SHUTDOWN_GRACE_MS = 500;
@@ -43,53 +46,91 @@ export type CodexProcess = {
   stop(done: (error?: Error) => void): void;
 };
 
+export class CodexCommandFailed extends Data.TaggedError("CodexCommandFailed")<{
+  readonly stage: "start" | "execute";
+  readonly cause: unknown;
+}> {}
+
+const stopCodexProcess = (child: CodexProcess): Effect.Effect<void> =>
+  Effect.callback((resume) => {
+    child.stop(() => resume(Effect.void));
+  });
+
+/** A finite command whose process cleanup settles before success, failure, or interruption returns. */
+export function runCodexCommandEffect(
+  command: string,
+  args: string[],
+  options: Pick<CommandOptions, "cwd" | "env" | "timeoutMs">,
+): Effect.Effect<CommandResult, CodexCommandFailed> {
+  return Effect.acquireUseRelease(
+    Effect.try({
+      try: () => startCodexProcess(command, args, options.cwd, options.env ?? process.env),
+      catch: (cause) => new CodexCommandFailed({ stage: "start", cause }),
+    }),
+    (child) =>
+      Effect.callback<CommandResult, CodexCommandFailed>((resume) => {
+        const result: CommandResult = { command, args, exitCode: 1, stdout: "", stderr: "" };
+        let settled = false;
+        const finish = (error?: Error): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (error)
+            resume(Effect.fail(new CodexCommandFailed({ stage: "execute", cause: error })));
+          else if (result.exitCode === 0) resume(Effect.succeed(result));
+          else
+            resume(
+              Effect.fail(
+                new CodexCommandFailed({ stage: "execute", cause: new CommandError(result) }),
+              ),
+            );
+        };
+        const timeoutMs = options.timeoutMs ?? 10_000;
+        const timer = setTimeout(() => {
+          result.exitCode = 128;
+          result.stderr += `\nTimed out after ${timeoutMs}ms\n`;
+          finish();
+        }, timeoutMs);
+        for (const name of ["stdout", "stderr"] as const) {
+          child[name].setEncoding("utf8");
+          child[name].on("data", (chunk: string) => {
+            if (settled) return;
+            result[name] += chunk;
+            if (result[name].length > 32 * 1024 * 1024) {
+              result.stderr += "\nCodex command output exceeded 33554432 bytes\n";
+              finish();
+            }
+          });
+          child[name].on("error", finish);
+        }
+        child.stdin.on("error", finish);
+        child.onError(finish);
+        child.onClose((code) => {
+          if (settled) return;
+          result.exitCode = code ?? 128;
+          finish();
+        });
+        child.stdin.end();
+        return Effect.sync(() => {
+          settled = true;
+          clearTimeout(timer);
+        });
+      }),
+    (child) => stopCodexProcess(child),
+  );
+}
+
 /** Run a finite Codex command with the same descendant ownership as model discovery. */
-export function runCodexCommand(
+export async function runCodexCommand(
   command: string,
   args: string[],
   options: Pick<CommandOptions, "cwd" | "env" | "timeoutMs">,
 ): Promise<CommandResult> {
-  return new Promise((resolve, reject) => {
-    const child = startCodexProcess(command, args, options.cwd, options.env ?? process.env);
-    const result: CommandResult = { command, args, exitCode: 1, stdout: "", stderr: "" };
-    let settled = false;
-    const finish = (error?: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stop(() => {
-        if (error) reject(error);
-        else if (result.exitCode === 0) resolve(result);
-        else reject(new CommandError(result));
-      });
-    };
-    const timeoutMs = options.timeoutMs ?? 10_000;
-    const timer = setTimeout(() => {
-      result.exitCode = 128;
-      result.stderr += `\nTimed out after ${timeoutMs}ms\n`;
-      finish();
-    }, timeoutMs);
-    for (const name of ["stdout", "stderr"] as const) {
-      child[name].setEncoding("utf8");
-      child[name].on("data", (chunk: string) => {
-        if (settled) return;
-        result[name] += chunk;
-        if (result[name].length > 32 * 1024 * 1024) {
-          result.stderr += "\nCodex command output exceeded 33554432 bytes\n";
-          finish();
-        }
-      });
-      child[name].on("error", finish);
-    }
-    child.stdin.on("error", finish);
-    child.onError(finish);
-    child.onClose((code) => {
-      if (settled) return;
-      result.exitCode = code ?? 128;
-      finish();
-    });
-    child.stdin.end();
-  });
+  const result = await Effect.runPromise(
+    Effect.result(runCodexCommandEffect(command, args, options)),
+  );
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }
 
 export function startCodexProcess(

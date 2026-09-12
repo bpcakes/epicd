@@ -5,6 +5,7 @@ import { AgentRoleSchema, AgentSessionContractSchema } from "./types.js";
 import { TurnLaunchSchema } from "./codex-launch.js";
 import { TaskClaimBindingSchema, EpicRepairBindingSchema } from "./tracker.js";
 import { StateFileIdentitySchema } from "./state-file-identity.js";
+import { EssentialTurnFailureSchema } from "./provider-failure.js";
 
 const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
 const Generation = z.number().int().positive();
@@ -162,6 +163,8 @@ export const TurnRecordSchema = z.strictObject({
       outputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     })
     .nullable(),
+  // Optional rather than defaulted so legacy records retain their original shape.
+  essentialFailure: EssentialTurnFailureSchema.optional(),
   policyDigest: z.string().length(64),
   controlVersion: z.number().int().nonnegative(),
   submissionAcknowledgement: z.string().min(1).max(4000).nullable(),

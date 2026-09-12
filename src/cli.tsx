@@ -23,7 +23,7 @@ import {
 } from "./domain/types.js";
 import { humanRunStatus, runStatusView } from "./status.js";
 import { RunView } from "./tui/run-view.js";
-import { OperatorView } from "./tui/operator-view.js";
+import { OperatorConsoleFailed, operatorConsoleEffect } from "./tui/operator-console-session.js";
 import { runDoctor } from "./doctor.js";
 import { redactSensitiveText } from "./util/redact.js";
 import { errorDetail } from "./util/error-detail.js";
@@ -258,31 +258,9 @@ async function openOperator(store: StateStore, runId: string) {
       "The operator console requires an interactive terminal; use explicit CLI commands otherwise",
     );
   const operator = new RunOperator(store, runId);
-  operator.status();
-  const cancellation = new AbortController();
-  let ui: ReturnType<typeof render> | undefined;
-  const close = () => {
-    cancellation.abort(new Error("Operator console closed"));
-    ui?.unmount();
-  };
-  const controls = {
-    status: () => operator.status(),
-    submit: (request: OperatorRequest) => operator.submit(request, cancellation.signal),
-  };
-  process.once("SIGINT", close);
-  process.once("SIGTERM", close);
-  try {
-    ui = render(<OperatorView controls={controls} close={close} />, {
-      exitOnCtrlC: false,
-      interactive: true,
-    });
-    await ui.waitUntilExit();
-  } finally {
-    close();
-    process.off("SIGINT", close);
-    process.off("SIGTERM", close);
-    await operator.settle();
-  }
+  const result = await Effect.runPromise(Effect.result(operatorConsoleEffect(operator)));
+  if (Result.isFailure(result))
+    throw result.failure.terminalState === "untouched" ? result.failure.cause : result.failure;
   process.stdout.write(
     "Operator console closed. No controller was started. Inspect status for committed requests.\n",
   );
@@ -769,7 +747,9 @@ function cliFailureMessage(error: unknown): string {
 function hasUnknownTerminalState(error: unknown): boolean {
   const failure = error instanceof RunSetupFailed ? error.cause : error;
   return (
-    (failure instanceof EpicPickerFailed || failure instanceof AccountSelectionFailed) &&
+    (failure instanceof EpicPickerFailed ||
+      failure instanceof AccountSelectionFailed ||
+      failure instanceof OperatorConsoleFailed) &&
     failure.terminalState === "unknown"
   );
 }

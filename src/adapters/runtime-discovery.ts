@@ -138,7 +138,7 @@ export function selectedCodexExecutableEffect(
   }).pipe(Effect.mapError(codexSelectionError));
 }
 
-/** Read-only caller discovery. Command deadlines remain owned by runCommand; interruption is not drain. */
+/** Read-only caller discovery. runCommand owns its timeout; Effect interruption is not process drain. */
 export function discoverHerdrEffect(
   executable: string,
   cwd: string,

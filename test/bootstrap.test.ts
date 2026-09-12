@@ -122,7 +122,7 @@ describe.runIf(process.platform === "linux")("fresh run bootstrap", () => {
   it("defers policy reads until execution and short-circuits later creation stages", async () => {
     const f = fixture();
     const graph = vi.spyOn(KernelBeads.prototype, "graph");
-    const verify = vi.spyOn(codexSettings, "verifyCodexExecutable");
+    const verify = vi.spyOn(codexSettings, "verifyCodexExecutableEffect");
     const program = createRunEffect(f.store, f.options);
     expect(verify).not.toHaveBeenCalled();
     expect(f.store.list()).toEqual([]);
@@ -146,7 +146,9 @@ describe.runIf(process.platform === "linux")("fresh run bootstrap", () => {
       const graph = vi.spyOn(KernelBeads.prototype, "graph");
       const persist = vi.spyOn(f.store, "create");
       if (stage === "verify_runtime")
-        vi.spyOn(codexSettings, "verifyCodexExecutable").mockRejectedValueOnce(cause);
+        vi.spyOn(codexSettings, "verifyCodexExecutableEffect").mockReturnValueOnce(
+          Effect.fail(new codexSettings.CodexExecutableVerificationFailed({ cause })),
+        );
       if (stage === "read_tracker") graph.mockRejectedValueOnce(cause);
       if (stage === "persist_run")
         persist.mockImplementationOnce(() => {

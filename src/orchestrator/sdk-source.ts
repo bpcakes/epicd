@@ -3,7 +3,11 @@ import type { OrchestrationJournal } from "../adapters/orchestration-journal.js"
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import type { ControlledAgentDriver } from "../kernel/agents.js";
 import type { AgentIdentity } from "../domain/agents.js";
-import { DecisionSourceError, type DecisionSourceAttempt } from "../domain/decision-source.js";
+import {
+  DecisionSourceError,
+  decisionSourceFailureForProviderFailure,
+  type DecisionSourceAttempt,
+} from "../domain/decision-source.js";
 import {
   ActionRequestSchema,
   KernelActionSchema,
@@ -92,12 +96,20 @@ export class ControlledDecisionSource implements DecisionSource {
     this.journal.decisionSource.bindTurn(this.authority, input.attemptId, turn.identity);
     const stopped = await this.runtime.run(this.authority, turn.identity, signal);
     if (!stopped.stopEvidence) throw new Error("Coordinator launcher stop is unconfirmed");
+    // A provider rejection and a control-plane cancellation are independent facts.
+    // Preserve the provider cause after stop proof even when the same failure also
+    // moved the run out of its active state.
+    if (stopped.essentialFailure) {
+      const failure = decisionSourceFailureForProviderFailure(stopped.essentialFailure);
+      throw new DecisionSourceError(failure.code, failure.detail, failure.retryAfterMs);
+    }
     if (stopped.status === "cancelled") return null; // Settled but deliberately not an admissible decision.
-    if (stopped.status !== "completed" || !stopped.resultEligible)
+    if (stopped.status !== "completed" || !stopped.resultEligible) {
       throw new DecisionSourceError(
         "runtime",
         `Coordinator turn ${turn.identity.turnId} stopped without an eligible result; inspect its recorded diagnostics`,
       );
+    }
     return stopped.result;
   }
 

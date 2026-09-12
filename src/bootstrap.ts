@@ -7,7 +7,7 @@ import { KernelGit } from "./adapters/kernel-git.js";
 import { PublicationGit } from "./adapters/publication-git.js";
 import { KernelBeads } from "./adapters/kernel-beads.js";
 import { StateStore } from "./adapters/store.js";
-import { resolveCodexModel, verifyCodexExecutable } from "./adapters/codex-settings.js";
+import { resolveCodexModelEffect, verifyCodexExecutableEffect } from "./adapters/codex-settings.js";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
@@ -24,9 +24,6 @@ import { assertRuntimeHandoffReady } from "./adapters/runtime-handoff.js";
 import { RuntimeHandoffTargetSchema } from "./domain/runtime-handoff.js";
 import { RepositoryAdmission } from "./kernel/repository-admission.js";
 import {
-  discoverHerdr,
-  resolveExecutable,
-  selectedCodexExecutable,
   discoverHerdrEffect,
   resolveExecutableEffect,
   selectedCodexExecutableEffect,
@@ -57,49 +54,127 @@ export type CreateRunOptions = {
   turnTimeoutMs?: number;
 };
 
+type RuntimeHandoffStage =
+  | "acquire_lease"
+  | "check_ready"
+  | "select_runtime"
+  | "verify_runtime"
+  | "discover_herdr"
+  | "inspect_repository"
+  | "admit_repository"
+  | "commit_handoff"
+  | "release_lease";
+
+export class RuntimeHandoffFailed extends Data.TaggedError("RuntimeHandoffFailed")<{
+  readonly stage: RuntimeHandoffStage;
+  readonly cause: unknown;
+}> {}
+
 /** Explicit operator choice. Preflight is read-only; no model, pane, prompt or service is started. */
+export function handoffRuntimeEffect(
+  store: StateStore,
+  runId: string,
+  options: { runtime: RuntimeKind; controlVersion: number; codexPath?: string; herdrPath?: string },
+  signal?: AbortSignal,
+): Effect.Effect<RunState, RuntimeHandoffFailed> {
+  const attempt = <A>(stage: RuntimeHandoffStage, run: () => A) =>
+    Effect.try({ try: run, catch: (cause) => new RuntimeHandoffFailed({ stage, cause }) });
+  const wait = <A>(stage: RuntimeHandoffStage, run: () => Promise<A>) =>
+    Effect.uninterruptible(
+      Effect.tryPromise({
+        try: run,
+        catch: (cause) => new RuntimeHandoffFailed({ stage, cause }),
+      }),
+    );
+  return Effect.gen(function* () {
+    // Preserve try/finally precedence: a release failure must replace a typed
+    // handoff failure because it means the controller lease may still be held.
+    const result = yield* Effect.acquireUseRelease(
+      attempt("acquire_lease", () => store.acquireLease(runId)),
+      (lease) => {
+        const authority = { runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
+        const journal = store.orchestration;
+        return Effect.result(
+          Effect.gen(function* () {
+            yield* attempt("check_ready", () =>
+              assertRuntimeHandoffReady(journal, authority, options.controlVersion),
+            );
+            const state = yield* attempt("check_ready", () => {
+              const state = store.get(runId)!;
+              if (!state.runtimeConfiguration) throw new Error("Run has no runtime configuration");
+              signal?.throwIfAborted();
+              return state;
+            });
+            const executable = yield* Effect.mapError(
+              selectedCodexExecutableEffect(options.runtime, options.codexPath),
+              ({ cause }) => new RuntimeHandoffFailed({ stage: "select_runtime", cause }),
+            );
+            yield* attempt("select_runtime", () => {
+              if (state.runtimeConfiguration!.accounts)
+                assertAccountStorage(state.runtimeConfiguration!.accounts, [executable]);
+            });
+            yield* Effect.mapError(
+              verifyCodexExecutableEffect(state.repoPath, { executablePath: executable, args: [] }),
+              ({ cause }) => new RuntimeHandoffFailed({ stage: "verify_runtime", cause }),
+            );
+            let herdr = null;
+            if (options.runtime === "herdr") {
+              const herdrExecutable = yield* Effect.mapError(
+                resolveExecutableEffect(options.herdrPath ?? "herdr"),
+                ({ cause }) => new RuntimeHandoffFailed({ stage: "discover_herdr", cause }),
+              );
+              herdr = yield* Effect.mapError(
+                discoverHerdrEffect(herdrExecutable, state.repoPath),
+                ({ cause }) => new RuntimeHandoffFailed({ stage: "discover_herdr", cause }),
+              );
+            }
+            const target = yield* attempt("select_runtime", () =>
+              RuntimeHandoffTargetSchema.parse({ runtime: options.runtime, executable, herdr }),
+            );
+            const repository = yield* wait("inspect_repository", () =>
+              new PublicationGit().bind(state.repoPath, signal),
+            );
+            yield* attempt("inspect_repository", () => {
+              if (
+                JSON.stringify(repository.commonDirectory) !==
+                JSON.stringify(state.runtimeConfiguration!.commonDirectory)
+              )
+                throw new Error("Repository metadata identity changed before runtime handoff");
+            });
+            yield* attempt("check_ready", () =>
+              assertRuntimeHandoffReady(journal, authority, options.controlVersion),
+            );
+            const admission = new RepositoryAdmission(store, authority, repository);
+            yield* wait("admit_repository", () => admission.enter(signal));
+            yield* wait("admit_repository", () => admission.assertOwned(signal));
+            return yield* attempt("commit_handoff", () => {
+              signal?.throwIfAborted();
+              return journal.handoffRuntime(authority, options.controlVersion, target);
+            });
+          }),
+        );
+      },
+      (lease) =>
+        attempt("release_lease", () => {
+          store.releaseLease(runId, lease.ownerToken);
+        }),
+    );
+    if (Result.isFailure(result)) return yield* Effect.fail(result.failure);
+    return result.success;
+  });
+}
+
 export async function handoffRuntime(
   store: StateStore,
   runId: string,
   options: { runtime: RuntimeKind; controlVersion: number; codexPath?: string; herdrPath?: string },
   signal?: AbortSignal,
-) {
-  const lease = store.acquireLease(runId);
-  const authority = { runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
-  try {
-    const journal = store.orchestration;
-    assertRuntimeHandoffReady(journal, authority, options.controlVersion);
-    const state = store.get(runId)!;
-    if (!state.runtimeConfiguration) throw new Error("Run has no runtime configuration");
-    signal?.throwIfAborted();
-    const executable = await selectedCodexExecutable(options.runtime, options.codexPath);
-    if (state.runtimeConfiguration.accounts)
-      assertAccountStorage(state.runtimeConfiguration.accounts, [executable]);
-    await verifyCodexExecutable(state.repoPath, { executablePath: executable, args: [] });
-    const herdr =
-      options.runtime === "herdr"
-        ? await discoverHerdr(await resolveExecutable(options.herdrPath ?? "herdr"), state.repoPath)
-        : null;
-    const target = RuntimeHandoffTargetSchema.parse({
-      runtime: options.runtime,
-      executable,
-      herdr,
-    });
-    const repository = await new PublicationGit().bind(state.repoPath, signal);
-    if (
-      JSON.stringify(repository.commonDirectory) !==
-      JSON.stringify(state.runtimeConfiguration.commonDirectory)
-    )
-      throw new Error("Repository metadata identity changed before runtime handoff");
-    assertRuntimeHandoffReady(journal, authority, options.controlVersion);
-    const admission = new RepositoryAdmission(store, authority, repository);
-    await admission.enter(signal);
-    await admission.assertOwned(signal);
-    signal?.throwIfAborted();
-    return journal.handoffRuntime(authority, options.controlVersion, target);
-  } finally {
-    store.releaseLease(runId, lease.ownerToken);
-  }
+): Promise<RunState> {
+  const result = await Effect.runPromise(
+    Effect.result(handoffRuntimeEffect(store, runId, options, signal)),
+  );
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }
 
 const creationStages = {
@@ -199,8 +274,11 @@ export function createRunEffect(
         Effect.mapError((error) => error.cause),
       ),
     );
-    yield* read("verify_runtime", () =>
-      verifyCodexExecutable(repoPath, { executablePath: executable, args: [] }),
+    yield* step(
+      "verify_runtime",
+      verifyCodexExecutableEffect(repoPath, { executablePath: executable, args: [] }).pipe(
+        Effect.mapError((error) => error.cause),
+      ),
     );
     const trackerExecutable = yield* step(
       "resolve_tracker",
@@ -266,15 +344,16 @@ export function createRunEffect(
     );
     const model =
       options.model ??
-      (yield* read("resolve_model", () =>
-        resolveCodexModel(repoPath, {
+      (yield* step(
+        "resolve_model",
+        resolveCodexModelEffect(repoPath, {
           executable: { executablePath: executable, args: [] },
           accountDiscovery: {
             source: accountBinding(accounts, "implementation", "implementation")?.source ?? null,
             root: join(privateRoot, "account-discovery"),
           },
           ...(signal ? { signal } : {}),
-        }),
+        }).pipe(Effect.mapError((error) => error.cause)),
       ));
     const state = yield* attempt("configure_runtime", () => {
       const configuration = RuntimeConfigurationSchema.parse({

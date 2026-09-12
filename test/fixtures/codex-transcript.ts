@@ -9,10 +9,23 @@ export async function transcriptFixture() {
   const root = await mkdtemp("/var/tmp/epicd-transcript-");
   const providerHome = join(root, "provider");
   await mkdir(providerHome, { mode: 0o700 });
+  const authCachePath = join(providerHome, "auth.json");
   const launch = CodexLaunchSchema.parse({
     generation: randomUUID(),
     controlDirectory: join(root, "control"),
-    authCachePath: null,
+    authCachePath,
+    accountBinding: {
+      accountClass: "implementation",
+      source: {
+        bindingId: "a".repeat(64),
+        principalDigest: "b".repeat(64),
+        codexHome: providerHome,
+        authCachePath,
+        device: "1",
+        inode: "2",
+        label: "fixture",
+      },
+    },
     reviewPacket: null,
     model: "gpt-6-astra",
     reasoningEffort: "high",
@@ -97,6 +110,22 @@ export async function transcriptFixture() {
     turn_id: turn,
     last_agent_message: "NEVER_COPY_FINAL_MESSAGE",
   });
+  const rateLimits = (input: object = {}) =>
+    line("event_msg", {
+      type: "token_count",
+      info: null,
+      rate_limits: {
+        limit_id: "premium",
+        limit_name: null,
+        primary: null,
+        secondary: null,
+        credits: { has_credits: false, unlimited: false, balance: "0" },
+        individual_limit: null,
+        spend_control_reached: null,
+        rate_limit_reached_type: null,
+        ...input,
+      },
+    });
   const prefix =
     header + started + input("<environment_context>NEVER_COPY_ENV</environment_context>") + input();
   await writeFile(path, prefix, { mode: 0o600 });
@@ -105,6 +134,7 @@ export async function transcriptFixture() {
     launch,
     session,
     turn,
+    providerTurn: turn,
     path,
     statePath,
     prompt,
@@ -114,6 +144,7 @@ export async function transcriptFixture() {
     input,
     call,
     output,
+    rateLimits,
     complete,
     prefix,
     append: (text: string | Buffer) => appendFile(path, text),

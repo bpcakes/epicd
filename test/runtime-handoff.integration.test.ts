@@ -6,12 +6,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Result from "effect/Result";
 import { StateStore } from "../src/adapters/store.js";
 import { PublicationGit, RUN_OWNERSHIP_REF } from "../src/adapters/publication-git.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { RepositoryAdmission } from "../src/kernel/repository-admission.js";
 import { runRepositoryIO } from "../dist/adapters/repository-io.js";
-import { handoffRuntime } from "../src/bootstrap.js";
+import { handoffRuntime, handoffRuntimeEffect } from "../src/bootstrap.js";
 import { RunOperator } from "../src/operator-controls.js";
 import * as codexSettings from "../src/adapters/codex-settings.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
@@ -514,10 +517,12 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
     f.pause();
     f.detach();
     vi.stubEnv("HERDR_ENV", "1");
-    vi.spyOn(codexSettings, "verifyCodexExecutable").mockImplementation(async () => {
-      f.pause();
-      return "fixture";
-    });
+    vi.spyOn(codexSettings, "verifyCodexExecutableEffect").mockReturnValue(
+      Effect.sync(() => {
+        f.pause();
+        return "fixture";
+      }),
+    );
     await expect(
       handoffRuntime(f.store, f.state.runId, {
         runtime: "herdr",
@@ -528,6 +533,90 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
     ).rejects.toThrow("Control changed");
     expect(f.store.get(f.state.runId)).toEqual(f.state);
     expect(f.journal.agents.instance(f.state.runId, f.agent).status).toBe("reserved");
+  });
+
+  it("releases the controller lease when a handoff Effect is interrupted", async () => {
+    const f = await fixture();
+    f.pause();
+    f.detach();
+    const verify = vi
+      .spyOn(codexSettings, "verifyCodexExecutableEffect")
+      .mockReturnValue(Effect.never);
+    const fiber = Effect.runFork(
+      handoffRuntimeEffect(f.store, f.state.runId, {
+        runtime: "sdk",
+        controlVersion: f.version(),
+        codexPath: f.codex,
+      }),
+    );
+    await expect.poll(() => verify).toHaveBeenCalledOnce();
+    expect(f.store.controllerLease(f.state.runId)).not.toBeNull();
+    await Effect.runPromise(Fiber.interrupt(fiber));
+    expect(f.store.controllerLease(f.state.runId)).toBeNull();
+    expect(f.store.get(f.state.runId)).toEqual(f.state);
+  });
+
+  it("retains a typed handoff stage and cause while releasing its lease", async () => {
+    const f = await fixture(),
+      cause = new Error("version preflight failed");
+    f.pause();
+    f.detach();
+    vi.spyOn(codexSettings, "verifyCodexExecutableEffect").mockReturnValue(
+      Effect.fail(new codexSettings.CodexExecutableVerificationFailed({ cause })),
+    );
+    const result = await Effect.runPromise(
+      Effect.result(
+        handoffRuntimeEffect(f.store, f.state.runId, {
+          runtime: "sdk",
+          controlVersion: f.version(),
+          codexPath: f.codex,
+        }),
+      ),
+    );
+    if (!Result.isFailure(result)) throw new Error("Expected handoff failure");
+    expect(result.failure).toMatchObject({
+      _tag: "RuntimeHandoffFailed",
+      stage: "verify_runtime",
+      cause,
+    });
+    expect(f.store.controllerLease(f.state.runId)).toBeNull();
+    expect(f.store.get(f.state.runId)).toEqual(f.state);
+  });
+
+  it("reports a lease-release failure over an earlier handoff failure", async () => {
+    const f = await fixture(),
+      handoffCause = new Error("version preflight failed"),
+      releaseCause = new Error("lease release failed");
+    f.pause();
+    f.detach();
+    vi.spyOn(codexSettings, "verifyCodexExecutableEffect").mockReturnValue(
+      Effect.fail(new codexSettings.CodexExecutableVerificationFailed({ cause: handoffCause })),
+    );
+    let heldOwnerToken: string | undefined;
+    const release = vi
+      .spyOn(f.store, "releaseLease")
+      .mockImplementationOnce((_runId, ownerToken) => {
+        heldOwnerToken = ownerToken;
+        throw releaseCause;
+      });
+    const result = await Effect.runPromise(
+      Effect.result(
+        handoffRuntimeEffect(f.store, f.state.runId, {
+          runtime: "sdk",
+          controlVersion: f.version(),
+          codexPath: f.codex,
+        }),
+      ),
+    );
+    if (!Result.isFailure(result)) throw new Error("Expected handoff failure");
+    expect(result.failure).toMatchObject({
+      _tag: "RuntimeHandoffFailed",
+      stage: "release_lease",
+      cause: releaseCause,
+    });
+    expect(f.store.controllerLease(f.state.runId)).not.toBeNull();
+    release.mockRestore();
+    f.store.releaseLease(f.state.runId, heldOwnerToken!);
   });
 
   it("checks physical repository ownership before applying the handoff", async () => {

@@ -8,6 +8,8 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
+import { ControlledLaunches } from "../src/adapters/controlled-launch.js";
+import { ControlledTranscript } from "../src/adapters/controlled-transcript.js";
 import { CodexLaunchSchema } from "../src/domain/codex-launch.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import { SdkAgentSessionContractSchema } from "../src/domain/types.js";
@@ -32,6 +34,7 @@ import { initialRun } from "./fixtures/orchestration/state.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 const outputSchema = {
@@ -42,12 +45,18 @@ const outputSchema = {
 };
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const emit = (value: unknown) => `printf '%s\\n' ${quote(JSON.stringify(value))}`;
+const INCIDENT_QUOTA =
+  "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 15th, 2026 7:00 AM.";
 
 async function fixture(
   mode:
     | "complete"
     | "hang"
     | "provider_error"
+    | "provider_error_before_turn"
+    | "provider_quota"
+    | "quota_tool_output"
+    | "quota_agent_message"
     | "missing_terminal"
     | "diagnostic"
     | "live" = "complete",
@@ -119,10 +128,23 @@ async function fixture(
       [
         "#!/bin/sh",
         'cat > "$CODEX_HOME/fixture-prompt.json"',
-        emit({ type: "thread.started", thread_id: providerId }),
-        emit({ type: "turn.started" }),
+        ...(mode === "provider_error_before_turn"
+          ? []
+          : [
+              emit({ type: "thread.started", thread_id: providerId }),
+              emit({ type: "turn.started" }),
+            ]),
+        ...(mode === "provider_error_before_turn"
+          ? [
+              emit({ type: "error", message: "Provider rejected before acknowledgement" }),
+              "sleep 30",
+            ]
+          : []),
         ...(mode === "provider_error"
           ? [emit({ type: "error", message: "Provider rejected the response schema" }), "sleep 30"]
+          : []),
+        ...(mode === "provider_quota"
+          ? [emit({ type: "error", message: INCIDENT_QUOTA }), "sleep 30"]
           : []),
         ...(mode === "hang" ? ["sleep 30"] : []),
         ...(mode === "diagnostic"
@@ -142,9 +164,31 @@ async function fixture(
               }),
             ]
           : []),
+        ...(mode === "quota_tool_output"
+          ? [
+              emit({
+                type: "item.completed",
+                item: {
+                  id: "quoted-provider-message",
+                  type: "command_execution",
+                  command: "printf a diagnostic fixture",
+                  aggregated_output: INCIDENT_QUOTA,
+                  exit_code: 0,
+                  status: "completed",
+                },
+              }),
+            ]
+          : []),
         emit({
           type: "item.completed",
-          item: { id: "response", type: "agent_message", text: '{"status":"observed"}' },
+          item: {
+            id: "response",
+            type: "agent_message",
+            text:
+              mode === "quota_agent_message"
+                ? JSON.stringify({ status: INCIDENT_QUOTA })
+                : '{"status":"observed"}',
+          },
         }),
         ...(mode === "missing_terminal"
           ? []
@@ -326,6 +370,120 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     ).toContainEqual(expect.objectContaining({ omission: "budget_exhausted", retainedBytes: 0 }));
   });
 
+  it("does not classify a quoted usage-limit message in tool output as provider authority", async () => {
+    const setup = await fixture("quota_tool_output");
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({ status: "completed", resultEligible: true });
+    expect(result.essentialFailure).toBeUndefined();
+    const diagnostic = setup.store.orchestration
+      .observations(setup.authority.runId)
+      .find((row) => row.kind === "runtime.command.completed")!;
+    expect(
+      setup.store.orchestration.diagnostics.read(
+        setup.authority.runId,
+        diagnostic.artifactIds[0]!,
+        0,
+        65536,
+      ).text,
+    ).toContain(INCIDENT_QUOTA);
+  });
+
+  it("does not classify a quoted usage-limit message in an agent response as provider authority", async () => {
+    const setup = await fixture("quota_agent_message");
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({
+      status: "completed",
+      resultEligible: true,
+      result: { status: INCIDENT_QUOTA },
+    });
+    expect(result.essentialFailure).toBeUndefined();
+  });
+
+  it("preserves a provider failure received before turn acknowledgement", async () => {
+    const setup = await fixture("provider_error_before_turn");
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({
+      status: "failed",
+      resultEligible: false,
+      essentialFailure: {
+        category: "runtime",
+        evidence: "unclassified",
+        message: "Provider rejected before acknowledgement",
+        providerSessionId: null,
+      },
+      launch: { stop: { processTreeStopped: true } },
+    });
+  });
+
+  it("persists a quota failure outside the diagnostic budget and restores it after reopening", async () => {
+    const setup = await fixture("provider_quota", false, 100);
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({
+      status: "cancelled",
+      resultEligible: false,
+      essentialFailure: {
+        category: "quota",
+        evidence: "provider_message",
+        message: INCIDENT_QUOTA,
+        source: "sdk.error",
+        providerCode: null,
+        diagnosticOmission: "budget_exhausted",
+        diagnosticArtifactIds: [expect.any(String)],
+      },
+      launch: { stop: { processTreeStopped: true } },
+    });
+    setup.reopen();
+    expect(
+      setup.store.orchestration.agents.turn(setup.authority.runId, result.identity)
+        .essentialFailure,
+    ).toEqual(result.essentialFailure);
+  });
+
+  it("keeps the provider quota cause primary when transcript finalization also fails", async () => {
+    vi.spyOn(ControlledTranscript.prototype, "finish").mockRejectedValueOnce(
+      new Error("fixture transcript finalization failed"),
+    );
+    const setup = await fixture("provider_quota");
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({
+      status: "failed",
+      essentialFailure: { category: "quota", message: INCIDENT_QUOTA },
+    });
+    const observations = setup.store.orchestration.observations(setup.authority.runId, 0, 100);
+    expect(observations).toContainEqual(
+      expect.objectContaining({
+        kind: "runtime.problem",
+        summary: INCIDENT_QUOTA,
+      }),
+    );
+    expect(observations).toContainEqual(
+      expect.objectContaining({
+        kind: "runtime.cleanup_problem",
+        summary: "fixture transcript finalization failed",
+      }),
+    );
+  });
+
+  it("records a cleanup-only failure once without accepting the turn result", async () => {
+    vi.spyOn(ControlledTranscript.prototype, "watch").mockReturnValue(async () => {
+      throw new Error("fixture transcript watcher cleanup failed");
+    });
+    const setup = await fixture();
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({ status: "failed", resultEligible: false });
+    const matching = setup.store.orchestration
+      .observations(setup.authority.runId, 0, 100)
+      .filter((observation) =>
+        observation.summary.includes("fixture transcript watcher cleanup failed"),
+      );
+    expect(matching).toMatchObject([
+      {
+        kind: "runtime.cleanup_problem",
+        summary: "fixture transcript watcher cleanup failed",
+      },
+    ]);
+  });
+
   it("binds a real supervised invocation, acknowledges its exact prompt, and resumes via a fresh launch", async () => {
     const setup = await fixture();
     const journal = setup.store.orchestration;
@@ -385,6 +543,22 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       setup.store.orchestration.agents.workspace(setup.authority.runId, setup.workspace)
         .activeTurnId,
     ).toBeNull();
+  });
+
+  it("keeps workspace ownership indeterminate when the runtime cannot obtain a stop receipt", async () => {
+    const setup = await fixture("complete");
+    vi.spyOn(ControlledLaunches.prototype, "stop").mockResolvedValue(null);
+    const result = await setup.driver().run(setup.authority, setup.prepare().identity);
+    expect(result).toMatchObject({
+      status: "indeterminate",
+      resultEligible: false,
+      result: null,
+      launch: { stop: null },
+    });
+    expect(
+      setup.store.orchestration.agents.workspace(setup.authority.runId, setup.workspace)
+        .activeTurnId,
+    ).toBe(result.identity.turnId);
   });
 
   it("rejects overlapping dispatch and preserves unknown ownership until a replacement controller stops the exact launch", async () => {
@@ -960,6 +1134,12 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       status: "failed",
       result: null,
       resultEligible: false,
+      essentialFailure: {
+        category: "runtime",
+        evidence: "unclassified",
+        message: "Provider rejected the response schema",
+        providerCode: null,
+      },
       launch: { stop: { processTreeStopped: true } },
     });
     const ticket = journal.pendingDecision(setup.authority.runId)!;
@@ -968,6 +1148,79 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     ).toMatchObject([{ outcome: { kind: "failure", code: "runtime" }, retryNotBefore: null }]);
     expect(journal.control(setup.authority.runId).decisionsUsed).toBe(1);
     expect(journal.actions(setup.authority.runId)).toHaveLength(0);
+  }, 15_000);
+
+  it("surfaces a stopped coordinator usage-limit event as quota without retrying", async () => {
+    const setup = await fixture("provider_quota", true);
+    const journal = setup.store.orchestration;
+    const source = new ControlledDecisionSource(
+      journal,
+      setup.authority,
+      setup.agent,
+      setup.driver(),
+    );
+    expect(
+      await new OrchestratorLoop(new ActionKernel(journal), source, { pollMs: 5 }).run(
+        setup.authority,
+      ),
+    ).toBe("awaiting_user");
+    const turn = journal.agents.turns(setup.authority.runId)[0]!;
+    expect(turn).toMatchObject({
+      status: "failed",
+      essentialFailure: {
+        category: "quota",
+        evidence: "provider_message",
+        message: INCIDENT_QUOTA,
+        providerCode: null,
+      },
+      launch: { stop: { processTreeStopped: true } },
+    });
+    const ticket = journal.pendingDecision(setup.authority.runId)!;
+    expect(
+      journal.decisionSource.execution(setup.authority.runId, ticket.decisionId)?.attempts,
+    ).toMatchObject([
+      {
+        outcome: { kind: "failure", code: "quota", detail: INCIDENT_QUOTA },
+        retryNotBefore: null,
+      },
+    ]);
+    expect(journal.control(setup.authority.runId).decisionsUsed).toBe(1);
+  }, 15_000);
+
+  it("keeps cancelled provider quota authoritative in live and recovered decisions", async () => {
+    const setup = await fixture("provider_quota", true, 100);
+    const journal = setup.store.orchestration;
+    const input = decisionInput(setup, new ActionKernel(journal));
+    const attempt = journal.decisionSource.start(setup.authority, input.ticket.decisionId);
+    const source = new ControlledDecisionSource(
+      journal,
+      setup.authority,
+      setup.agent,
+      setup.driver(),
+    );
+    await expect(source.decide({ ...input, attemptId: attempt.attemptId })).rejects.toMatchObject({
+      name: "DecisionSourceError",
+      code: "quota",
+      message: INCIDENT_QUOTA,
+    });
+    expect(journal.agents.turns(setup.authority.runId)[0]).toMatchObject({
+      status: "cancelled",
+      essentialFailure: { category: "quota", diagnosticOmission: "budget_exhausted" },
+    });
+
+    setup.newLease();
+    setup.reopen();
+    expect(
+      setup.store.orchestration.decisionSource.reconcileStoppedAttempt(
+        setup.authority,
+        attempt.attemptId,
+      ).outcome,
+    ).toEqual({
+      kind: "failure",
+      code: "quota",
+      detail: INCIDENT_QUOTA,
+      retryAfterMs: null,
+    });
   }, 15_000);
 
   it.runIf(process.env.EPICD_LIVE_ORCHESTRATOR === "1")(

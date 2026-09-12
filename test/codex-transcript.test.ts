@@ -113,6 +113,128 @@ describe("pinned Codex transcript diagnostics", () => {
       );
   });
 
+  it("retains only allowlisted rate-limit fields with exact session, turn, model, and binding provenance", async () => {
+    const s = await fixture();
+    await s.append(
+      s.rateLimits({
+        primary: { used_percent: 100, window_minutes: 300, resets_at: 1_789_000_000 },
+        rate_limit_reached_type: "workspace_member_usage_limit_reached",
+        untrusted_extra: "NEVER_RETAIN_EXTRA",
+        credits: {
+          has_credits: false,
+          unlimited: false,
+          balance: "0",
+          access_token: "NEVER_RETAIN_TOKEN",
+        },
+      }) + s.complete,
+    );
+    await s.poll();
+    expect(s.records.map((record) => record.kind)).toEqual([
+      "runtime.transcript_turn_bound",
+      "runtime.transcript_rate_limits",
+      "runtime.transcript_turn_finished",
+    ]);
+    const snapshot = JSON.parse(s.records[1]!.text);
+    expect(snapshot).toMatchObject({
+      sessionId: s.session,
+      providerTurnId: s.turn,
+      association: "turn_scoped",
+      bindingId: "a".repeat(64),
+      model: s.launch.model,
+      reasoningEffort: s.launch.reasoningEffort,
+      executableVersion: "0.153.4",
+      limitId: "premium",
+      primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 1_789_000_000 },
+      credits: { hasCredits: false, unlimited: false, balance: "0" },
+      rateLimitReachedType: "workspace_member_usage_limit_reached",
+      rateLimitReachedTypeSupport: "known",
+    });
+    expect(s.records[1]!.text).not.toMatch(/NEVER_RETAIN|access_token|untrusted_extra/);
+    expect(snapshot.evidenceWarning).toContain("not execution");
+  });
+
+  it("ignores rate-limit snapshots from another turn in the same session", async () => {
+    const s = await fixture();
+    const foreign = randomUUID();
+    await s.append(
+      s.complete +
+        s.line("event_msg", { type: "task_started", turn_id: foreign }) +
+        s.input("other prompt", foreign) +
+        s.rateLimits({ limit_id: "foreign-bucket", untrusted_extra: "NEVER_RETAIN_FOREIGN" }),
+    );
+    await s.poll();
+    expect(s.records.map((record) => record.kind)).toEqual([
+      "runtime.transcript_turn_bound",
+      "runtime.transcript_turn_finished",
+    ]);
+    expect(JSON.stringify(s.records)).not.toContain("foreign-bucket");
+    expect(JSON.stringify(s.records)).not.toContain("NEVER_RETAIN_FOREIGN");
+  });
+
+  it("does not associate an unscoped rate-limit snapshot after task completion", async () => {
+    const s = await fixture();
+    await s.append(s.complete + s.rateLimits({ limit_id: "after-completion" }));
+    await s.poll();
+    expect(s.records.map((record) => record.kind)).toEqual([
+      "runtime.transcript_turn_bound",
+      "runtime.transcript_turn_finished",
+    ]);
+    expect(JSON.stringify(s.records)).not.toContain("after-completion");
+  });
+
+  it("keeps a snapshot advisory when the private session has no model association", async () => {
+    const s = await fixture();
+    const db = new Database(s.statePath);
+    try {
+      db.prepare("UPDATE threads SET model = NULL WHERE id = ?").run(s.session);
+    } finally {
+      db.close();
+    }
+    await s.append(s.rateLimits() + s.complete);
+    await s.poll();
+    expect(JSON.parse(s.records[1]!.text)).toMatchObject({
+      sessionId: s.session,
+      providerTurnId: s.turn,
+      association: "advisory",
+      model: null,
+      limitId: "premium",
+    });
+  });
+
+  it("retains malformed current-turn quota snapshots as an explicit gap without aborting the turn", async () => {
+    const s = await fixture();
+    await s.append(
+      s.rateLimits({ limit_id: "", access_token: "NEVER_RETAIN_UNSUPPORTED" }) + s.complete,
+    );
+    await expect(s.poll()).resolves.toMatchObject({ finished: true });
+    expect(s.records.map((record) => record.kind)).toEqual([
+      "runtime.transcript_turn_bound",
+      "runtime.transcript_rate_limits_unsupported",
+      "runtime.transcript_turn_finished",
+    ]);
+    const gap = JSON.parse(s.records[1]!.text);
+    expect(gap).toMatchObject({
+      executableVersion: "0.153.4",
+      issueCount: 2,
+      issues: [
+        { code: "too_small", path: "limit_id" },
+        { code: "invalid_format", path: "limit_id" },
+      ],
+    });
+    expect(s.records[1]).toMatchObject({ sourceTruncated: true });
+    expect(s.records[1]!.text).not.toContain("NEVER_RETAIN_UNSUPPORTED");
+  });
+
+  it("preserves an unknown reached-type as unsupported advisory data", async () => {
+    const s = await fixture();
+    await s.append(s.rateLimits({ rate_limit_reached_type: "future_limit_kind" }) + s.complete);
+    await s.poll();
+    expect(JSON.parse(s.records[1]!.text)).toMatchObject({
+      rateLimitReachedType: "future_limit_kind",
+      rateLimitReachedTypeSupport: "unsupported",
+    });
+  });
+
   it("ignores other prompts and subsequent turns, and marks missing exact input", async () => {
     const s = await fixture();
     const foreign = randomUUID();

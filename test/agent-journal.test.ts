@@ -25,6 +25,7 @@ import {
   coordinatorConversationPressure,
   COORDINATOR_CONVERSATION_LIMITS,
 } from "../src/orchestrator/conversation.js";
+import { classifyProviderFailure, essentialTurnFailure } from "../src/domain/provider-failure.js";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
@@ -264,6 +265,70 @@ describe("coordinator conversation accounting", () => {
       processTreeStopped: true,
     });
     expect(report).toThrow("unstopped");
+  });
+  it("preserves the first exact-launch provider failure without treating it as stop evidence", () => {
+    const f = fixture(),
+      agent = f.reserve("specialist"),
+      prepared = f.prepare(agent);
+    const { turn, manifest } = f.launches.reserve(f.journal, f.authority, prepared.identity);
+    const sessionId = randomUUID();
+    f.agents.bindTurnProvider(f.authority, turn.identity, { runtime: "sdk", sessionId });
+    f.agents.acknowledgePrompt(
+      f.authority,
+      turn.identity,
+      turn.promptDigest,
+      "Fixture acknowledgement",
+    );
+    const failure = essentialTurnFailure(
+      turn.identity,
+      manifest.generation,
+      sessionId,
+      "2026-09-11T10:00:00.000Z",
+      classifyProviderFailure({
+        channel: "sdk",
+        event: "error",
+        message: "Unknown provider failure",
+      }),
+      { artifactIds: [], omission: "sink_failed" },
+    );
+    expect(
+      f.agents.recordEssentialFailure(f.authority, turn.identity, failure).essentialFailure,
+    ).toEqual(failure);
+    expect(
+      f.agents.recordEssentialFailure(f.authority, turn.identity, failure).essentialFailure,
+    ).toEqual(failure);
+    expect(() =>
+      f.agents.recordEssentialFailure(f.authority, turn.identity, {
+        ...failure,
+        message: "A later cleanup failure",
+      }),
+    ).toThrow("first provider failure");
+    const indeterminate = f.agents.markIndeterminate(
+      f.authority,
+      turn.identity,
+      "No trusted stop receipt",
+    );
+    expect(indeterminate).toMatchObject({
+      status: "indeterminate",
+      stopEvidence: null,
+      essentialFailure: failure,
+    });
+    expect(f.agents.instance(f.authority.runId, agent).activeTurnId).toBe(turn.identity.turnId);
+    expect(f.agents.workspace(f.authority.runId, agent).activeTurnId).toBe(turn.identity.turnId);
+  });
+
+  it("does not synthesize an essential-failure field when reading old turn records", () => {
+    const f = fixture();
+    const turn = f.prepare(f.reserve("specialist"));
+    expect(Object.hasOwn(turn, "essentialFailure")).toBe(false);
+    const reopened = new StateStore(f.path);
+    stores.push(reopened);
+    expect(
+      Object.hasOwn(
+        reopened.orchestration.agents.turn(f.authority.runId, turn.identity),
+        "essentialFailure",
+      ),
+    ).toBe(false);
   });
   it("rolls back accounting if its audit cannot be recorded", () => {
     const f = fixture(),

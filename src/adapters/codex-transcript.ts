@@ -16,6 +16,53 @@ const RecordSchema = z.object({
   type: z.string(),
   payload: z.record(z.string(), z.unknown()),
 });
+const RateLimitWindowSchema = z.object({
+  used_percent: z.number().finite().nonnegative(),
+  window_minutes: z.number().int().nonnegative().nullable(),
+  resets_at: z.number().int().nonnegative().nullable(),
+});
+const KnownRateLimitReachedTypes = new Set([
+  "rate_limit_reached",
+  "workspace_owner_credits_depleted",
+  "workspace_member_credits_depleted",
+  "workspace_owner_usage_limit_reached",
+  "workspace_member_usage_limit_reached",
+]);
+const TranscriptRateLimitsSchema = z.object({
+  limit_id: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[A-Za-z0-9._:-]+$/),
+  limit_name: z.string().max(256).nullable().optional(),
+  primary: RateLimitWindowSchema.nullable().optional(),
+  secondary: RateLimitWindowSchema.nullable().optional(),
+  credits: z
+    .object({
+      has_credits: z.boolean(),
+      unlimited: z.boolean(),
+      balance: z
+        .string()
+        .max(128)
+        .regex(/^\d+(?:\.\d+)?$/)
+        .nullable()
+        .optional(),
+    })
+    .nullable()
+    .optional(),
+  individual_limit: z
+    .object({ limit: z.number().finite().nonnegative(), used: z.number().finite().nonnegative() })
+    .nullable()
+    .optional(),
+  spend_control_reached: z.boolean().nullable().optional(),
+  rate_limit_reached_type: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[A-Za-z0-9._:-]+$/)
+    .nullable()
+    .optional(),
+});
 type Record = z.infer<typeof RecordSchema>;
 export type TranscriptDiagnostic = {
   sourceEventId: string;
@@ -42,6 +89,8 @@ export class CodexTranscriptReader {
   private fileIdentity: string | null = null;
   private path: string | null = null;
   private sessionId: string | null = null;
+  private sessionModel: string | null = null;
+  private sessionReasoningEffort: string | null = null;
   private header = false;
   private currentTurn: string | null = null;
   private targetTurn: string | null = null;
@@ -51,7 +100,10 @@ export class CodexTranscriptReader {
   constructor(
     private readonly launch: CodexLaunch,
     private readonly prompt: string,
-    private readonly emit: (record: TranscriptDiagnostic) => void,
+    private readonly emit: (
+      record: TranscriptDiagnostic,
+      replayCandidates?: readonly TranscriptDiagnostic[],
+    ) => void,
   ) {}
 
   async poll(expectedSession: string | null, check: () => void): Promise<TranscriptProgress> {
@@ -62,6 +114,8 @@ export class CodexTranscriptReader {
       if (this.sessionId) throw new Error("Observed Codex transcript session disappeared");
       return this.progress(false);
     }
+    this.sessionModel = session.model;
+    this.sessionReasoningEffort = session.reasoning_effort;
     const localPath = relative(this.launch.confinement.providerHome, session.rollout_path);
     const pattern = new RegExp(
       `^sessions/\\d{4}/\\d{2}/\\d{2}/rollout-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-${session.id}\\.jsonl$`,
@@ -197,6 +251,85 @@ export class CodexTranscriptReader {
       return;
     }
     if (!this.targetTurn || this.currentTurn !== this.targetTurn) return;
+    if (!this.finished && record.type === "event_msg" && payload.type === "token_count") {
+      if (payload.rate_limits === null || payload.rate_limits === undefined) return;
+      const parsedRateLimits = TranscriptRateLimitsSchema.safeParse(payload.rate_limits);
+      if (!parsedRateLimits.success) {
+        this.emitRecord(
+          record,
+          raw,
+          offset,
+          "rate_limits_unsupported",
+          "Provider transcript rate-limit snapshot has an unsupported shape",
+          {
+            executableVersion: "0.153.4",
+            issueCount: parsedRateLimits.error.issues.length,
+            issues: parsedRateLimits.error.issues.slice(0, 8).map((issue) => ({
+              code: issue.code,
+              path: issue.path.map(String).join(".") || "$",
+            })),
+          },
+          true,
+        );
+        return;
+      }
+      const rateLimits = parsedRateLimits.data;
+      const snapshot = (model: string | null, reasoningEffort: string | null) => {
+        const associated =
+          model === this.launch.model &&
+          reasoningEffort === this.launch.reasoningEffort &&
+          this.launch.accountBinding !== undefined;
+        return this.diagnosticRecord(
+          record,
+          raw,
+          offset,
+          "rate_limits",
+          associated
+            ? "Provider transcript rate-limit snapshot associated with this turn"
+            : "Provider transcript rate-limit snapshot is advisory; account or model association is unavailable",
+          {
+            association: associated ? "turn_scoped" : "advisory",
+            bindingId: this.launch.accountBinding?.source.bindingId ?? null,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            executableVersion: "0.153.4",
+            limitId: rateLimits.limit_id,
+            limitName: rateLimits.limit_name ?? null,
+            primary: normalizeWindow(rateLimits.primary),
+            secondary: normalizeWindow(rateLimits.secondary),
+            credits:
+              rateLimits.credits === null || rateLimits.credits === undefined
+                ? null
+                : {
+                    hasCredits: rateLimits.credits.has_credits,
+                    unlimited: rateLimits.credits.unlimited,
+                    balance: rateLimits.credits.balance ?? null,
+                  },
+            individualLimit: rateLimits.individual_limit ?? null,
+            spendControlReached: rateLimits.spend_control_reached ?? null,
+            rateLimitReachedType: rateLimits.rate_limit_reached_type ?? null,
+            rateLimitReachedTypeSupport:
+              rateLimits.rate_limit_reached_type === null ||
+              rateLimits.rate_limit_reached_type === undefined
+                ? null
+                : KnownRateLimitReachedTypes.has(rateLimits.rate_limit_reached_type)
+                  ? "known"
+                  : "unsupported",
+          },
+        );
+      };
+      // The private-state adapter accepts only null or the pinned launch value
+      // for each field. A durable sink can recover the first context by matching
+      // these four complete inputs against its immutable, unredacted digest.
+      // Redacted display text is deliberately never used as replay state.
+      this.emit(
+        snapshot(this.sessionModel, this.sessionReasoningEffort),
+        [null, this.launch.model].flatMap((model) =>
+          [null, this.launch.reasoningEffort].map((effort) => snapshot(model, effort)),
+        ),
+      );
+      return;
+    }
     if (record.type === "response_item") {
       if (["custom_tool_call", "function_call"].includes(String(payload.type))) {
         const call = z
@@ -317,7 +450,19 @@ export class CodexTranscriptReader {
     data: object,
     sourceTruncated = false,
   ) {
-    this.emit({
+    this.emit(this.diagnosticRecord(record, raw, offset, kind, summary, data, sourceTruncated));
+  }
+
+  private diagnosticRecord(
+    record: Record,
+    raw: Buffer,
+    offset: number,
+    kind: string,
+    summary: string,
+    data: object,
+    sourceTruncated = false,
+  ): TranscriptDiagnostic {
+    return {
       sourceEventId: `${this.sessionId}:${offset}`,
       kind: `runtime.transcript_${kind}`,
       summary,
@@ -332,7 +477,7 @@ export class CodexTranscriptReader {
           "Provider-retained diagnostic, not execution, validation, approval or process-stop certification. Provider omissions may be unobservable.",
         ...data,
       }),
-    });
+    };
   }
 }
 
@@ -359,6 +504,15 @@ async function openTranscript(path: string, check: () => void): Promise<FileHand
   }
 }
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+function normalizeWindow(window: z.infer<typeof RateLimitWindowSchema> | null | undefined) {
+  return window === null || window === undefined
+    ? null
+    : {
+        usedPercent: window.used_percent,
+        windowDurationMins: window.window_minutes,
+        resetsAt: window.resets_at,
+      };
+}
 function missing(error: unknown) {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }

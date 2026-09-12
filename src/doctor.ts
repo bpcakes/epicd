@@ -8,7 +8,7 @@ import {
   selectedCodexExecutableEffect,
   type HerdrEndpoint,
 } from "./adapters/runtime-discovery.js";
-import { verifyCodexExecutable } from "./adapters/codex-settings.js";
+import { verifyCodexExecutableEffect } from "./adapters/codex-settings.js";
 import { ORCHESTRATOR_MODEL, type RuntimeKind } from "./domain/types.js";
 
 export type DoctorOptions = {
@@ -33,7 +33,7 @@ export class DoctorCheckFailed extends Data.TaggedError("DoctorCheckFailed")<{
   readonly cause: unknown;
 }> {}
 
-/** Helpers own their deadlines; fiber interruption does not drain their underlying I/O. */
+/** Read-only checks composed directly from their lazy Effect APIs. */
 export function doctorEffect(
   options: DoctorOptions,
 ): Effect.Effect<DoctorReport, DoctorCheckFailed> {
@@ -43,10 +43,10 @@ export function doctorEffect(
       selectedCodexExecutableEffect(options.runtime, options.codexPath),
       ({ cause }) => new DoctorCheckFailed({ stage: "select_executable", cause }),
     );
-    const version = yield* Effect.tryPromise({
-      try: () => verifyCodexExecutable(cwd, { executablePath: executable, args: [] }),
-      catch: (cause) => new DoctorCheckFailed({ stage: "verify_version", cause }),
-    });
+    const version = yield* Effect.mapError(
+      verifyCodexExecutableEffect(cwd, { executablePath: executable, args: [] }),
+      ({ cause }) => new DoctorCheckFailed({ stage: "verify_version", cause }),
+    );
     let herdr: DoctorReport["herdr"] = null;
     if (options.runtime === "herdr") {
       const herdrExecutable = yield* Effect.mapError(

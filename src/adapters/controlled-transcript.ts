@@ -1,10 +1,18 @@
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { CodexLaunch } from "../domain/codex-launch.js";
-import type { ControllerAuthority, TurnIdentity } from "../domain/orchestration.js";
+import type {
+  ControllerAuthority,
+  ObservationInput,
+  TurnIdentity,
+} from "../domain/orchestration.js";
 import { redactDiagnosticText } from "../util/redact.js";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
-import { CodexTranscriptReader, type TranscriptProgress } from "./codex-transcript.js";
+import {
+  CodexTranscriptReader,
+  type TranscriptDiagnostic,
+  type TranscriptProgress,
+} from "./codex-transcript.js";
 
 /** Diagnostic ingestion only. Never acknowledges a prompt, accepts a result, or releases a process. */
 export class ControlledTranscript {
@@ -20,17 +28,44 @@ export class ControlledTranscript {
   }
 
   private createReader() {
-    return new CodexTranscriptReader(this.launch, this.prompt, (record) => {
+    const observationInput = (
+      record: TranscriptDiagnostic,
+      wakesOrchestrator = record.kind !== "runtime.transcript_rate_limits",
+    ): Omit<ObservationInput, "artifactIds"> => ({
+      source: "codex-transcript",
+      sourceEventId: `${this.identity.turnId}:${record.sourceEventId}`,
+      kind: record.kind,
+      summary: record.summary,
+      identity: this.identity,
+      wakesOrchestrator,
+    });
+    return new CodexTranscriptReader(this.launch, this.prompt, (current, replayCandidates) => {
+      let record = current;
+      let input = observationInput(record);
+      if (replayCandidates) {
+        replay: for (const candidate of replayCandidates) {
+          // Earlier snapshots woke the coordinator. Their original immutable
+          // inputs still replay, while new passive snapshots do not wake it.
+          for (const wakes of [false, true]) {
+            const candidateInput = observationInput(candidate, wakes);
+            if (
+              this.journal.diagnostics.matchesInput(
+                this.authority.runId,
+                candidateInput,
+                candidate.text,
+                candidate.sourceTruncated,
+              )
+            ) {
+              record = candidate;
+              input = candidateInput;
+              break replay;
+            }
+          }
+        }
+      }
       const retained = this.journal.diagnostics.append(
         this.authority,
-        {
-          source: "codex-transcript",
-          sourceEventId: `${this.identity.turnId}:${record.sourceEventId}`,
-          kind: record.kind,
-          summary: record.summary,
-          identity: this.identity,
-          wakesOrchestrator: true,
-        },
+        input,
         record.text,
         record.sourceTruncated,
       );

@@ -5,8 +5,8 @@ import { describe, expect, it } from "vitest";
 import { operatorFixture } from "./fixtures/operator.js";
 
 const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
-async function terminal(f: Awaited<ReturnType<typeof operatorFixture>>) {
-  const command = `stty rows 48 cols 140; exec ${quote(process.execPath)} ${quote(resolve("dist/cli.js"))} control ${quote(f.state.runId)} --state ${quote(f.path)}`;
+async function terminal(f: Awaited<ReturnType<typeof operatorFixture>>, runId = f.state.runId) {
+  const command = `stty rows 48 cols 140; exec ${quote(process.execPath)} ${quote(resolve("dist/cli.js"))} control ${quote(runId)} --state ${quote(f.path)}`;
   const child = spawn("/usr/bin/script", ["-q", "-e", "-E", "never", "-c", command, "/dev/null"], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, TERM: "xterm", FORCE_COLOR: "0", CI: "" },
@@ -35,6 +35,17 @@ async function terminal(f: Awaited<ReturnType<typeof operatorFixture>>) {
 describe.runIf(process.platform === "linux")(
   "compiled operator console in a real pseudo-terminal",
   () => {
+    it("preserves a pre-render status failure as the original CLI diagnostic", async () => {
+      const f = await operatorFixture(),
+        tty = await terminal(f, "missing-run");
+      try {
+        await tty.see("epicd: Unknown epicd run missing-run");
+        await expect(tty.closed).resolves.toEqual([1, null]);
+      } finally {
+        await tty.stop();
+      }
+    });
+
     it("opens and quits without attaching a controller or changing the run", async () => {
       const f = await operatorFixture(),
         before = f.operator.status(),

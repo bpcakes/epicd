@@ -3,9 +3,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveCodexModel, verifyCodexExecutable } from "../src/adapters/codex-settings.js";
-import { startCodexProcess } from "../src/adapters/codex-process.js";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Result from "effect/Result";
+import {
+  resolveCodexModel,
+  resolveCodexModelEffect,
+  verifyCodexExecutable,
+  verifyCodexExecutableEffect,
+} from "../src/adapters/codex-settings.js";
+import { runCodexCommandEffect, startCodexProcess } from "../src/adapters/codex-process.js";
+import * as accountModelDiscovery from "../src/adapters/account-model-discovery.js";
+import { CommandError } from "../src/util/command.js";
+
+vi.mock("../src/adapters/account-model-discovery.js", async (original) => ({
+  ...(await original<typeof import("../src/adapters/account-model-discovery.js")>()),
+}));
 
 const tempDirs: string[] = [];
 
@@ -35,6 +50,22 @@ async function waitForProcessExit(pid: number): Promise<void> {
 }
 
 describe("Codex app-server process cleanup", () => {
+  it("exposes a typed version-check failure while retaining the CommandError cause", async () => {
+    const result = await Effect.runPromise(
+      Effect.result(
+        verifyCodexExecutableEffect(process.cwd(), {
+          executablePath: process.execPath,
+          args: ["-e", "process.stderr.write('version failed\\n'); process.exit(7)", "--"],
+        }),
+      ),
+    );
+    if (!Result.isFailure(result)) throw new Error("Expected version failure");
+    expect(result.failure._tag).toBe("CodexExecutableVerificationFailed");
+    expect(result.failure.cause).toBeInstanceOf(Error);
+    expect((result.failure.cause as Error).message).toContain("version failed");
+    expect((result.failure.cause as Error).cause).toBeInstanceOf(CommandError);
+  });
+
   it.each(["stdout", "stderr"] as const)(
     "preserves a finite version command's %s",
     async (stream) => {
@@ -140,16 +171,161 @@ describe("Codex app-server process cleanup", () => {
     },
   );
 
-  it("retries a failed executable spawn and reports the attempt count", async () => {
+  it("retries typed discovery failures and preserves the Promise attempt-count contract", async () => {
     const directory = mkdtempSync(join(tmpdir(), "epicd-codex-missing-"));
     tempDirs.push(directory);
-    await expect(
-      resolveCodexModel(directory, {
-        executable: { executablePath: join(directory, "missing-executable"), args: [] },
-        attempts: 2,
-      }),
-    ).rejects.toThrow("after 2 attempts:");
+    const options = {
+      executable: { executablePath: join(directory, "missing-executable"), args: [] },
+      attempts: 2,
+    };
+    const result = await Effect.runPromise(
+      Effect.result(resolveCodexModelEffect(directory, options)),
+    );
+    if (!Result.isFailure(result)) throw new Error("Expected model-discovery failure");
+    expect(result.failure).toMatchObject({
+      _tag: "CodexModelResolutionFailed",
+      stage: "discover",
+      attempts: 2,
+      cause: { message: expect.stringContaining("after 2 attempts:") },
+    });
+    await expect(resolveCodexModel(directory, options)).rejects.toThrow("after 2 attempts:");
   });
+
+  it("does not retry a model probe when cleanup cannot prove stop", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "epicd-codex-stop-unproven-"));
+    tempDirs.push(directory);
+    const cleanupFailure = new Error("cleanup is pending; retained intent: fixture");
+    const start = vi
+      .spyOn(accountModelDiscovery, "startAccountModelDiscovery")
+      .mockImplementation(async () => {
+        const stdin = new PassThrough();
+        return {
+          stdin,
+          stdout: new PassThrough(),
+          stderr: new PassThrough(),
+          onError: vi.fn(),
+          onClose: vi.fn(),
+          stop: (done: (error?: Error) => void) => done(cleanupFailure),
+        };
+      });
+    const result = await Effect.runPromise(
+      Effect.result(
+        resolveCodexModelEffect(directory, {
+          executable: { executablePath: process.execPath, args: [] },
+          attempts: 2,
+          timeoutMs: 10,
+          accountDiscovery: { source: null, root: directory },
+        }),
+      ),
+    );
+    if (!Result.isFailure(result)) throw new Error("Expected model-discovery failure");
+    expect(start).toHaveBeenCalledOnce();
+    expect(result.failure).toMatchObject({
+      stage: "discover",
+      attempts: 1,
+      cause: { message: expect.stringContaining(cleanupFailure.message) },
+    });
+  });
+
+  it.runIf(process.platform === "linux")(
+    "does not start a discovery retry until the preceding process has stopped",
+    async () => {
+      const directory = mkdtempSync(join(tmpdir(), "epicd-codex-effect-retry-"));
+      tempDirs.push(directory);
+      const fixturePath = join(directory, "app-server.cjs");
+      const logPath = join(directory, "lifecycle.log");
+      writeFileSync(
+        fixturePath,
+        `
+const fs = require("node:fs");
+const { createInterface } = require("node:readline");
+const logPath = process.argv[2];
+const prior = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
+const attempt = prior.split("\\n").filter(line => line.startsWith("start ")).length + 1;
+if (attempt === 2) {
+  const pid = Number(prior.match(/^start 1 (\\d+)$/m)[1]);
+  let alive = true;
+  try {
+    process.kill(pid, 0);
+    alive = !/^\\d+ \\(.*\\) Z /.test(fs.readFileSync("/proc/" + pid + "/stat", "utf8"));
+  } catch { alive = false; }
+  fs.appendFileSync(logPath, "prior " + (alive ? "alive" : "stopped") + "\\n");
+}
+fs.appendFileSync(logPath, "start " + attempt + " " + process.pid + "\\n");
+process.on("SIGTERM", () => {});
+createInterface({ input: process.stdin }).on("line", line => {
+  const request = JSON.parse(line);
+  if (attempt === 2 && request.method === "initialize") process.stdout.write("{\\n");
+});
+`,
+      );
+      const result = await Effect.runPromise(
+        Effect.result(
+          resolveCodexModelEffect(directory, {
+            executable: { executablePath: process.execPath, args: [fixturePath, logPath] },
+            attempts: 2,
+            timeoutMs: 300,
+          }),
+        ),
+      );
+      if (!Result.isFailure(result)) throw new Error("Expected model-discovery failure");
+      expect(result.failure.attempts).toBe(2);
+      const lifecycle = readFileSync(logPath, "utf8").trim().split("\n");
+      expect(lifecycle).toHaveLength(3);
+      expect(lifecycle[0]).toMatch(/^start 1 \d+$/);
+      expect(lifecycle[1]).toBe("prior stopped");
+      expect(lifecycle[2]).toMatch(/^start 2 \d+$/);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "waits for finite-command descendants when its Effect fiber is interrupted",
+    async () => {
+      const directory = mkdtempSync(join(tmpdir(), "epicd-codex-effect-interrupt-"));
+      tempDirs.push(directory);
+      const fixturePath = join(directory, "command.cjs");
+      const readyPath = join(directory, "ready.json");
+      writeFileSync(
+        fixturePath,
+        `
+const { spawn } = require("node:child_process");
+const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)"], { stdio: ["ignore", "pipe", "ignore"] });
+process.on("SIGTERM", () => {});
+child.stdout.once("data", () => {
+  require("node:fs").writeFileSync(process.argv[2], JSON.stringify({ parent: process.pid, child: child.pid }));
+});
+setInterval(() => {}, 1000);
+`,
+      );
+      const fiber = Effect.runFork(
+        runCodexCommandEffect(process.execPath, [fixturePath, readyPath], {
+          cwd: directory,
+          env: process.env,
+          timeoutMs: 10_000,
+        }),
+      );
+      let pids: { parent: number; child: number } | undefined;
+      try {
+        await expect
+          .poll(() => {
+            try {
+              return JSON.parse(readFileSync(readyPath, "utf8"));
+            } catch {
+              return null;
+            }
+          })
+          .not.toBeNull();
+        pids = JSON.parse(readFileSync(readyPath, "utf8"));
+        await Effect.runPromise(Fiber.interrupt(fiber));
+        expect(processExists(pids!.parent)).toBe(false);
+        expect(processExists(pids!.child)).toBe(false);
+      } finally {
+        await Effect.runPromise(Fiber.interrupt(fiber));
+        for (const pid of pids ? [pids.parent, pids.child] : [])
+          if (processExists(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+  );
 
   it.runIf(process.platform !== "win32")(
     "cleans up its group when the caller exits unexpectedly",

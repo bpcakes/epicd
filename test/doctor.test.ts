@@ -29,8 +29,8 @@ describe("doctor Effect boundary", () => {
           .spyOn(discovery, "selectedCodexExecutableEffect")
           .mockReturnValue(Effect.succeed("/fixture/codex")),
         verify_version: vi
-          .spyOn(codexSettings, "verifyCodexExecutable")
-          .mockResolvedValue("fixture"),
+          .spyOn(codexSettings, "verifyCodexExecutableEffect")
+          .mockReturnValue(Effect.succeed("fixture")),
         resolve_herdr: vi
           .spyOn(discovery, "resolveExecutableEffect")
           .mockReturnValue(Effect.succeed("/fixture/herdr")),
@@ -42,7 +42,10 @@ describe("doctor Effect boundary", () => {
           }),
         ),
       };
-      if (stage === "verify_version") stages.verify_version.mockRejectedValue(cause);
+      if (stage === "verify_version")
+        stages.verify_version.mockReturnValue(
+          Effect.fail(new codexSettings.CodexExecutableVerificationFailed({ cause })),
+        );
       else
         stages[stage].mockReturnValue(
           Effect.fail(

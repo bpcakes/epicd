@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -97,6 +98,202 @@ async function fixture(budget = 100 * 1024 * 1024) {
 }
 
 describe("durable transcript ingestion (diagnostic only)", () => {
+  it("retains repeated quota snapshots without waking a waiting coordinator", async () => {
+    const s = await fixture();
+    const observer = s.observer();
+    await observer.poll(s.session, s.check);
+    const cursor = s.observations().at(-1)!.id;
+    await s.append(s.rateLimits() + s.rateLimits());
+    await observer.poll(s.session, s.check);
+    expect(
+      s.observations().filter((row) => row.kind === "runtime.transcript_rate_limits"),
+    ).toHaveLength(2);
+    expect(s.journal.observations(s.authority.runId, cursor, 1, true)).toEqual([]);
+    await s.append(s.call() + s.output() + s.complete);
+    await observer.finish(s.session, s.check);
+    expect(
+      s.journal.observations(s.authority.runId, cursor, 100, true).map((row) => row.kind),
+    ).toEqual([
+      "runtime.transcript_tool_call",
+      "runtime.transcript_tool_result",
+      "runtime.transcript_turn_finished",
+    ]);
+  });
+
+  it("retains a zero-credit snapshot as diagnostics without changing the turn", async () => {
+    const s = await fixture();
+    await s.append(s.rateLimits() + s.complete);
+    await s.observer().finish(s.session, s.check);
+    const snapshot = s.observations().find((row) => row.kind === "runtime.transcript_rate_limits")!;
+    expect(
+      JSON.parse(
+        s.journal.diagnostics.read(s.authority.runId, snapshot.artifactIds[0]!, 0, 65536).text,
+      ),
+    ).toMatchObject({
+      sessionId: s.session,
+      providerTurnId: s.providerTurn,
+      limitId: "premium",
+      credits: { hasCredits: false, unlimited: false, balance: "0" },
+    });
+    expect(s.journal.agents.turn(s.authority.runId, s.turn.identity)).toEqual(s.turn);
+  });
+
+  it.each(["model", "reasoning_effort", "both"])(
+    "preserves quota provenance across a cold reopen after %s metadata arrives",
+    async (missing) => {
+      const s = await fixture();
+      const db = new Database(s.statePath);
+      try {
+        db.prepare("UPDATE threads SET model = ?, reasoning_effort = ?").run(
+          missing === "reasoning_effort" ? s.launch.model : null,
+          missing === "model" ? s.launch.reasoningEffort : null,
+        );
+        await s.append(s.rateLimits());
+        await s.observer().poll(s.session, s.check);
+        const before = s.observations();
+        const snapshot = before.find((row) => row.kind === "runtime.transcript_rate_limits")!;
+        const retained = s.journal.diagnostics.retained(
+          s.authority.runId,
+          snapshot.artifactIds[0]!,
+        );
+        expect(JSON.parse(retained.text)).toMatchObject({ association: "advisory" });
+        db.prepare("UPDATE threads SET model = ?, reasoning_effort = ?").run(
+          s.launch.model,
+          s.launch.reasoningEffort,
+        );
+        await s.append(s.rateLimits({ limit_id: "later" }) + s.call() + s.output() + s.complete);
+        s.reopen();
+        await s.observer().finish(s.session, s.check);
+        expect(s.observations().slice(0, before.length)).toEqual(before);
+        expect(s.journal.diagnostics.retained(s.authority.runId, snapshot.artifactIds[0]!)).toEqual(
+          retained,
+        );
+        const snapshots = s
+          .observations()
+          .filter((row) => row.kind === "runtime.transcript_rate_limits");
+        expect(snapshots).toHaveLength(2);
+        expect(
+          JSON.parse(
+            s.journal.diagnostics.retained(s.authority.runId, snapshots[1]!.artifactIds[0]!).text,
+          ),
+        ).toMatchObject({
+          association: "turn_scoped",
+          model: s.launch.model,
+          reasoningEffort: s.launch.reasoningEffort,
+          limitId: "later",
+        });
+        expect(s.observations().at(-1)!.kind).toBe("runtime.transcript_turn_finished");
+        const after = s.observations(),
+          usage = s.journal.diagnostics.usage(s.authority.runId);
+        s.reopen();
+        await s.observer().finish(s.session, s.check);
+        expect(s.observations()).toEqual(after);
+        expect(s.journal.diagnostics.usage(s.authority.runId)).toEqual(usage);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it("preserves quota provenance when retrying a later journal failure", async () => {
+    const s = await fixture();
+    const db = new Database(s.statePath);
+    try {
+      db.prepare("UPDATE threads SET model = NULL, reasoning_effort = NULL").run();
+      await s.append(s.rateLimits() + s.call() + s.output() + s.complete);
+      const observer = s.observer();
+      const original = s.journal.diagnostics.append.bind(s.journal.diagnostics);
+      let calls = 0;
+      const spy = vi.spyOn(s.journal.diagnostics, "append").mockImplementation((...args) => {
+        if (++calls === 3) throw new Error("injected persistence failure");
+        return original(...args);
+      });
+      await expect(observer.poll(s.session, s.check)).rejects.toThrow(
+        "injected persistence failure",
+      );
+      const before = s.observations();
+      expect(before).toHaveLength(2);
+      db.prepare("UPDATE threads SET model = ?, reasoning_effort = ?").run(
+        s.launch.model,
+        s.launch.reasoningEffort,
+      );
+      spy.mockRestore();
+      await observer.finish(s.session, s.check);
+      expect(s.observations().slice(0, 2)).toEqual(before);
+      expect(s.observations()).toHaveLength(5);
+      expect(s.journal.diagnostics.usage(s.authority.runId).count).toBe(5);
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each([false, true])(
+    "replays redacted quota diagnostics with a legacy wake flag of %s",
+    async (legacyWake) => {
+      const s = await fixture();
+      const db = new Database(s.statePath);
+      try {
+        db.prepare("UPDATE threads SET model = NULL, reasoning_effort = NULL").run();
+        await s.append(s.rateLimits({ limit_name: "token=never-retain-quota-secret" }));
+        const append = s.journal.diagnostics.append.bind(s.journal.diagnostics);
+        const spy = vi
+          .spyOn(s.journal.diagnostics, "append")
+          .mockImplementation((authority, input, text, truncated) =>
+            append(
+              authority,
+              input.kind === "runtime.transcript_rate_limits"
+                ? { ...input, wakesOrchestrator: legacyWake }
+                : input,
+              text,
+              truncated,
+            ),
+          );
+        await s.observer().poll(s.session, s.check);
+        spy.mockRestore();
+        const before = s.observations();
+        const retained = s.journal.diagnostics.retained(
+          s.authority.runId,
+          before[1]!.artifactIds[0]!,
+        );
+        expect(retained.text).not.toContain("never-retain-quota-secret");
+        db.prepare("UPDATE threads SET model = ?, reasoning_effort = ?").run(
+          s.launch.model,
+          s.launch.reasoningEffort,
+        );
+        await s.append(s.call() + s.output() + s.complete);
+        s.reopen();
+        await s.observer().finish(s.session, s.check);
+        expect(s.observations().slice(0, 2)).toEqual(before);
+        expect(s.observations()).toHaveLength(5);
+        expect(
+          s.journal.diagnostics.retained(s.authority.runId, before[1]!.artifactIds[0]!),
+        ).toEqual(retained);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it("rejects changed quota bytes after private model metadata arrives", async () => {
+    const s = await fixture();
+    const db = new Database(s.statePath);
+    try {
+      db.prepare("UPDATE threads SET model = NULL").run();
+      const initial = s.prefix + s.rateLimits({ access_token: "token-one" }) + s.complete;
+      await writeFile(s.path, initial);
+      await s.observer().finish(s.session, s.check);
+      db.prepare("UPDATE threads SET model = ?").run(s.launch.model);
+      await writeFile(s.path, initial.replace("token-one", "token-two"));
+      s.reopen();
+      await expect(s.observer().finish(s.session, s.check)).rejects.toThrow(
+        "reused with different content",
+      );
+      expect(s.observations()).toHaveLength(3);
+    } finally {
+      db.close();
+    }
+  });
+
   it("replays after a cold reopen without duplicate observations, charges or invented evidence", async () => {
     const s = await fixture();
     await s.append(s.call() + s.output() + s.complete);

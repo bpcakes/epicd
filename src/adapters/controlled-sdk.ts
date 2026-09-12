@@ -7,6 +7,11 @@ import { ControlledLaunches, type ControlledLaunchOptions } from "./controlled-l
 import { ControlledTranscript } from "./controlled-transcript.js";
 import { normalizeCodexEvent } from "./codex.js";
 import { redactSensitiveText } from "../util/redact.js";
+import {
+  classifyProviderFailure,
+  essentialTurnFailure,
+  type EssentialTurnFailure,
+} from "../domain/provider-failure.js";
 
 export type ControlledSdkOptions = ControlledLaunchOptions;
 
@@ -71,6 +76,7 @@ export class ControlledSdkRuntime {
     let completed = false;
     let result: unknown = null;
     let diagnostic: string | null = null;
+    const cleanupDiagnostics: string[] = [];
     let sequence = 0;
     let onStreamAbort: (() => void) | undefined;
     const transcript = new ControlledTranscript(
@@ -124,6 +130,14 @@ export class ControlledSdkRuntime {
           let response = "";
           for await (const event of streamed.events) {
             check();
+            const classified =
+              event.type === "error" || event.type === "turn.failed"
+                ? classifyProviderFailure({
+                    channel: "sdk",
+                    event: event.type,
+                    message: event.type === "error" ? event.message : event.error.message,
+                  })
+                : null;
             if (event.type === "thread.started")
               this.journal.agents.bindTurnProvider(authority, identity, {
                 runtime: "sdk",
@@ -139,24 +153,56 @@ export class ControlledSdkRuntime {
               );
             }
             const normalized = normalizeCodexEvent(event);
+            let retainedFailureDiagnostic:
+              | { artifactIds: string[]; omission: EssentialTurnFailure["diagnosticOmission"] }
+              | undefined;
             if (normalized) {
-              const retained = this.journal.diagnostics.append(
-                authority,
-                {
-                  source: "controlled-sdk",
-                  sourceEventId: `${identity.turnId}:${++sequence}`,
-                  kind: `runtime.${normalized.type}`,
-                  summary: redactSensitiveText(JSON.stringify(normalized), 7999),
-                  identity,
-                  wakesOrchestrator: true,
-                },
-                JSON.stringify(normalized),
-                normalized.type === "command.completed" && normalized.outputTruncated,
-              );
-              if (retained.artifact.omission === "budget_exhausted")
-                throw new Error(
-                  "Retained diagnostic budget exhausted; stop this turn without accepting its result",
+              try {
+                const retained = this.journal.diagnostics.append(
+                  authority,
+                  {
+                    source: "controlled-sdk",
+                    sourceEventId: `${identity.turnId}:${++sequence}`,
+                    kind: `runtime.${normalized.type}`,
+                    summary: redactSensitiveText(JSON.stringify(normalized), 7999),
+                    identity,
+                    wakesOrchestrator: true,
+                  },
+                  JSON.stringify(normalized),
+                  normalized.type === "command.completed" && normalized.outputTruncated,
                 );
+                retainedFailureDiagnostic = {
+                  artifactIds: [retained.artifact.artifactId],
+                  omission: retained.artifact.omission,
+                };
+                if (!classified && retained.artifact.omission === "budget_exhausted")
+                  throw new Error(
+                    "Retained diagnostic budget exhausted; stop this turn without accepting its result",
+                  );
+              } catch (error) {
+                if (!classified) throw error;
+                retainedFailureDiagnostic = { artifactIds: [], omission: "sink_failed" };
+                cleanupDiagnostics.push(
+                  redactSensitiveText(
+                    error instanceof Error
+                      ? `Provider failure diagnostic could not be retained: ${error.message}`
+                      : "Provider failure diagnostic could not be retained",
+                    7999,
+                  ),
+                );
+              }
+            }
+            if (classified) {
+              const failure = essentialTurnFailure(
+                identity,
+                manifest.generation,
+                sessionId(),
+                new Date().toISOString(),
+                classified,
+                retainedFailureDiagnostic ?? { artifactIds: [], omission: "sink_failed" },
+              );
+              this.journal.agents.recordEssentialFailure(authority, identity, failure);
+              throw new ProviderEventFailure(failure);
             }
             if (event.type === "turn.completed") {
               if (event.usage)
@@ -189,8 +235,6 @@ export class ControlledSdkRuntime {
                 );
               response = event.item.text;
             }
-            if (event.type === "error" || event.type === "turn.failed")
-              throw new Error(event.type === "error" ? event.message : event.error.message);
           }
           check();
           if (!completed || !thread.id || !response.trim())
@@ -200,14 +244,27 @@ export class ControlledSdkRuntime {
         interrupted,
       ]);
     } catch (error) {
-      error = transcriptError ?? error;
+      const primary =
+        error instanceof ProviderEventFailure ? error.failure.message : (transcriptError ?? error);
       diagnostic = redactSensitiveText(
-        error instanceof Error ? error.message : "Agent execution failed",
+        primary instanceof Error
+          ? primary.message
+          : typeof primary === "string"
+            ? primary
+            : "Agent execution failed",
         7999,
       );
       request.abort(error);
     } finally {
-      await stopWatching?.();
+      try {
+        await stopWatching?.();
+      } catch (error) {
+        const detail = redactSensitiveText(
+          error instanceof Error ? error.message : "Transcript watcher cleanup failed",
+          7999,
+        );
+        cleanupDiagnostics.push(detail);
+      }
       clearInterval(health);
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
@@ -247,7 +304,7 @@ export class ControlledSdkRuntime {
           7999,
         );
         transcript.gap(detail);
-        diagnostic ??= detail;
+        cleanupDiagnostics.push(detail);
       }
     }
     if (diagnostic)
@@ -256,6 +313,16 @@ export class ControlledSdkRuntime {
         sourceEventId: `${identity.turnId}:problem`,
         kind: "runtime.problem",
         summary: diagnostic,
+        artifactIds: [],
+        identity,
+        wakesOrchestrator: true,
+      });
+    for (const [index, detail] of cleanupDiagnostics.entries())
+      this.journal.appendObservation(authority, {
+        source: "controlled-sdk",
+        sourceEventId: `${identity.turnId}:cleanup-problem:${index}`,
+        kind: "runtime.cleanup_problem",
+        summary: detail,
         artifactIds: [],
         identity,
         wakesOrchestrator: true,
@@ -275,7 +342,12 @@ export class ControlledSdkRuntime {
     return this.journal.agents.finishTurn(authority, identity, {
       status: cancelled
         ? "cancelled"
-        : completed && result !== null && !diagnostic && stop.code === 0 && !stop.interrupted
+        : completed &&
+            result !== null &&
+            diagnostic === null &&
+            cleanupDiagnostics.length === 0 &&
+            stop.code === 0 &&
+            !stop.interrupted
           ? "completed"
           : "failed",
       result,
@@ -342,5 +414,12 @@ export class ControlledSdkRuntime {
       result: null,
       stopEvidence: JSON.stringify(stop),
     });
+  }
+}
+
+class ProviderEventFailure extends Error {
+  constructor(readonly failure: EssentialTurnFailure) {
+    super(failure.message);
+    this.name = "ProviderEventFailure";
   }
 }
