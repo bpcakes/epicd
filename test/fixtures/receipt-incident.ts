@@ -57,6 +57,7 @@ export type ReceiptFault = {
     afterSha256: string;
   }[];
 };
+export type ReceiptFaultState = { fault: ReceiptFault | null };
 
 /** Explicit host fault injection AFTER a real stopped review turn. It emulates
  * legacy receipt writes; it does not claim the immutable runtime permitted them,
@@ -66,17 +67,18 @@ export function receiptFaultDriver(
   journal: Journal,
   original: ControlledAgentDriver,
   workspaceRoot: string,
+  state: ReceiptFaultState = { fault: null },
 ) {
   const run = original.run.bind(original);
-  let fault: ReceiptFault | null = null;
   const driver: ControlledAgentDriver = {
+    backend: original.backend,
     kind: original.kind,
     reconcile: original.reconcile.bind(original),
     async run(authority, identity, signal) {
       const stopped = await run(authority, identity, signal);
       const assignment = journal.agents.assignment(authority.runId, identity.assignmentId);
       if (
-        fault ||
+        state.fault ||
         assignment.purpose !== "review" ||
         !stopped.resultEligible ||
         !stopped.stopEvidence
@@ -125,7 +127,7 @@ export function receiptFaultDriver(
           deltas,
         }),
       );
-      fault = {
+      state.fault = {
         identity,
         workspacePath: workspace.path,
         observationId: retained.observation.id,
@@ -138,7 +140,7 @@ export function receiptFaultDriver(
   return {
     driver,
     get fault() {
-      return fault;
+      return state.fault;
     },
   };
 }

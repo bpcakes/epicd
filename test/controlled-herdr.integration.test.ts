@@ -4,12 +4,15 @@ import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import Database from "better-sqlite3";
 import { StateStore } from "../src/adapters/store.js";
 import { ControlledHerdrRuntime } from "../src/adapters/controlled-herdr.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { controlCodexLaunch } from "../src/adapters/codex-launch.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import {
@@ -25,6 +28,7 @@ import { OrchestratorLoop } from "../src/orchestrator/loop.js";
 import { ControlledDecisionSource } from "../src/orchestrator/sdk-source.js";
 import { runCommand, runJson } from "../src/util/command.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { freezeAccountDraft, loadAccountDraft } from "../src/adapters/accounts.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -142,10 +146,45 @@ async function fixture(role: AgentRole = "implementation") {
     { cwd: root, env, timeoutMs: 5000 },
     z.object({ result: z.object({ workspace: z.object({ workspace_id: z.string() }) }) }),
   );
+  const herdrPath = await realpath(execFileSync("which", ["herdr"], { encoding: "utf8" }).trim());
+  const executable = await realpath(
+    join(
+      dirname(createRequire(import.meta.url).resolve("@openai/codex-linux-x64/package.json")),
+      "vendor/x86_64-unknown-linux-musl/bin/codex",
+    ),
+  );
   const databasePath = join(root, "state.sqlite3");
   let store = new StateStore(databasePath);
   closeStore = () => store.close();
-  const state = store.create(initialRun(), RepositoryPolicySchema.parse({ schemaVersion: 1 }));
+  const accounts = await freezeAccountDraft(
+    await loadAccountDraft({
+      codexHome: process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+    }),
+  );
+  const state = store.create(
+    {
+      ...initialRun(),
+      runtime: "herdr",
+      runtimeConfiguration: {
+        commonDirectory: { path: join(root, "repo", ".git"), device: "1", inode: "1" },
+        executable,
+        trackerExecutable: process.execPath,
+        runtimeRoot: join(root, "runtime"),
+        workspaceRoot: join(root, "copies"),
+        accounts,
+        turnTimeoutMs: 90_000,
+        herdr: {
+          executable: herdrPath,
+          sessionName,
+          workspaceId: creation.result.workspace.workspace_id,
+        },
+      },
+    },
+    RepositoryPolicySchema.parse({ schemaVersion: 1 }),
+  );
+  const fixtureDb = new Database(databasePath);
+  fixtureDb.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+  fixtureDb.close();
   const lease = store.acquireLease(state.runId);
   let authority: ControllerAuthority = {
     runId: state.runId,
@@ -180,6 +219,7 @@ async function fixture(role: AgentRole = "implementation") {
         : "Perform only the bounded runtime integration check and write its required result envelope",
       confinementProfile: "epicd-isolated",
       contract: HerdrAgentSessionContractSchema.parse({
+        backend: "codex",
         runtime: "herdr",
         requested: settings,
         effective: settings,
@@ -189,23 +229,31 @@ async function fixture(role: AgentRole = "implementation") {
   );
   const options = {
     root: join(root, "runtime"),
-    herdrPath: "herdr",
+    herdrPath,
     sessionName,
     workspaceId: creation.result.workspace.workspace_id,
     env,
-    executable: await realpath(
-      join(
-        dirname(createRequire(import.meta.url).resolve("@openai/codex-linux-x64/package.json")),
-        "vendor/x86_64-unknown-linux-musl/bin/codex",
-      ),
-    ),
-    authCachePath: await realpath(
-      join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "auth.json"),
-    ),
+    executable,
     launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
     turnTimeoutMs: 90_000,
   };
   const runtime = () => new ControlledHerdrRuntime(store.orchestration, options);
+  const dispatcher = () =>
+    new ControlledAgentDispatcher(store.orchestration, {
+      "codex:herdr": (journal, execution) => {
+        if (!execution.herdr) throw new Error("Missing persisted Herdr execution endpoint");
+        return new ControlledHerdrRuntime(journal, {
+          root: execution.runtimeRoot,
+          executable: execution.executable,
+          turnTimeoutMs: execution.turnTimeoutMs,
+          herdrPath: execution.herdr.executable,
+          sessionName: execution.herdr.sessionName,
+          workspaceId: execution.herdr.workspaceId,
+          launcherEntrypoint: options.launcherEntrypoint,
+          env,
+        });
+      },
+    });
   const prepare = (instructions: string) =>
     store.orchestration.agents.prepareTurn(
       authority,
@@ -272,6 +320,7 @@ async function fixture(role: AgentRole = "implementation") {
       return authority;
     },
     runtime,
+    dispatcher,
     prepare,
     replaceController,
     terminalStopped,
@@ -287,7 +336,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === 
       const dispatch = async (instructions: string) => {
         const journal = setup.store.orchestration;
         const kernel = new ActionKernel(journal);
-        registerAgentCapabilities(kernel, setup.runtime(), () => setup.agent.contract);
+        registerAgentCapabilities(kernel, setup.dispatcher(), () => setup.agent.contract);
         const ticket = journal.beginDecision(
           setup.authority,
           journal.latestObservationCursor(setup.authority.runId),
@@ -456,7 +505,7 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_HERDR === 
         journal,
         setup.authority,
         setup.agent,
-        setup.runtime(),
+        setup.dispatcher(),
       );
       expect(
         await new OrchestratorLoop(new ActionKernel(journal), source, { pollMs: 50 }).run(

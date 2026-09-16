@@ -2,15 +2,17 @@ import { AccountBindingSchema } from "./accounts.js";
 import { z } from "zod";
 import { TurnIdentitySchema } from "./orchestration.js";
 import { AgentRoleSchema, AgentSessionContractSchema } from "./types.js";
-import { TurnLaunchSchema } from "./codex-launch.js";
+import { LaunchPathSchema, TurnLaunchSchema } from "./codex-launch.js";
 import { TaskClaimBindingSchema, EpicRepairBindingSchema } from "./tracker.js";
 import { StateFileIdentitySchema } from "./state-file-identity.js";
 import { EssentialTurnFailureSchema } from "./provider-failure.js";
+import { AgentExecutionSchema } from "./agent-execution.js";
 
 const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
 const Generation = z.number().int().positive();
 const Text = z.string().min(1).max(16000);
 const At = z.iso.datetime();
+export const AGENT_INSTANCE_SCHEMA_VERSION = 3;
 export const AgentIdentitySchema = z.strictObject({ agentId: Id, agentGeneration: Generation });
 export type AgentIdentity = z.infer<typeof AgentIdentitySchema>;
 export const WorkspaceIdentitySchema = z.strictObject({
@@ -77,8 +79,13 @@ export const AgentAssignmentSchema = z
 export type AgentAssignment = z.infer<typeof AgentAssignmentSchema>;
 
 export const ProviderIdentitySchema = z.discriminatedUnion("runtime", [
-  z.strictObject({ runtime: z.literal("sdk"), sessionId: z.string().min(1).max(256) }),
   z.strictObject({
+    backend: z.literal("codex"),
+    runtime: z.literal("sdk"),
+    sessionId: z.string().min(1).max(256),
+  }),
+  z.strictObject({
+    backend: z.literal("codex"),
     runtime: z.literal("herdr"),
     name: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
     paneId: z.string().min(1).max(256),
@@ -89,15 +96,26 @@ export const ProviderIdentitySchema = z.discriminatedUnion("runtime", [
 ]);
 export type ProviderIdentity = z.infer<typeof ProviderIdentitySchema>;
 
+export const AgentConversationContinuationSchema = z.strictObject({
+  transferId: Id,
+  sourceAgentId: Id,
+  sourceAgentGeneration: Generation,
+  sessionId: z.string().min(1).max(256),
+  providerHome: LaunchPathSchema,
+});
+export type AgentConversationContinuation = z.infer<typeof AgentConversationContinuationSchema>;
+
 export const AgentInstanceSchema = AgentIdentitySchema.extend({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(AGENT_INSTANCE_SCHEMA_VERSION),
   runId: Id,
   role: AgentRoleSchema,
   ...WorkspaceIdentitySchema.shape,
   assignmentId: Id,
   accountBinding: AccountBindingSchema.optional(),
+  execution: AgentExecutionSchema,
   contract: AgentSessionContractSchema,
   confinementProfile: z.string().min(1).max(256),
+  conversationContinuation: AgentConversationContinuationSchema.nullable(),
   provider: ProviderIdentitySchema.nullable(),
   status: z.enum(["reserved", "ready", "busy", "revoked", "released"]),
   activeTurnId: Id.nullable(),
@@ -106,6 +124,59 @@ export const AgentInstanceSchema = AgentIdentitySchema.extend({
   updatedAt: At,
 });
 export type AgentInstance = z.infer<typeof AgentInstanceSchema>;
+
+export const AgentConversationTransferSchema = z
+  .strictObject({
+    transferId: Id,
+    runId: Id,
+    sourceAgentId: Id,
+    sourceAgentGeneration: Generation,
+    targetRuntime: z.enum(["sdk", "herdr"]),
+    sessionId: z.string().min(1).max(256),
+    providerHome: LaunchPathSchema,
+    workspaceId: Id,
+    workspaceGeneration: Generation,
+    status: z.enum(["pending", "claimed", "consumed", "abandoned"]),
+    targetAgentId: Id.nullable(),
+    targetAgentGeneration: Generation.nullable(),
+    sourceDigest: z.string().length(64),
+    createdAt: At,
+    claimedAt: At.nullable(),
+    consumedAt: At.nullable(),
+    abandonment: z
+      .strictObject({
+        at: At,
+        reason: z.string().trim().min(1).max(4000),
+        stoppedTurnIds: z.array(Id),
+      })
+      .nullable(),
+  })
+  .refine((record) => {
+    const hasTarget = record.targetAgentId !== null && record.targetAgentGeneration !== null;
+    if (record.status === "abandoned")
+      return (
+        record.abandonment !== null &&
+        record.consumedAt === null &&
+        (hasTarget
+          ? record.claimedAt !== null
+          : record.targetAgentId === null &&
+            record.targetAgentGeneration === null &&
+            record.claimedAt === null)
+      );
+    if (record.abandonment !== null) return false;
+    if (record.status === "pending")
+      return (
+        !hasTarget &&
+        record.targetAgentId === null &&
+        record.targetAgentGeneration === null &&
+        record.claimedAt === null &&
+        record.consumedAt === null
+      );
+    if (record.status === "claimed")
+      return hasTarget && record.claimedAt !== null && record.consumedAt === null;
+    return hasTarget && record.claimedAt !== null && record.consumedAt !== null;
+  }, "Conversation transfer lifecycle must retain one exact target");
+export type AgentConversationTransfer = z.infer<typeof AgentConversationTransferSchema>;
 
 export const AgentMailboxMessageSchema = z.strictObject({
   messageId: Id,

@@ -110,6 +110,15 @@ export class ReviewJournal {
           "review_already_reserved",
           "Reconcile the recorded review instead of starting it again",
         );
+      if (
+        this.access.agents
+          .recoveryIntegrity(authority.runId)
+          .some((incident) => incident.state === "uncontained")
+      )
+        throw new DeliveryError(
+          "agent_integrity_uncontained",
+          "Review admission requires confirmed stop and integrity of every agent owner",
+        );
       const candidate = this.access.delivery.candidate(authority.runId, action);
       const binding = this.access.delivery.binding(authority.runId, action);
       const workspace = this.access.agents.workspace(authority.runId, action);
@@ -142,11 +151,7 @@ export class ReviewJournal {
           workspace.workspaceId,
           this.reviewPurpose(authority.runId, candidate, binding.phase),
         );
-      else if (
-        this.access.agents
-          .instances(authority.runId)
-          .some((agent) => agent.workspaceId === workspace.workspaceId)
-      )
+      else if (this.access.agents.workspaceWasAssigned(authority.runId, workspace))
         throw new DeliveryError(
           "review_workspace_used",
           "A fresh reviewer requires a previously unassigned copy",
@@ -260,6 +265,7 @@ export class ReviewJournal {
             this.access.control(authority.runId).controlVersion,
           );
       if (
+        agent.contract.backend !== contract.backend ||
         agent.contract.runtime !== contract.runtime ||
         agent.confinementProfile !== "epicd-isolated"
       )
@@ -293,11 +299,11 @@ export class ReviewJournal {
         epicContext?.requirements.map((issue) => issue.id) ?? [review.taskId],
       );
       const unsettledTurnIds: string[] = [];
-      for (const turn of this.access.agents.turns(authority.runId)) {
+      for (const { turn, owner } of this.access.agents.operationalTurnEntries(authority.runId)) {
         if (
           !turn.prompt.assignment.taskId ||
           !taskIds.has(turn.prompt.assignment.taskId) ||
-          this.access.agents.instance(authority.runId, turn.identity).role === "orchestrator"
+          owner.role === "orchestrator"
         )
           continue;
         if (["completed", "failed", "cancelled"].includes(turn.status) && turn.stopEvidence)
@@ -535,7 +541,8 @@ export class ReviewJournal {
       if (review.status === "finished") return review;
       if (
         !review.turnIdentity ||
-        !this.access.agents.turn(authority.runId, review.turnIdentity).stopEvidence ||
+        !this.access.agents.turnForRecovery(authority.runId, review.turnIdentity).turn
+          ?.stopEvidence ||
         this.access.agents.activeWorkspaceOperation(authority.runId, review)
       )
         throw new DeliveryError(
@@ -714,6 +721,15 @@ export class ReviewJournal {
       return denied("review_report_missing", "No eligible structured report was retained.", [
         latest.evidenceId,
       ]);
+    if (
+      this.access.agents
+        .recoveryIntegrity(runId)
+        .some((incident) => incident.state === "uncontained")
+    )
+      return denied(
+        "agent_integrity_uncontained",
+        "Uncontained agent ownership prevents approval; inspect recovery incidents.",
+      );
     if (!this.provenTurn(latest))
       return denied(
         "review_turn_ineligible",
@@ -815,7 +831,7 @@ export class ReviewJournal {
         missingRequirements.map((check) => check.id),
       );
     const lastTurn = this.access.agents
-      .turns(runId)
+      .operationalTurns(runId)
       .findLast(
         (turn) =>
           turn.identity.agentId === latest.turnIdentity!.agentId &&
@@ -865,8 +881,12 @@ export class ReviewJournal {
   }
   private provenTurn(review: ReviewEvidence): boolean {
     if (!review.turnIdentity) return false;
+    const ownership = this.access.agents.ownershipAssessment(review.runId, review.turnIdentity);
+    // Damage removes approval authority; status must still explain why. Exact
+    // execution reads and the run's admission gates remain strict.
+    if (ownership.state !== "valid") return false;
     const turn = this.access.agents.turn(review.runId, review.turnIdentity);
-    const agent = this.access.agents.instance(review.runId, review.turnIdentity);
+    const agent = ownership.agent;
     const launch = turn.launch;
     const context = turn.prompt.reviewContext;
     const scope = this.contextScope(review);
@@ -912,15 +932,10 @@ export class ReviewJournal {
       launch.stop?.kind === "stopped" &&
       launch.stop.code === 0 &&
       !launch.stop.interrupted &&
-      !this.access.agents
-        .instances(review.runId)
-        .some(
-          (old) =>
-            old.agentId === agent.agentId &&
-            ["implementation", "epic_repair"].includes(
-              this.access.agents.assignment(review.runId, old.assignmentId).purpose,
-            ),
-        )
+      !this.access.agents.agentHadPurpose(review.runId, agent.agentId, [
+        "implementation",
+        "epic_repair",
+      ])
     );
   }
   private independent(
@@ -939,15 +954,7 @@ export class ReviewJournal {
       assignment.taskId !== taskId ||
       assignment.candidateId !== candidateId ||
       agent.workspaceId !== workspaceId ||
-      this.access.agents
-        .instances(runId)
-        .some(
-          (old) =>
-            old.agentId === agent.agentId &&
-            ["implementation", "epic_repair"].includes(
-              this.access.agents.assignment(runId, old.assignmentId).purpose,
-            ),
-        )
+      this.access.agents.agentHadPurpose(runId, agent.agentId, ["implementation", "epic_repair"])
     )
       throw new DeliveryError(
         "review_not_independent",

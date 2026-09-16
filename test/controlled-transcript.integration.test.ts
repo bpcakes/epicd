@@ -7,6 +7,7 @@ import { ControlledTranscript } from "../src/adapters/controlled-transcript.js";
 import { StateStore } from "../src/adapters/store.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import { SdkAgentSessionContractSchema } from "../src/domain/types.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 import { transcriptFixture } from "./fixtures/codex-transcript.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
 
@@ -23,10 +24,24 @@ async function fixture(budget = 100 * 1024 * 1024) {
     store.close();
     await rm(s.root, { recursive: true, force: true });
   });
+  const initial = initialRun();
+  initial.runtimeConfiguration = {
+    commonDirectory: { path: join(s.root, ".git"), device: "1", inode: "1" },
+    executable: process.execPath,
+    trackerExecutable: process.execPath,
+    runtimeRoot: join(s.root, "runtime"),
+    workspaceRoot: join(s.root, "copies"),
+    accounts: fixtureAccounts(s.root),
+    turnTimeoutMs: 15_000,
+    herdr: null,
+  };
   const state = store.create(
-    initialRun(),
+    initial,
     RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { artifactBytes: budget } }),
   );
+  const fixtureDatabase = new Database(path);
+  fixtureDatabase.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+  fixtureDatabase.close();
   const lease = store.acquireLease(state.runId);
   const authority = { runId: state.runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
   const version = () => store.orchestration.control(state.runId).controlVersion;
@@ -54,6 +69,7 @@ async function fixture(budget = 100 * 1024 * 1024) {
       instructions: "Inspect diagnostic output",
       confinementProfile: "epicd-isolated",
       contract: SdkAgentSessionContractSchema.parse({
+        backend: "codex",
         runtime: "sdk",
         requested: settings,
         effective: settings,

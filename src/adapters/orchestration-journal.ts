@@ -85,7 +85,7 @@ import {
   createWorkspaceInspectionSchema,
 } from "./workspace-inspection-journal.js";
 
-export const ORCHESTRATION_SCHEMA_VERSION = 43;
+export const ORCHESTRATION_SCHEMA_VERSION = 48;
 
 export const ORCHESTRATION_TABLES = [
   "orchestration_runs",
@@ -551,10 +551,12 @@ export class OrchestrationJournal {
     )
       unfinished("Settle all other actions before completing the run");
     if (
-      this.agents.turns(runId).some((turn) => !turn.stopEvidence) ||
+      this.agents.operationalTurns(runId).some((turn) => !turn.stopEvidence) ||
       this.decisionSource.unsettled(runId)
     )
       unfinished("Completion requires confirmed stop of every agent and coordinator request");
+    if (this.agents.hasOpenConversationTransfers(runId))
+      unfinished("Completion cannot abandon a reserved coordinator conversation transfer");
     if (
       this.db
         .prepare(
@@ -564,7 +566,7 @@ export class OrchestrationJournal {
         .get(runId)
     )
       unfinished("Completion requires confirmed stop of every workspace operation");
-    const agents = this.agents.instances(runId);
+    const agents = this.agents.operationalInstances(runId);
     if (
       agents.some(
         (agent) =>
@@ -619,7 +621,7 @@ export class OrchestrationJournal {
           )
           .all(runId) as { operation_id: string }[]
       ).map((entry) => entry.operation_id),
-      agentAssignmentIds: agents.map((agent) => agent.assignmentId).sort(),
+      agentAssignmentIds: this.agents.assignmentIds(runId),
       publicationIds: this.publications
         .records(runId)
         .map((record) => record.publicationId)
@@ -739,10 +741,12 @@ export class OrchestrationJournal {
 
   private transaction<T>(authority: ControllerAuthority, body: () => T): T {
     return this.db
-      .transaction(() => {
-        this.assertAuthority(authority);
-        return body();
-      })
+      .transaction(() =>
+        this.agents.withWriteTransaction(() => {
+          this.assertAuthority(authority);
+          return body();
+        }),
+      )
       .immediate();
   }
 
@@ -1445,14 +1449,63 @@ export class OrchestrationJournal {
       .run(runId);
   }
 
+  /** Explicit operator settlement of unused continuity; never an agent capability. */
+  abandonConversationTransfer(
+    authority: ControllerAuthority,
+    expectedVersion: number,
+    transferId: string,
+    reason: string,
+  ) {
+    return this.transaction(authority, () => {
+      // Terminal retries acknowledge the original result, even with the old
+      // control version, without adding events or invalidating later decisions.
+      const abandoned = this.agents.abandonedConversationTransfer(authority.runId, transferId);
+      if (abandoned) return abandoned;
+      const control = this.control(authority.runId);
+      if (control.controlVersion !== expectedVersion)
+        throw new Error("Control changed; inspect the run before abandoning continuity");
+      if (!["paused", "awaiting_user", "blocked"].includes(control.status))
+        throw new Error("Pause the run before abandoning a conversation transfer");
+      if (
+        this.decisionSource.unsettled(authority.runId) ||
+        this.actions(authority.runId).some((action) =>
+          ["accepted", "running", "indeterminate"].includes(action.status),
+        )
+      )
+        throw new Error(
+          "Settle coordinator requests and unfinished actions before abandoning continuity",
+        );
+      const transfer = this.agents.abandonConversationTransfer(authority, transferId, reason);
+      this.recordObservation(authority.runId, {
+        source: "operator",
+        sourceEventId: `conversation-abandoned-${transferId}`,
+        kind: "operator.conversation_abandoned",
+        summary: `Conversation transfer ${transferId} abandoned: ${transfer.abandonment!.reason}. Resume uses a fresh conversation; retained evidence and resources remain available.`,
+        identity: null,
+        artifactIds: [],
+        wakesOrchestrator: true,
+      });
+      this.noteSettingsChange(authority.runId);
+      return transfer;
+    });
+  }
+
   /** Explicit operator handoff, never an agent-selected runtime fallback. */
   handoffRuntime(
     authority: ControllerAuthority,
     expectedVersion: number,
     target: RuntimeHandoffTarget,
+    retainCoordinatorSession = false,
   ) {
     return this.transaction(authority, () =>
-      commitRuntimeHandoff(this.db, this, authority, expectedVersion, target),
+      commitRuntimeHandoff(
+        this.db,
+        this,
+        authority,
+        expectedVersion,
+        target,
+        retainCoordinatorSession,
+      ),
     );
   }
 

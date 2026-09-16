@@ -100,6 +100,10 @@ export type AgentDiagnosticResult = z.infer<typeof AgentDiagnosticResultSchema>;
 export const RuntimeKindSchema = z.enum(["sdk", "herdr"]);
 export type RuntimeKind = z.infer<typeof RuntimeKindSchema>;
 
+/** Codex is the only executable backend in this foundation slice. */
+export const BackendKindSchema = z.literal("codex");
+export type BackendKind = z.infer<typeof BackendKindSchema>;
+
 export const AgentRoleSchema = z.enum(["orchestrator", "implementation", "review"]);
 export type AgentRole = z.infer<typeof AgentRoleSchema>;
 export const AGENT_ROLES = AgentRoleSchema.options;
@@ -204,6 +208,7 @@ export type ResolvedAgentRoleSettings = z.infer<typeof ResolvedAgentRoleSettings
 
 export const SdkAgentSessionContractSchema = z
   .strictObject({
+    backend: BackendKindSchema,
     runtime: z.literal("sdk"),
     requested: AgentRoleSettingsSchema.readonly(),
     effective: ResolvedAgentRoleSettingsSchema.readonly(),
@@ -213,6 +218,7 @@ export type SdkAgentSessionContract = z.infer<typeof SdkAgentSessionContractSche
 
 export const HerdrAgentSessionContractSchema = z
   .strictObject({
+    backend: BackendKindSchema,
     runtime: z.literal("herdr"),
     requested: AgentRoleSettingsSchema.readonly(),
     effective: AgentRoleSettingsSchema.readonly(),

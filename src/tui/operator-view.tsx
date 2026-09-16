@@ -12,6 +12,10 @@ type Kind = OperatorRequest["kind"];
 type Field = { name: string; label: string; optional?: true };
 const fields: Record<Kind, Field[]> = {
   pause: [],
+  abandon_conversation: [
+    { name: "transferId", label: "Conversation transfer ID from status" },
+    { name: "reason", label: "Reason for starting a fresh conversation" },
+  ],
   respond: [{ name: "message", label: "Response (instruction only, not authority)" }],
   grant_fixture: [
     { name: "fixtureId", label: "Declared fixture ID" },
@@ -40,6 +44,11 @@ const fields: Record<Kind, Field[]> = {
       optional: true,
     },
     { name: "herdrPath", label: "Herdr executable override (blank: PATH)", optional: true },
+    {
+      name: "retainCoordinatorSession",
+      label: "Retain stopped coordinator conversation? (yes/no; blank: no)",
+      optional: true,
+    },
   ],
 };
 const choices: Record<string, Kind> = {
@@ -50,6 +59,7 @@ const choices: Record<string, Kind> = {
   "5": "grant_sql",
   "6": "revoke_sql",
   "7": "handoff",
+  "8": "abandon_conversation",
 };
 type Draft = { action: Kind; observed: RunStatus; index: number; values: Record<string, string> };
 type Screen =
@@ -69,6 +79,11 @@ function requestFrom(draft: Draft): OperatorRequest {
   if (draft.action === "respond") input.escalationId = draft.observed.escalation?.escalationId;
   if (draft.action === "grant_fixture")
     input.operations = draft.values.operations!.split(",").map((value) => value.trim());
+  if (draft.action === "handoff" && draft.values.retainCoordinatorSession) {
+    if (!/^(?:yes|no)$/i.test(draft.values.retainCoordinatorSession))
+      throw new Error("Conversation retention must be yes or no");
+    input.retainCoordinatorSession = /^yes$/i.test(draft.values.retainCoordinatorSession);
+  }
   for (const field of fields[draft.action])
     if (field.optional && !input[field.name]) delete input[field.name];
   return OperatorRequestSchema.parse(input);
@@ -101,9 +116,16 @@ export function operatorRequestPreview(request: OperatorRequest, observed: RunSt
   if (request.kind === "handoff")
     lines.push(
       "Requires settled work and no live controller. Preserves evidence and budgets; native Herdr stays native. Does not start a model or answer a question.",
+      request.retainCoordinatorSession
+        ? "The stopped coordinator session will transfer exclusively to one replacement generation."
+        : "The target runtime will start a fresh coordinator conversation.",
     );
   if (request.kind === "pause")
     lines.push("Stops admission; actual work needs confirmed stop receipts.");
+  if (request.kind === "abandon_conversation")
+    lines.push(
+      "Requires a stopped, unbound target and no live controller. Retains evidence and resources; next resume starts a fresh conversation.",
+    );
   if (request.kind === "revoke_fixture" || request.kind === "revoke_sql")
     lines.push(
       "Revokes only this grant. Does not delete a resource or prove in-flight work stopped.",
@@ -236,7 +258,10 @@ export function OperatorView({
       {screen.kind === "menu" ? (
         <>
           <Text>1 pause · 2 answer question · 3 grant fixture · 4 revoke fixture grant</Text>
-          <Text>5 grant SQL access · 6 revoke SQL access · 7 runtime handoff · q close</Text>
+          <Text>
+            5 grant SQL access · 6 revoke SQL access · 7 runtime handoff · 8 abandon conversation ·
+            q close
+          </Text>
           <Text dimColor>
             Every operation requires review and typed confirmation. Closing does not pause delivery.
           </Text>

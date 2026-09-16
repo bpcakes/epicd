@@ -320,6 +320,7 @@ describe("durable coordinator transport attempts", () => {
     "authentication",
     "quota",
     "model_unavailable",
+    "runtime",
     "configuration",
     "safety_stop",
   ])("does not retry a %s failure, change model, or execute a delivery action", async (code) => {

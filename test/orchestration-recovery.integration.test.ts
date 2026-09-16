@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgentCoordinationError } from "../src/adapters/agent-journal.js";
 import { StateStore } from "../src/adapters/store.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { OperationFailed } from "../src/kernel/guards.js";
@@ -53,6 +54,51 @@ function fixture() {
 }
 
 describe("external action uncertainty", () => {
+  it("continues independent recovery after an ownership admission denial but propagates unexpected failures", async () => {
+    const { store, authority, decision } = fixture();
+    const journal = store.orchestration;
+    const first = journal.acceptAction(authority, decision);
+    if (first.kind !== "accepted") throw new Error("Expected first intent");
+    journal.startAction(authority, first.action.actionId);
+    const ticket = journal.beginDecision(
+      authority,
+      journal.latestObservationCursor(authority.runId),
+      journal.control(authority.runId).controlVersion,
+    );
+    const second = journal.acceptAction(authority, {
+      ...decision,
+      request: {
+        ...decision.request,
+        decisionId: ticket.decisionId,
+        observationCursor: ticket.observationCursor,
+        expectedControlVersion: ticket.expectedControlVersion,
+      },
+    });
+    if (second.kind !== "accepted") throw new Error("Expected second intent");
+    journal.startAction(authority, second.action.actionId);
+    const inspected: string[] = [];
+    await reconcileActions(journal, authority, async (action) => {
+      inspected.push(action.actionId);
+      if (action.actionId === first.action.actionId)
+        throw new AgentCoordinationError(
+          "agent_integrity_uncontained",
+          "An owner has unproven work",
+        );
+      return {
+        status: "succeeded",
+        result: { kind: "resource", resourceId: "independently-stopped-resource", generation: 1 },
+      };
+    });
+    expect(inspected).toEqual([first.action.actionId, second.action.actionId]);
+    expect(journal.action(authority.runId, first.action.actionId)?.status).toBe("indeterminate");
+    expect(journal.action(authority.runId, second.action.actionId)?.status).toBe("succeeded");
+    await expect(
+      reconcileActions(journal, authority, async () => {
+        throw new Error("Unexpected storage failure");
+      }),
+    ).rejects.toThrow("Unexpected storage failure");
+  });
+
   it("does not call a partly executed effect again when its outcome is unknown", async () => {
     const { kernel, store, authority, decision } = fixture();
     let effects = 0;

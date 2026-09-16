@@ -74,7 +74,13 @@ export class RuntimeHandoffFailed extends Data.TaggedError("RuntimeHandoffFailed
 export function handoffRuntimeEffect(
   store: StateStore,
   runId: string,
-  options: { runtime: RuntimeKind; controlVersion: number; codexPath?: string; herdrPath?: string },
+  options: {
+    runtime: RuntimeKind;
+    controlVersion: number;
+    codexPath?: string;
+    herdrPath?: string;
+    retainCoordinatorSession?: boolean;
+  },
   signal?: AbortSignal,
 ): Effect.Effect<RunState, RuntimeHandoffFailed> {
   const attempt = <A>(stage: RuntimeHandoffStage, run: () => A) =>
@@ -149,7 +155,12 @@ export function handoffRuntimeEffect(
             yield* wait("admit_repository", () => admission.assertOwned(signal));
             return yield* attempt("commit_handoff", () => {
               signal?.throwIfAborted();
-              return journal.handoffRuntime(authority, options.controlVersion, target);
+              return journal.handoffRuntime(
+                authority,
+                options.controlVersion,
+                target,
+                options.retainCoordinatorSession ?? false,
+              );
             });
           }),
         );
@@ -167,7 +178,13 @@ export function handoffRuntimeEffect(
 export async function handoffRuntime(
   store: StateStore,
   runId: string,
-  options: { runtime: RuntimeKind; controlVersion: number; codexPath?: string; herdrPath?: string },
+  options: {
+    runtime: RuntimeKind;
+    controlVersion: number;
+    codexPath?: string;
+    herdrPath?: string;
+    retainCoordinatorSession?: boolean;
+  },
   signal?: AbortSignal,
 ): Promise<RunState> {
   const result = await Effect.runPromise(

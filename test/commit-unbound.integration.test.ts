@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import * as lifetime from "../src/adapters/command-lifetime.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { reconcileCommit } from "../src/kernel/commits.js";
-import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { reconcileDeliveryAction } from "../src/kernel/delivery-recovery.js";
 import { reconcileActions } from "../src/kernel/reconcile.js";
 import { fixture, git, success, waitFor } from "./fixtures/review.js";
@@ -120,19 +120,19 @@ describe.skipIf(process.platform !== "linux")("unbound application commit recove
       f.newLease();
       const journal = f.reopen().orchestration;
       const manager = new WorkspaceManager(journal, join(f.root, "managed"));
-      const driver = new ControlledSdkRuntime(journal, {
-        root: join(f.root, "runtime"),
-        executable: join(f.root, "bin/codex"),
-        authCachePath: null,
-        turnTimeoutMs: 30000,
-      });
       const launches = vi.spyOn(lifetime, "startDurableCommand");
       const inspections = vi.spyOn(manager, "reconcileCandidateCommitInspection");
       await reconcileActions(
         journal,
         f.authority,
         async (action) =>
-          (await reconcileDeliveryAction(journal, manager, driver, f.authority, action)) ?? {
+          (await reconcileDeliveryAction(
+            journal,
+            manager,
+            new ControlledAgentDispatcher(journal),
+            f.authority,
+            action,
+          )) ?? {
             status: "unresolved",
             detail: "No matching recovery",
           },

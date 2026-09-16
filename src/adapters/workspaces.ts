@@ -1741,7 +1741,7 @@ export class WorkspaceManager {
       if (
         this.journal.agents.activeWorkspaceOperation(authority.runId, workspace) ||
         this.journal.agents
-          .turns(authority.runId)
+          .operationalTurns(authority.runId)
           .some(
             (turn) =>
               turn.identity.workspaceId === workspace.workspaceId &&

@@ -6,14 +6,15 @@ import { WorkspaceError, type WorkspaceManager } from "../adapters/workspaces.js
 import { DeliveryError } from "../adapters/delivery-journal.js";
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import type { ActionKernel } from "./actions.js";
-import type { ControlledAgentDriver } from "./agents.js";
+import type { AgentDispatcher } from "../adapters/agent-dispatch.js";
 import { CapabilityRejected, OperationFailed } from "./guards.js";
+import { assertAgentDispatchReady } from "./agents.js";
 
 /** Review mechanics only. The orchestrator still decides when to review, repair, or gather more evidence. */
 export function registerReviewCapabilities(
   kernel: ActionKernel,
   workspaces: WorkspaceManager,
-  driver: ControlledAgentDriver,
+  dispatcher: AgentDispatcher,
   contractFor: () => AgentSessionContract,
 ) {
   const journal = kernel.journal;
@@ -106,11 +107,7 @@ export function registerReviewCapabilities(
   });
   kernel.registerExternal("run_review", async ({ authority, record, signal }) => {
     const contract = contractFor();
-    if (contract.runtime !== driver.kind)
-      throw new CapabilityRejected(
-        "wrong_runtime",
-        "Review contract and controlled runtime must agree",
-      );
+    assertAgentDispatchReady(dispatcher, contract);
     let review = journal.reviews.reserve(authority, record.actionId);
     const snapshot = journal.delivery.snapshotAtRevision(
       authority.runId,
@@ -129,7 +126,7 @@ export function registerReviewCapabilities(
       );
       signal.throwIfAborted();
       review = journal.reviews.prepare(authority, review.evidenceId, contract);
-      await driver.run(authority, review.turnIdentity!, signal);
+      await dispatcher.run(authority, review.turnIdentity!, signal);
       // A pause or cancellation may prohibit a new inspection. Its stopped turn
       // is still recorded as failed review evidence, never promoted to approval.
       signal.throwIfAborted();
@@ -156,12 +153,12 @@ export function registerReviewCapabilities(
       journal.assertAuthority(authority);
       review = journal.reviews.evidence(authority.runId, review.evidenceId);
       if (review.status === "finished") throw error;
-      if (
-        review.turnIdentity &&
-        !journal.agents.turn(authority.runId, review.turnIdentity).stopEvidence
-      ) {
-        await driver.reconcile(authority, review.turnIdentity);
-        if (!journal.agents.turn(authority.runId, review.turnIdentity).stopEvidence) throw error;
+      if (review.turnIdentity) {
+        await dispatcher.reconcile(authority, review.turnIdentity);
+        if (
+          !journal.agents.turnForRecovery(authority.runId, review.turnIdentity).turn?.stopEvidence
+        )
+          throw error;
       }
       // Only known, settled failures release inspection ownership. Storage/unknown
       // process failures remain indeterminate and block approval after restart.
@@ -195,11 +192,11 @@ export async function reconcileReview(
   journal: OrchestrationJournal,
   authority: ControllerAuthority,
   review: ReviewEvidence,
-  driver: ControlledAgentDriver,
+  dispatcher: AgentDispatcher,
 ) {
   journal.assertAuthority(authority);
   const current = journal.reviews.evidence(authority.runId, review.evidenceId);
   if (current.status === "finished") return current;
-  if (current.turnIdentity) await driver.reconcile(authority, current.turnIdentity);
+  if (current.turnIdentity) await dispatcher.reconcile(authority, current.turnIdentity);
   return journal.reviews.cancelStopped(authority, current.evidenceId);
 }

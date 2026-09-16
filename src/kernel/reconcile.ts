@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
+import { AgentCoordinationError } from "../adapters/agent-journal.js";
 import type { ActionPayload, ActionRecord, ControllerAuthority } from "../domain/orchestration.js";
 import { redactSensitiveText } from "../util/redact.js";
 
@@ -19,7 +20,19 @@ export async function reconcileActions(
     // Recovering one dependency can atomically settle its related acknowledgement.
     if (journal.action(authority.runId, action.actionId)?.status !== "indeterminate") continue;
     journal.assertAuthority(authority);
-    const outcome = await inspect(action);
+    let outcome: RecoveryObservation;
+    try {
+      outcome = await inspect(action);
+    } catch (error) {
+      // A run-wide admission denial is not a reason to skip independent stop
+      // recovery. Preserve this action's uncertainty and inspect later owners.
+      if (
+        !(error instanceof AgentCoordinationError) ||
+        error.code !== "agent_integrity_uncontained"
+      )
+        throw error;
+      outcome = { status: "unresolved", detail: error.message };
+    }
     journal.assertAuthority(authority);
     settleRecoveryObservation(journal, authority, action, outcome);
   }

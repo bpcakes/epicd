@@ -188,7 +188,7 @@ describe.runIf(process.platform === "linux")("operator console interaction", () 
       submit = vi.fn<(request: OperatorRequest) => Promise<string>>(async () => "Recorded handoff");
     const v = await viewFor(f, submit);
     await v.key("7");
-    for (const value of ["herdr", "/selected/codex", "/selected/herdr"]) await v.enter(value);
+    for (const value of ["herdr", "/selected/codex", "/selected/herdr", "no"]) await v.enter(value);
     expect(v.view.lastFrame()).toMatch(/native Herdr stays\s+native/);
     expect(submit).not.toHaveBeenCalled();
     await v.enter("confirm");
@@ -201,6 +201,40 @@ describe.runIf(process.platform === "linux")("operator console interaction", () 
       herdrPath: "/selected/herdr",
     });
     expect(f.store.orchestration.agents.instances(f.state.runId)).toEqual([]);
+  });
+
+  it("submits the exact abandonment ID and reason only after confirmation", async () => {
+    const f = await operatorFixture();
+    const submit = vi.fn<(request: OperatorRequest) => Promise<string>>(
+      async () => "Conversation transfer abandoned",
+    );
+    const v = await viewFor(f, submit);
+    await v.key("8");
+    await v.enter("transfer-to-abandon");
+    await v.enter("The session cannot resume");
+    expect(v.view.lastFrame()).toContain("Retains evidence");
+    expect(submit).not.toHaveBeenCalled();
+    await v.enter("confirm");
+    await expect.poll(() => submit.mock.calls.length).toBe(1);
+    expect(submit.mock.calls[0]![0]).toEqual({
+      kind: "abandon_conversation",
+      transferId: "transfer-to-abandon",
+      reason: "The session cannot resume",
+      controlVersion: 0,
+    });
+  });
+
+  it("sends conversation retention only after an explicit yes", async () => {
+    const f = await operatorFixture(),
+      submit = vi.fn<(request: OperatorRequest) => Promise<string>>(async () => "Recorded handoff");
+    const v = await viewFor(f, submit);
+    await v.key("7");
+    for (const value of ["herdr", "/selected/codex", "/selected/herdr", "yes"])
+      await v.enter(value);
+    expect(v.view.lastFrame()).toContain("transfer exclusively");
+    await v.enter("confirm");
+    await expect.poll(() => submit.mock.calls.length).toBe(1);
+    expect(submit.mock.calls[0]![0]).toMatchObject({ retainCoordinatorSession: true });
   });
 
   it("does not send duplicate commands or treat close as a second mutation while a request is pending", async () => {

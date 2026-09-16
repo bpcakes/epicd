@@ -1,4 +1,4 @@
-import type { AgentInstance, TurnRecord } from "../domain/agents.js";
+import type { AgentIdentity, AgentInstance, TurnRecord } from "../domain/agents.js";
 
 /** Conservative transport maintenance, not a model context-size claim or delivery budget. */
 export const COORDINATOR_CONVERSATION_LIMITS = Object.freeze({
@@ -16,12 +16,15 @@ export const COORDINATOR_CONVERSATION_LIMITS = Object.freeze({
 export function coordinatorConversationPressure(
   agent: AgentInstance,
   turns: readonly TurnRecord[],
+  conversationOwners: readonly AgentIdentity[] = [agent],
 ) {
+  const owners = new Set(
+    conversationOwners.map((owner) => `${owner.agentId}/${owner.agentGeneration}`),
+  );
   const own = turns.filter(
     (turn) =>
       turn.identity.runId === agent.runId &&
-      turn.identity.agentId === agent.agentId &&
-      turn.identity.agentGeneration === agent.agentGeneration,
+      owners.has(`${turn.identity.agentId}/${turn.identity.agentGeneration}`),
   );
   const retainedBytes = own.reduce(
     (sum, turn) =>

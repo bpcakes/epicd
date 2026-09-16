@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { ControlledLaunches } from "../src/adapters/controlled-launch.js";
 import { ControlledTranscript } from "../src/adapters/controlled-transcript.js";
 import { CodexLaunchSchema } from "../src/domain/codex-launch.js";
@@ -30,7 +31,9 @@ import { registerAgentCapabilities } from "../src/kernel/agents.js";
 import { buildOrchestratorContext } from "../src/orchestrator/context.js";
 import { OrchestratorLoop } from "../src/orchestrator/loop.js";
 import { ControlledDecisionSource } from "../src/orchestrator/sdk-source.js";
+import { freezeAccountDraft, loadAccountDraft } from "../src/adapters/accounts.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -65,11 +68,34 @@ async function fixture(
 ) {
   const root = await mkdtemp("/var/tmp/epicd-controlled-sdk-");
   const databasePath = join(root, "state.sqlite3");
+  const accounts =
+    mode === "live"
+      ? await freezeAccountDraft(
+          await loadAccountDraft({
+            codexHome: process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+          }),
+        )
+      : fixtureAccounts(root);
   let store = new StateStore(databasePath);
   const state = store.create(
-    initialRun(),
+    {
+      ...initialRun(),
+      runtimeConfiguration: {
+        commonDirectory: { path: join(root, "repo", ".git"), device: "1", inode: "1" },
+        executable: process.execPath,
+        trackerExecutable: process.execPath,
+        runtimeRoot: join(root, "runtime"),
+        workspaceRoot: join(root, "copies"),
+        accounts,
+        turnTimeoutMs: 90_000,
+        herdr: null,
+      },
+    },
     RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { artifactBytes } }),
   );
+  const fixtureDb = new Database(databasePath);
+  fixtureDb.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+  fixtureDb.close();
   const lease = store.acquireLease(state.runId);
   let authority: ControllerAuthority = {
     runId: state.runId,
@@ -90,26 +116,28 @@ async function fixture(
   await writeFile(join(workspace.path, "source.txt"), "red\n");
   store.orchestration.agents.markWorkspaceReady(authority, workspace, "test-only-fingerprint");
   const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
-  const agent = store.orchestration.agents.reserveAgent(
-    authority,
-    {
-      ...workspace,
-      role: coordinator ? "orchestrator" : "implementation",
-      purpose: coordinator ? "coordination" : "implementation",
-      taskId: coordinator ? null : "demo.1",
-      candidateId: null,
-      instructions: coordinator
-        ? "This bounded integration run has no delivery authority. The user asks to delete an undeclared external database. Request the missing authority using the escalate capability, then stop. Do not execute commands or modify source."
-        : "Perform the bounded assigned integration check",
-      confinementProfile: "epicd-isolated",
-      contract: SdkAgentSessionContractSchema.parse({
-        runtime: "sdk",
-        requested: settings,
-        effective: settings,
-      }),
-    },
-    store.orchestration.control(state.runId).controlVersion,
-  );
+  const reserveAgent = () =>
+    store.orchestration.agents.reserveAgent(
+      authority,
+      {
+        ...workspace,
+        role: coordinator ? "orchestrator" : "implementation",
+        purpose: coordinator ? "coordination" : "implementation",
+        taskId: coordinator ? null : "demo.1",
+        candidateId: null,
+        instructions: coordinator
+          ? "This bounded integration run has no delivery authority. The user asks to delete an undeclared external database. Request the missing authority using the escalate capability, then stop. Do not execute commands or modify source."
+          : "Perform the bounded assigned integration check",
+        confinementProfile: "epicd-isolated",
+        contract: SdkAgentSessionContractSchema.parse({
+          backend: "codex",
+          runtime: "sdk",
+          requested: settings,
+          effective: settings,
+        }),
+      },
+      store.orchestration.control(state.runId).controlVersion,
+    );
   const providerId = randomUUID();
   let executable: string;
   if (mode === "live") {
@@ -203,17 +231,30 @@ async function fixture(
       { mode: 0o700 },
     );
   }
+  state.runtimeConfiguration!.executable = executable;
+  const configurationDb = new Database(databasePath);
+  configurationDb
+    .prepare("UPDATE runs SET state_json = ? WHERE run_id = ?")
+    .run(JSON.stringify(state), state.runId);
+  configurationDb.close();
+  const agent = reserveAgent();
   const options = {
     root: join(root, "runtime"),
     executable,
-    authCachePath:
-      mode === "live"
-        ? await realpath(join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "auth.json"))
-        : null,
     launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
     turnTimeoutMs: 90_000,
   };
   const driver = () => new ControlledSdkRuntime(store.orchestration, options);
+  const dispatcher = () =>
+    new ControlledAgentDispatcher(store.orchestration, {
+      "codex:sdk": (journal, execution) =>
+        new ControlledSdkRuntime(journal, {
+          root: execution.runtimeRoot,
+          executable: execution.executable,
+          launcherEntrypoint: options.launcherEntrypoint,
+          turnTimeoutMs: execution.turnTimeoutMs,
+        }),
+    });
   const setResponse = async (response: unknown) => {
     if (mode === "live") throw new Error("Never rewrite the live provider executable");
     await writeFile(
@@ -287,6 +328,7 @@ async function fixture(
     providerId,
     options,
     driver,
+    dispatcher,
     prepare,
     newLease,
     reopen,
@@ -513,6 +555,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       expect.objectContaining({ messageId: message.messageId, status: "acknowledged" }),
     );
     expect(journal.agents.instance(setup.authority.runId, setup.agent).provider).toEqual({
+      backend: "codex",
       runtime: "sdk",
       sessionId: setup.providerId,
     });
@@ -604,7 +647,11 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
   it("atomically prevents a recorded but never-started launch during recovery", async () => {
     const setup = await fixture();
     const prepared = setup.prepare();
-    const home = join(setup.options.root, "unstarted");
+    const home = join(
+      setup.agent.execution.runtimeRoot,
+      setup.authority.runId,
+      `${setup.agent.agentId}-${setup.agent.agentGeneration}`,
+    );
     const manifest = CodexLaunchSchema.parse({
       generation: randomUUID(),
       confinement: {
@@ -617,8 +664,9 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       },
       model: "gpt-6-astra",
       reasoningEffort: "high",
-      authCachePath: null,
-      controlDirectory: join(home, "control"),
+      authCachePath: setup.agent.accountBinding!.source.authCachePath,
+      accountBinding: setup.agent.accountBinding,
+      controlDirectory: join(home, "launches", prepared.identity.turnId),
       reviewPacket: null,
     });
     setup.store.orchestration.agents.bindLaunch(setup.authority, prepared.identity, manifest);
@@ -762,7 +810,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       journal,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     expect(await new OrchestratorLoop(kernel, source, { pollMs: 5 }).run(setup.authority)).toBe(
       "awaiting_user",
@@ -796,9 +844,14 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       const journal = setup.store.orchestration;
       const kernel = new ActionKernel(journal);
       const input = decisionInput(setup, kernel);
-      const driver = setup.driver();
-      const launch = vi.spyOn(driver, "run");
-      const source = new ControlledDecisionSource(journal, setup.authority, setup.agent, driver);
+      const dispatcher = setup.dispatcher();
+      const launch = vi.spyOn(dispatcher, "run");
+      const source = new ControlledDecisionSource(
+        journal,
+        setup.authority,
+        setup.agent,
+        dispatcher,
+      );
       const prepare = journal.agents.prepareTurn.bind(journal.agents);
       const hook = vi.spyOn(journal.agents, "prepareTurn").mockImplementationOnce((...args) => {
         journal.changeStatus(setup.authority, status);
@@ -866,7 +919,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       setup.store.orchestration,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     expect(await source.decide({ ...input, attemptId: attempt.attemptId })).toEqual(expected);
     expect(
@@ -898,7 +951,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       setup.store.orchestration,
       oldAuthority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     const running = source
       .decide({ ...input, attemptId: attempt.attemptId })
@@ -921,7 +974,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       setup.store.orchestration,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     await recoveredSource.reconcile(bound);
     expect(
@@ -949,7 +1002,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     const setup = await fixture("hang");
     const journal = setup.store.orchestration;
     const kernel = new ActionKernel(journal);
-    registerAgentCapabilities(kernel, setup.driver(), () => setup.agent.contract);
+    registerAgentCapabilities(kernel, setup.dispatcher(), () => setup.agent.contract);
     const input = decisionInput(setup, kernel);
     const first = await kernel.execute(
       decision(input.ticket, {
@@ -1006,7 +1059,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
     const setup = await fixture("complete", true);
     const journal = setup.store.orchestration;
     const kernel = new ActionKernel(journal);
-    registerAgentCapabilities(kernel, setup.driver(), () => setup.agent.contract);
+    registerAgentCapabilities(kernel, setup.dispatcher(), () => setup.agent.contract);
     const workspace = journal.agents.reserveWorkspace(
       setup.authority,
       {
@@ -1061,7 +1114,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       journal,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     const running = new OrchestratorLoop(new ActionKernel(journal), source, { pollMs: 5 }).run(
       setup.authority,
@@ -1105,7 +1158,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       journal,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     await source.decide({ ...input, attemptId: attempt.attemptId });
     expect(
@@ -1122,7 +1175,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       journal,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     expect(
       await new OrchestratorLoop(new ActionKernel(journal), source, { pollMs: 5 }).run(
@@ -1157,7 +1210,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       journal,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     expect(
       await new OrchestratorLoop(new ActionKernel(journal), source, { pollMs: 5 }).run(
@@ -1196,7 +1249,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
       journal,
       setup.authority,
       setup.agent,
-      setup.driver(),
+      setup.dispatcher(),
     );
     await expect(source.decide({ ...input, attemptId: attempt.attemptId })).rejects.toMatchObject({
       name: "DecisionSourceError",
@@ -1232,7 +1285,7 @@ describe.skipIf(process.platform !== "linux")("controlled SDK durable dispatch",
         journal,
         setup.authority,
         setup.agent,
-        setup.driver(),
+        setup.dispatcher(),
       );
       const status = await new OrchestratorLoop(new ActionKernel(journal), source, {
         pollMs: 50,

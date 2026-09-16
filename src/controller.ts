@@ -9,12 +9,11 @@ import type { ControllerAuthority } from "./domain/orchestration.js";
 import type { AgentInstance, WorkspaceRecord } from "./domain/agents.js";
 import { StateStore } from "./adapters/store.js";
 import { WorkspaceManager } from "./adapters/workspaces.js";
-import { ControlledSdkRuntime } from "./adapters/controlled-sdk.js";
-import { ControlledHerdrRuntime } from "./adapters/controlled-herdr.js";
 import { KernelBeads } from "./adapters/kernel-beads.js";
 import { PublicationGit } from "./adapters/publication-git.js";
 import { ActionKernel } from "./kernel/actions.js";
-import { registerAgentCapabilities, type ControlledAgentDriver } from "./kernel/agents.js";
+import { registerAgentCapabilities } from "./kernel/agents.js";
+import { ControlledAgentDispatcher, type AgentDispatcher } from "./adapters/agent-dispatch.js";
 import { registerDeliveryCapabilities } from "./kernel/delivery.js";
 import { registerWorkspaceDisposalCapabilities } from "./kernel/workspace-disposal.js";
 import {
@@ -51,30 +50,16 @@ export function agentContract(state: RunState, role: AgentRole) {
   const settings = resolveAgentRoleSettings(state, role);
   if (!settings.model) throw new Error(`Resolve a concrete ${role} model before starting a run`);
   return AgentSessionContractSchema.parse({
+    backend: "codex",
     runtime: state.runtime,
     requested: settings,
     effective: settings,
   });
 }
 
-/** Native Herdr never routes through the SDK. Runtime and paths are frozen at creation. */
-export function controlledDriver(store: StateStore, state: RunState): ControlledAgentDriver {
-  const config = state.runtimeConfiguration;
-  if (!config) throw new Error("Run has no runtime configuration; create a fresh configured run");
-  const common = {
-    root: config.runtimeRoot,
-    executable: config.executable,
-    authCachePath: null,
-    turnTimeoutMs: config.turnTimeoutMs,
-  };
-  if (state.runtime === "sdk") return new ControlledSdkRuntime(store.orchestration, common);
-  if (!config.herdr) throw new Error("Native Herdr endpoint is missing");
-  return new ControlledHerdrRuntime(store.orchestration, {
-    ...common,
-    herdrPath: config.herdr.executable,
-    sessionName: config.herdr.sessionName,
-    workspaceId: config.herdr.workspaceId,
-  });
+/** Production dispatch always resolves the persisted generation binding. */
+export function controlledDispatcher(store: StateStore): ControlledAgentDispatcher {
+  return new ControlledAgentDispatcher(store.orchestration);
 }
 
 /** Supplies capabilities and stop recovery. The model chooses all delivery transitions. */
@@ -84,7 +69,7 @@ export class OrchestratorController {
     readonly store: StateStore,
     readonly runId: string,
     private readonly options: {
-      driver?: (store: StateStore, state: RunState) => ControlledAgentDriver;
+      dispatcher?: (store: StateStore, state: RunState) => AgentDispatcher;
       drainTimeoutMs?: number;
       repositoryIO?: typeof runRepositoryIO;
     } = {},
@@ -129,19 +114,19 @@ export class OrchestratorController {
       await repositoryAdmission.enter(signal);
       if (journal.control(this.runId).status === "complete") return this.status();
       const admission = repositoryAdmission;
-      const driver = (this.options.driver ?? controlledDriver)(this.store, state);
-      if (driver.kind !== state.runtime)
-        throw new Error("Driver does not match the persisted runtime");
+      const dispatcher = this.options.dispatcher
+        ? this.options.dispatcher(this.store, state)
+        : controlledDispatcher(this.store);
       const workspaces = new WorkspaceManager(journal, config.workspaceRoot);
       kernel = new ActionKernel(journal, (dispatchSignal) => admission.assertOwned(dispatchSignal));
       const contractFor = (role: AgentRole) => agentContract(this.store.get(this.runId)!, role);
-      registerAgentCapabilities(kernel, driver, contractFor);
+      registerAgentCapabilities(kernel, dispatcher, contractFor);
       registerDeliveryCapabilities(kernel, workspaces);
       registerWorkspaceDisposalCapabilities(kernel, workspaces);
       registerInspectionCapabilities(kernel, workspaces);
-      registerReviewCapabilities(kernel, workspaces, driver, () => contractFor("review"));
+      registerReviewCapabilities(kernel, workspaces, dispatcher, () => contractFor("review"));
       registerCommitCapabilities(kernel, workspaces);
-      registerDeliveryRecoveryCapabilities(kernel, workspaces, driver);
+      registerDeliveryRecoveryCapabilities(kernel, workspaces, dispatcher);
       registerPublicationCapabilities(kernel, workspaces);
       const tracker = registerTrackerCapabilities(
         kernel,
@@ -153,10 +138,32 @@ export class OrchestratorController {
       registerDiagnosticWorkspaceCapabilities(kernel, workspaces, state.repoPath);
 
       // A replaced controller lease is never evidence that its external work stopped.
-      for (const turn of journal.agents.turns(this.runId)) {
+      for (const recovered of journal.agents.turnsForRecovery(this.runId)) {
+        if (!recovered.turn) {
+          journal.appendObservation(authority, {
+            source: "controller",
+            sourceEventId: `stop-${authority.leaseId}-${recovered.identity?.turnId ?? `row-${recovered.rowId}`}`,
+            kind: "recovery.unresolved",
+            summary: redactSensitiveText(
+              `Turn recovery validation failed: ${String(recovered.failure ?? "unknown persisted turn error")}`,
+              7999,
+            ),
+            identity: recovered.identity,
+            artifactIds: [],
+            wakesOrchestrator: true,
+          });
+          continue;
+        }
+        const turn = recovered.turn;
         if (turn.stopEvidence) continue;
         try {
-          await driver.reconcile(authority, turn.identity);
+          if (turn.status === "prepared") {
+            if (recovered.ownerValidity === "readable")
+              journal.agents.cancelPreparedTurn(authority, turn.identity);
+            else journal.agents.cancelPreparedTurnWithoutOwner(authority, turn.identity);
+          } else if (recovered.ownerValidity === "not_required")
+            journal.agents.settleStoppedTurnWithoutOwner(authority, turn.identity);
+          else await dispatcher.reconcile(authority, turn.identity);
         } catch (error) {
           journal.appendObservation(authority, {
             source: "controller",
@@ -169,6 +176,7 @@ export class OrchestratorController {
           });
         }
       }
+      journal.agents.supersedeQueuedMessagesForIsolatedOwners(authority);
       // Reads own durable exclusions even when no parent action/agent was reserved.
       // Drain them before parent recovery or settings can select a different workspace.
       for (const inspection of journal.workspaceInspections.unsettled(this.runId)) {
@@ -194,7 +202,7 @@ export class OrchestratorController {
         const delivery = await reconcileDeliveryAction(
           journal,
           workspaces,
-          driver,
+          dispatcher,
           authority!,
           action,
           signal,
@@ -343,7 +351,7 @@ export class OrchestratorController {
           ["start_agent", "continue_agent", "start_specialist"].includes(action.request.action.kind)
         ) {
           const turn = journal.agents
-            .turns(this.runId)
+            .operationalTurns(this.runId)
             .find((turn) => turn.identity.operationId === action.operationId);
           if (turn?.stopEvidence)
             return {
@@ -356,9 +364,43 @@ export class OrchestratorController {
           detail: `Action ${action.actionId} remains indeterminate. Inspect its owned resources and use the available reconciliation capability; no effect was repeated.`,
         };
       });
+      // Reconciliation above can change containment. This final assessment owns
+      // both the incident report and admission; never reuse a pre-recovery view.
+      journal.agents.supersedeQueuedMessagesForIsolatedOwners(authority);
+      const agentIntegrity = journal.agents.recoveryIntegrity(this.runId);
+      for (const incident of agentIntegrity) {
+        const observation = {
+          source: "controller" as const,
+          kind:
+            incident.state === "isolated"
+              ? "recovery.owner_isolated"
+              : "recovery.owner_uncontained",
+          summary:
+            incident.state === "isolated"
+              ? `Unreadable agent ${incident.identity.agentId}/${incident.identity.agentGeneration} lost authority; ${incident.affectedTurnIds.length} stopped historical turn(s) remain preserved and ineligible, with ${incident.affectedMessageIds.length} mailbox record(s) retained.`
+              : `${incident.ownerRecordReadable ? "Agent" : "Unreadable agent"} ${incident.identity.agentId}/${incident.identity.agentGeneration} has ${incident.affectedTurnIds.length} associated turn(s), including persisted work whose integrity or stop cannot be proved automatically; ${incident.affectedMessageIds.length} mailbox record(s) remain preserved.`,
+          identity: null,
+          artifactIds: [] as string[],
+          wakesOrchestrator: incident.state !== "isolated",
+        };
+        journal.appendObservation(authority, {
+          ...observation,
+          sourceEventId: `agent-integrity-${incident.rowId}-${digestJson([incident.recordDigest, observation])}`,
+        });
+      }
+      const uncontainedOwners = agentIntegrity.filter(
+        (incident) => incident.state === "uncontained",
+      );
+      if (uncontainedOwners.length > 0)
+        throw new Error(
+          `Automatic recovery could not prove persisted integrity and stop for ${uncontainedOwners.length} unreadable agent owner(s) or readable owner(s) with damaged turn history. Preserve their workspaces and inspect recovery.owner_uncontained observations before intervention.`,
+        );
       if (journal.control(this.runId).status === "active" && !signal?.aborted) {
+        // Launch readiness is a new-work precondition. Keep all cold recovery
+        // above this boundary available when the current runtime cannot launch.
+        dispatcher.assertReady(agentContract(state, "orchestrator"));
         let coordinator = await this.coordinator(authority, state, workspaces, admission, signal);
-        let source = new ControlledDecisionSource(journal, authority, coordinator, driver);
+        let source = new ControlledDecisionSource(journal, authority, coordinator, dispatcher);
         const currentAuthority = authority;
         await new OrchestratorLoop(
           kernel,
@@ -369,12 +411,17 @@ export class OrchestratorController {
           {
             healthIntervalMs: 2000,
             onHealthCheck: (healthSignal) => admission.assertOwned(healthSignal),
-            beforeSourceDispatch: (turnSignal) => admission.assertOwned(turnSignal),
+            beforeSourceDispatch: async (turnSignal) => {
+              await admission.assertOwned(turnSignal);
+              dispatcher.assertReady(coordinator.contract);
+            },
             beforeDecision: async (turnSignal) => {
               await admission.assertOwned(turnSignal);
+              const currentState = this.store.get(this.runId)!;
+              dispatcher.assertReady(agentContract(currentState, "orchestrator"));
               const next = await this.coordinator(
                 currentAuthority,
-                this.store.get(this.runId)!,
+                currentState,
                 workspaces,
                 admission,
                 turnSignal,
@@ -388,7 +435,7 @@ export class OrchestratorController {
                   journal,
                   currentAuthority,
                   coordinator,
-                  driver,
+                  dispatcher,
                 );
               }
             },
@@ -458,7 +505,7 @@ export class OrchestratorController {
     const journal = this.store.orchestration;
     const contract = agentContract(state, "orchestrator");
     const prior = journal.agents
-      .instances(this.runId)
+      .operationalInstances(this.runId)
       .filter((agent) => agent.role === "orchestrator");
     const live = prior.filter((agent) => !["revoked", "released"].includes(agent.status));
     if (live.length > 1) throw new Error("Multiple coordinator assignments require reconciliation");
@@ -477,7 +524,11 @@ export class OrchestratorController {
           journal.decisionSource.execution(this.runId, pending.decisionId))
       )
         return existing;
-      const pressure = coordinatorConversationPressure(existing, journal.agents.turns(this.runId));
+      const pressure = coordinatorConversationPressure(
+        existing,
+        journal.agents.operationalTurns(this.runId),
+        journal.agents.conversationLineageIdentities(this.runId, existing),
+      );
       const settingsChanged = digestJson(existing.contract) !== digestJson(contract);
       if (!settingsChanged && pressure.reasons.length === 0) return existing;
       journal.agents.retireStoppedAgent(
@@ -486,7 +537,46 @@ export class OrchestratorController {
         `${settingsChanged ? "Future-thread settings changed" : "Bounded context rollover"}; ${JSON.stringify(pressure)}`,
       );
     }
-    const operation = `coordinator-${digestJson([this.runId, prior.length, contract]).slice(0, 40)}`;
+    const transfer = journal.agents.pendingCoordinatorConversationTransfer(
+      this.runId,
+      contract.runtime,
+    );
+    if (transfer) {
+      const source = prior
+        .filter(
+          (agent) =>
+            agent.agentId === transfer.sourceAgentId &&
+            (agent.agentGeneration === transfer.sourceAgentGeneration ||
+              (agent.provider === null &&
+                agent.conversationContinuation?.transferId === transfer.transferId)),
+        )
+        .sort((left, right) => right.agentGeneration - left.agentGeneration)[0];
+      if (!source)
+        throw new Error("The pending coordinator conversation has no readable source lineage");
+      const workspace = journal.agents.workspace(this.runId, {
+        workspaceId: transfer.workspaceId,
+        workspaceGeneration: transfer.workspaceGeneration,
+      });
+      return journal.agents.reserveAgent(
+        authority,
+        {
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          workspaceId: workspace.workspaceId,
+          workspaceGeneration: workspace.workspaceGeneration,
+          instructions:
+            "Continue delivery after the operator's explicit runtime handoff. Preserve the prior conversation's useful context, but re-check current journal authority and evidence before acting.",
+          contract,
+          confinementProfile: "epicd-isolated",
+          replaces: source,
+          conversationTransferId: transfer.transferId,
+        },
+        journal.control(this.runId).controlVersion,
+      );
+    }
+    const operation = `coordinator-${digestJson([this.runId, journal.agents.coordinatorGenerationCount(this.runId), contract]).slice(0, 40)}`;
     const workspace = await this.coordinatorWorkspace(
       authority,
       state,

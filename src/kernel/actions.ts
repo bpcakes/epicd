@@ -167,7 +167,7 @@ export class ActionKernel {
     this.registerLocal("inspect_agent", ({ authority }, action) => {
       const agent = journal.agents.instance(authority.runId, action);
       const turns = journal.agents
-        .turns(authority.runId)
+        .operationalTurns(authority.runId)
         .filter(
           (turn) =>
             turn.identity.agentId === agent.agentId &&
@@ -175,15 +175,38 @@ export class ActionKernel {
         );
       const latestResult = turns.findLast((turn) => turn.result !== null);
       const resultText = latestResult ? JSON.stringify(latestResult.result) : null;
-      const { accountBinding: privateBinding, ...publicAgent } = agent;
+      const continuation = agent.conversationContinuation;
       const content = {
         agent: {
-          ...publicAgent,
-          ...(privateBinding
+          schemaVersion: agent.schemaVersion,
+          runId: agent.runId,
+          agentId: agent.agentId,
+          agentGeneration: agent.agentGeneration,
+          role: agent.role,
+          workspaceId: agent.workspaceId,
+          workspaceGeneration: agent.workspaceGeneration,
+          assignmentId: agent.assignmentId,
+          contract: agent.contract,
+          confinementProfile: agent.confinementProfile,
+          conversationContinuation: continuation
+            ? {
+                transferId: continuation.transferId,
+                sourceAgentId: continuation.sourceAgentId,
+                sourceAgentGeneration: continuation.sourceAgentGeneration,
+                sessionId: continuation.sessionId,
+              }
+            : null,
+          provider: agent.provider,
+          status: agent.status,
+          activeTurnId: agent.activeTurnId,
+          revokedReason: agent.revokedReason,
+          createdAt: agent.createdAt,
+          updatedAt: agent.updatedAt,
+          ...(agent.accountBinding
             ? {
                 account: {
-                  accountClass: privateBinding.accountClass,
-                  label: privateBinding.source.label,
+                  accountClass: agent.accountBinding.accountClass,
+                  label: agent.accountBinding.source.label,
                 },
               }
             : {}),

@@ -6,7 +6,11 @@ import type { OrchestrationJournal } from "./orchestration-journal.js";
 import type { ControllerAuthority, TurnIdentity } from "../domain/orchestration.js";
 import type { TurnRecord } from "../domain/agents.js";
 import { NativeLaunchEndpointSchema, type NativeLaunchEndpoint } from "../domain/codex-launch.js";
-import { ControlledLaunches, type ControlledLaunchOptions } from "./controlled-launch.js";
+import {
+  assertControlledExecution,
+  ControlledLaunches,
+  type ControlledLaunchOptions,
+} from "./controlled-launch.js";
 import { ControlledTranscript } from "./controlled-transcript.js";
 import { HerdrArtifacts, herdrResultContract } from "./herdr-artifacts.js";
 import { HerdrObserver, type NativeHerdrIdentity } from "./herdr-observer.js";
@@ -61,6 +65,7 @@ export function nativeShellBootstrap(
 
 /** Real native TUI turns, observed/steered by Herdr, with independent supervisor stop proof. */
 export class ControlledHerdrRuntime {
+  readonly backend = "codex" as const;
   readonly kind = "herdr";
   private readonly launches: ControlledLaunches;
   private readonly env: NodeJS.ProcessEnv;
@@ -68,7 +73,6 @@ export class ControlledHerdrRuntime {
     private readonly journal: OrchestrationJournal,
     private readonly options: ControlledHerdrOptions,
   ) {
-    if (process.env.HERDR_ENV !== "1") throw new Error("Controlled Herdr requires HERDR_ENV=1");
     z.string()
       .regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/)
       .parse(options.sessionName);
@@ -92,14 +96,22 @@ export class ControlledHerdrRuntime {
   ): Promise<TurnRecord> {
     this.journal.assertAuthority(authority);
     const agent = this.journal.agents.instance(authority.runId, identity);
-    if (agent.contract.runtime !== "herdr")
-      throw new Error("Controlled Herdr requires a native assignment");
+    const timeout = assertControlledExecution(agent, this.options, "herdr");
+    const endpoint = agent.execution.herdr;
+    if (
+      !endpoint ||
+      endpoint.executable !== this.options.herdrPath ||
+      endpoint.sessionName !== this.options.sessionName ||
+      endpoint.workspaceId !== this.options.workspaceId
+    )
+      throw new Error("Controlled Herdr endpoint differs from the recorded agent execution");
+    if (process.env.HERDR_ENV !== "1") throw new Error("Controlled Herdr requires HERDR_ENV=1");
     const { turn, manifest, packet } = this.launches.reserve(this.journal, authority, identity);
     const request = new AbortController();
     const abort = () => request.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    const deadline = Date.now() + (this.options.turnTimeoutMs ?? 1_800_000);
+    const deadline = Date.now() + timeout;
     const check = () => {
       this.journal.assertAuthority(authority);
       const current = this.journal.agents.turn(authority.runId, identity);
@@ -161,8 +173,10 @@ export class ControlledHerdrRuntime {
         transcriptError = error;
         request.abort(error);
       });
-      const previous = await readNativeCodexSession(manifest, agent.provider?.sessionId ?? null);
-      if (agent.provider?.sessionId && !previous)
+      const expectedSessionId =
+        agent.provider?.sessionId ?? agent.conversationContinuation?.sessionId ?? null;
+      const previous = await readNativeCodexSession(manifest, expectedSessionId);
+      if (expectedSessionId && !previous)
         throw new Error("The recorded native conversation is missing");
       const server = await this.server();
       check();
@@ -284,6 +298,7 @@ export class ControlledHerdrRuntime {
       check();
       if (!before.ready) throw new Error(`Native agent is not ready (${before.state})`);
       this.journal.agents.bindTurnProvider(authority, identity, {
+        backend: "codex",
         runtime: "herdr",
         name: native.name,
         paneId: native.paneId,
@@ -325,6 +340,7 @@ export class ControlledHerdrRuntime {
           )
             throw new Error("Herdr and the private provider disagree about session identity");
           this.journal.agents.bindTurnProvider(authority, identity, {
+            backend: "codex",
             runtime: "herdr",
             name: native.name,
             paneId: native.paneId,
@@ -448,6 +464,17 @@ export class ControlledHerdrRuntime {
         identity,
         "Native turn has no durable supervisor identity",
       );
+    const agent = this.journal.agents.instance(authority.runId, identity);
+    assertControlledExecution(agent, this.options, "herdr");
+    const endpoint = agent.execution.herdr;
+    if (
+      !endpoint ||
+      endpoint.executable !== this.options.herdrPath ||
+      endpoint.sessionName !== this.options.sessionName ||
+      endpoint.workspaceId !== this.options.workspaceId
+    )
+      throw new Error("Controlled Herdr endpoint differs from the recorded agent execution");
+    this.journal.agents.validateLaunchBinding(authority.runId, turn.identity);
     this.journal.agents.requestStop(authority, identity);
     const stop = turn.launch.stop ?? (await this.launches.stop(turn.launch.manifest, true));
     this.journal.assertAuthority(authority);

@@ -46,10 +46,15 @@ describe("pinned coordinator and immutable session contracts", () => {
   it("requires an effective concrete SDK model and freezes the launch contract", () => {
     const requested = { model: null, reasoningEffort: "high" };
     expect(
-      SdkAgentSessionContractSchema.safeParse({ runtime: "sdk", requested, effective: requested })
-        .success,
+      SdkAgentSessionContractSchema.safeParse({
+        backend: "codex",
+        runtime: "sdk",
+        requested,
+        effective: requested,
+      }).success,
     ).toBe(false);
     const contract = SdkAgentSessionContractSchema.parse({
+      backend: "codex",
       runtime: "sdk",
       requested,
       effective: { ...requested, model: "worker" },

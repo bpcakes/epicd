@@ -96,6 +96,66 @@ describe.runIf(process.platform === "linux")("complete read-only review evidence
     ).toBe(review.evidenceId);
   }, 30000);
 
+  it("retains an isolated historical worker turn as redacted ineligible review evidence", async () => {
+    const s = await fixture(),
+      run = s.authority.runId;
+    const candidate = await s.capture(await s.define());
+    await s.validate(candidate, await s.copy(candidate));
+    const previous = await s.review(candidate);
+    success(previous.result);
+    const identity = previous.evidence.turnIdentity!;
+    const db = new Database(s.path);
+    const row = db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id=? AND agent_id=? AND generation=?",
+      )
+      .get(run, identity.agentId, identity.agentGeneration) as { record_json: string };
+    const owner = JSON.parse(row.record_json);
+    const update = (record: string) =>
+      db
+        .prepare(
+          "UPDATE agent_instances SET record_json=? WHERE run_id=? AND agent_id=? AND generation=?",
+        )
+        .run(record, run, identity.agentId, identity.agentGeneration);
+    try {
+      update(JSON.stringify({ ...owner, schemaVersion: 1 }));
+      expect(s.journal.agents.ownershipAssessment(run, identity).state).toBe("isolated");
+
+      const reviewed = await s.review(candidate, {}, [
+        'cat /epicd-evidence/review.json > "$CODEX_HOME/received-evidence.json"',
+      ]);
+      success(reviewed.result);
+      const turn = s.journal.agents.turn(run, reviewed.evidence.turnIdentity!);
+      const packet = JSON.parse(
+        readFileSync(
+          join(turn.launch!.manifest.confinement.providerHome, "received-evidence.json"),
+          "utf8",
+        ),
+      );
+      const retained = packet.records.find(
+        (entry: { source: { recordKind?: string; recordId?: string } }) =>
+          entry.source.recordKind === "agent_turn" && entry.source.recordId === identity.turnId,
+      );
+      expect(retained?.content.record).toMatchObject({
+        identity,
+        role: null,
+        ownerIntegrity: "isolated",
+        status: "completed",
+        resultEligible: false,
+      });
+      expect(retained?.content.record).not.toHaveProperty("prompt");
+      expect(retained?.content.record).not.toHaveProperty("launch");
+      expect(s.journal.reviews.records(run).at(-1)).toMatchObject({
+        evidenceId: reviewed.evidence.evidenceId,
+        status: "finished",
+        sourceIntact: true,
+      });
+    } finally {
+      update(row.record_json);
+      db.close();
+    }
+  }, 30000);
+
   it("automatically supplies full descendant closure proof to final review without historical validation becoming current", async () => {
     const s = await closureFixture("sha1", true, "preclosed");
     const run = s.authority.runId;

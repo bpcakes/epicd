@@ -14,6 +14,7 @@ import { WorkspaceCreationSchema } from "../src/domain/workspace-creation.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { registerWorkspaceDisposalCapabilities } from "../src/kernel/workspace-disposal.js";
 import { reconcileDeliveryAction } from "../src/kernel/delivery-recovery.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { fixture, git, target } from "./fixtures/review.js";
 
 describe.skipIf(process.platform !== "linux")("complete workspace creation lifetime", () => {
@@ -227,7 +228,7 @@ describe.skipIf(process.platform !== "linux")("complete workspace creation lifet
           const outcome = await reconcileDeliveryAction(
             journal,
             manager,
-            f.driver,
+            new ControlledAgentDispatcher(journal),
             f.authority,
             journal.action(f.authority.runId, action.actionId)!,
           );

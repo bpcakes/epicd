@@ -13,10 +13,12 @@ import {
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach } from "vitest";
+import Database from "better-sqlite3";
 import { StateStore } from "../../src/adapters/store.js";
 import { registerDeliveryRecoveryCapabilities } from "../../src/kernel/delivery-recovery.js";
 import { WorkspaceManager } from "../../src/adapters/workspaces.js";
 import { ControlledSdkRuntime } from "../../src/adapters/controlled-sdk.js";
+import { ControlledAgentDispatcher } from "../../src/adapters/agent-dispatch.js";
 import { ActionKernel } from "../../src/kernel/actions.js";
 import { registerAgentCapabilities } from "../../src/kernel/agents.js";
 import { registerDeliveryCapabilities } from "../../src/kernel/delivery.js";
@@ -128,27 +130,31 @@ export async function fixture(
       repoPath: source,
       epicBaseRevision: head,
       epicId: trackedTask.epicId,
-      ...(tracker?.executable
-        ? {
-            runtimeConfiguration: {
-              commonDirectory: {
-                path: join(source, ".git"),
-                device: String(statSync(join(source, ".git")).dev),
-                inode: String(statSync(join(source, ".git")).ino),
-              },
-              executable: join(root, "bin/codex"),
-              trackerExecutable: tracker.executable(root),
-              workspaceRoot: join(root, "managed"),
-              runtimeRoot: join(root, "runtime"),
-              accounts: fixtureAccounts(),
-              turnTimeoutMs: 30000,
-              herdr: null,
-            },
-          }
-        : {}),
+      runtimeConfiguration: {
+        commonDirectory: {
+          path: join(source, ".git"),
+          device: String(statSync(join(source, ".git")).dev),
+          inode: String(statSync(join(source, ".git")).ino),
+        },
+        executable: join(root, "bin/codex"),
+        trackerExecutable: tracker?.executable?.(root) ?? "/bin/false",
+        workspaceRoot: join(root, "managed"),
+        runtimeRoot: join(root, "runtime"),
+        accounts: fixtureAccounts(root),
+        turnTimeoutMs: 30000,
+        herdr: null,
+      },
     },
     RepositoryPolicySchema.parse({ schemaVersion: 1, ...policyInput, requiredChecks: [required] }),
   );
+  if (!tracker?.executable) {
+    // Keep the late-claim fixture unconfigured until its explicit claim; agent
+    // reservation still receives its required frozen execution source, and
+    // TrackerJournal.reserve recreates this root when the claim is dispatched.
+    const fixtureDb = new Database(path);
+    fixtureDb.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+    fixtureDb.close();
+  }
   const lease = store.acquireLease(state.runId);
   let authority: ControllerAuthority = {
     runId: state.runId,
@@ -162,6 +168,7 @@ export async function fixture(
   const workspace = await manager.create(authority, source, head, "implementation");
   const settings = { model: "worker-model", reasoningEffort: "high" as const };
   const contract = SdkAgentSessionContractSchema.parse({
+    backend: "codex",
     runtime: "sdk",
     requested: settings,
     effective: settings,
@@ -187,18 +194,20 @@ export async function fixture(
   const options = {
     root: join(root, "runtime"),
     executable,
-    authCachePath: null,
     launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
     turnTimeoutMs: 30_000,
   };
   const driver = new ControlledSdkRuntime(journal, options);
+  const dispatcher = new ControlledAgentDispatcher(journal, {
+    "codex:sdk": () => driver,
+  });
   registerDeliveryCapabilities(kernel, manager);
   registerDiagnosticWorkspaceCapabilities(kernel, manager, source);
   registerCommitCapabilities(kernel, manager);
   const publication = registerPublicationCapabilities(kernel, manager);
-  registerAgentCapabilities(kernel, driver, () => contract);
-  registerReviewCapabilities(kernel, manager, driver, () => contract);
-  registerDeliveryRecoveryCapabilities(kernel, manager, driver);
+  registerAgentCapabilities(kernel, dispatcher, () => contract);
+  registerReviewCapabilities(kernel, manager, dispatcher, () => contract);
+  registerDeliveryRecoveryCapabilities(kernel, manager, dispatcher);
   const decision = (action: KernelAction) => {
     const ticket = journal.beginDecision(
       authority,
@@ -371,6 +380,7 @@ export async function fixture(
     writer,
     kernel,
     driver,
+    dispatcher,
     decision,
     dispatch,
     define,

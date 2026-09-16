@@ -8,6 +8,7 @@ import {
   RuntimeHandoffTargetSchema,
   type RuntimeHandoffTarget,
 } from "../domain/runtime-handoff.js";
+import { coordinatorConversationPressure } from "../orchestrator/conversation.js";
 
 /** Read-only preflight, repeated in the final transaction. A dead lease is never stop proof. */
 export function assertRuntimeHandoffReady(
@@ -33,7 +34,7 @@ export function assertRuntimeHandoffReady(
   if (
     journal.decisionSource.unsettled(runId) ||
     journal.agents
-      .turns(runId)
+      .operationalTurns(runId)
       .some((turn) => !turn.stopEvidence || (turn.launch !== null && turn.launch.stop === null))
   )
     throw new Error(
@@ -46,7 +47,7 @@ export function assertRuntimeHandoffReady(
       );
   if (journal.workspaceDisposals.records(runId).some((record) => record.outcome === null))
     throw new Error("Reconcile pending workspace disposal before runtime handoff");
-  for (const agent of journal.agents.instances(runId))
+  for (const agent of journal.agents.operationalInstances(runId))
     if (
       agent.activeTurnId ||
       journal.agents
@@ -56,6 +57,10 @@ export function assertRuntimeHandoffReady(
       throw new Error(
         "Settle pending agent instructions before runtime handoff; no messages are discarded",
       );
+  if (journal.agents.hasOpenConversationTransfers(runId))
+    throw new Error(
+      "Resume and claim the reserved coordinator conversation, or explicitly abandon it, before another runtime handoff",
+    );
   if (
     journal.publications
       .records(runId)
@@ -92,6 +97,7 @@ export function commitRuntimeHandoff(
   authority: ControllerAuthority,
   expectedVersion: number,
   input: RuntimeHandoffTarget,
+  retainCoordinatorSession = false,
 ) {
   if (!db.inTransaction) throw new Error("Runtime handoff must be atomic");
   assertRuntimeHandoffReady(journal, authority, expectedVersion);
@@ -122,9 +128,40 @@ export function commitRuntimeHandoff(
     updatedAt: new Date().toISOString(),
   });
   const retired = journal.agents
-    .instances(authority.runId)
+    .operationalInstances(authority.runId)
     .filter((agent) => agent.status !== "released");
+  const continuitySources = retired.filter(
+    (agent) =>
+      agent.role === "orchestrator" &&
+      agent.revokedReason === null &&
+      agent.provider?.sessionId != null,
+  );
+  if (retainCoordinatorSession && continuitySources.length !== 1)
+    throw new Error(
+      "Retaining continuity requires exactly one stopped coordinator with a bound Codex session",
+    );
+  if (retainCoordinatorSession) {
+    const source = continuitySources[0]!;
+    const pressure = coordinatorConversationPressure(
+      source,
+      journal.agents.operationalTurns(authority.runId),
+      journal.agents.conversationLineageIdentities(authority.runId, source),
+    );
+    if (pressure.reasons.length > 0)
+      throw new Error(
+        `The coordinator conversation reached its rollover boundary (${pressure.reasons.join(
+          ", ",
+        )}); switch runtimes with a fresh conversation`,
+      );
+  }
   for (const agent of retired) journal.agents.retireStoppedAgent(authority, agent);
+  const transfer = retainCoordinatorSession
+    ? journal.agents.createCoordinatorConversationTransfer(
+        authority,
+        continuitySources[0]!,
+        target.runtime,
+      )
+    : null;
   db.prepare("UPDATE runs SET state_json = ?, updated_at = ? WHERE run_id = ?").run(
     JSON.stringify(next),
     next.updatedAt,
@@ -142,8 +179,11 @@ export function commitRuntimeHandoff(
       previous,
       target,
       retiredAgents: retired.length,
+      conversationTransferId: transfer?.transferId ?? null,
       continuity:
-        "Fresh conversations; retained evidence, findings, memory, policy, budgets, workspaces and native endpoints. No model started, resource deleted, message discarded or permission granted.",
+        transfer === null
+          ? "Fresh conversations; retained evidence, findings, memory, policy, budgets, workspaces and native endpoints. No model started, resource deleted, message discarded or permission granted."
+          : "The exact stopped coordinator conversation is reserved for one replacement generation. No model started, resource deleted, message discarded or permission granted.",
     }),
     identity: null,
     artifactIds: [],

@@ -3,7 +3,11 @@ import type { OrchestrationJournal } from "./orchestration-journal.js";
 import type { ControllerAuthority, TurnIdentity } from "../domain/orchestration.js";
 import type { TurnRecord } from "../domain/agents.js";
 import type { CodexLaunchStop } from "../domain/codex-launch.js";
-import { ControlledLaunches, type ControlledLaunchOptions } from "./controlled-launch.js";
+import {
+  assertControlledExecution,
+  ControlledLaunches,
+  type ControlledLaunchOptions,
+} from "./controlled-launch.js";
 import { ControlledTranscript } from "./controlled-transcript.js";
 import { normalizeCodexEvent } from "./codex.js";
 import { redactSensitiveText } from "../util/redact.js";
@@ -17,6 +21,7 @@ export type ControlledSdkOptions = ControlledLaunchOptions;
 
 /** Actual SDK dispatch through the persisted agent turn, not the legacy runtime's in-memory handle. */
 export class ControlledSdkRuntime {
+  readonly backend = "codex" as const;
   readonly kind = "sdk";
   private readonly launches: ControlledLaunches;
   constructor(
@@ -33,8 +38,7 @@ export class ControlledSdkRuntime {
   ): Promise<TurnRecord> {
     this.journal.assertAuthority(authority);
     const agent = this.journal.agents.instance(authority.runId, identity);
-    if (agent.contract.runtime !== "sdk")
-      throw new Error("Controlled SDK dispatch requires an SDK assignment");
+    const effectiveTimeout = assertControlledExecution(agent, this.options, "sdk");
     const workspace = this.journal.agents.workspace(authority.runId, identity);
     const { manifest, turn, packet } = this.launches.reserve(this.journal, authority, identity);
     const request = new AbortController();
@@ -43,7 +47,7 @@ export class ControlledSdkRuntime {
     if (signal?.aborted) abort();
     const timeout = setTimeout(
       () => request.abort(new Error("Agent turn deadline exceeded")),
-      this.options.turnTimeoutMs ?? 1_800_000,
+      effectiveTimeout,
     );
     const check = () => {
       this.journal.assertAuthority(authority);
@@ -109,10 +113,13 @@ export class ControlledSdkRuntime {
         skipGitRepoCheck: true,
         threadSource: `epicd-${agent.role}`,
       };
-      const thread =
+      const resumeSessionId =
         agent.provider?.runtime === "sdk"
-          ? client.resumeThread(agent.provider.sessionId, settings)
-          : client.startThread(settings);
+          ? agent.provider.sessionId
+          : agent.conversationContinuation?.sessionId;
+      const thread = resumeSessionId
+        ? client.resumeThread(resumeSessionId, settings)
+        : client.startThread(settings);
       invoked = true;
       const interrupted = new Promise<never>((_, reject) => {
         onStreamAbort = () => reject(new Error("Agent stream interrupted; reconcile its launcher"));
@@ -140,6 +147,7 @@ export class ControlledSdkRuntime {
                 : null;
             if (event.type === "thread.started")
               this.journal.agents.bindTurnProvider(authority, identity, {
+                backend: "codex",
                 runtime: "sdk",
                 sessionId: event.thread_id,
               });
@@ -368,6 +376,9 @@ export class ControlledSdkRuntime {
         identity,
         "No controlled launch identity is available",
       );
+    const agent = this.journal.agents.instance(authority.runId, identity);
+    assertControlledExecution(agent, this.options, "sdk");
+    this.journal.agents.validateLaunchBinding(authority.runId, turn.identity);
     this.journal.agents.requestStop(authority, identity);
     const manifest = turn.launch.manifest;
     let stop = turn.launch.stop;

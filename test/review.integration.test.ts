@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { runStatusView } from "../src/status.js";
+import { buildOrchestratorContext } from "../src/orchestrator/context.js";
+import { ActionKernel } from "../src/kernel/actions.js";
+import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
 import { reconcileReview } from "../src/kernel/reviews.js";
 import { digestJson } from "../src/domain/repository-policy.js";
 import { KernelActionSchema, type KernelAction } from "../src/domain/orchestration.js";
@@ -10,6 +14,98 @@ import type { AdaptiveReviewResult } from "../src/domain/reviews.js";
 import { fixture, check, finding, git, success, target, waitFor } from "./fixtures/review.js";
 
 describe.skipIf(process.platform !== "linux")("independent pre-commit review evidence", () => {
+  it.each(["isolated", "uncontained"] as const)(
+    "keeps finished-review diagnostics readable for an %s owner after reopen",
+    async (state) => {
+      const s = await fixture(),
+        run = s.authority.runId;
+      const candidate = await s.capture(await s.define());
+      await s.validate(candidate, await s.copy(candidate));
+      const reviewed = await s.review(candidate);
+      const identity = reviewed.evidence.turnIdentity!;
+      const nextCopy = state === "uncontained" ? await s.copy(candidate) : null;
+      expect(s.journal.reviews.assessApproval(run, candidate).approved).toBe(true);
+      if (state === "uncontained")
+        s.journal.workspaceInspections.reserve(
+          s.authority,
+          s.store.get(run)!.runtimeConfiguration!.workspaceRoot,
+          identity,
+          { kind: "materialization" },
+        );
+      const db = new Database(s.path);
+      const original = db
+        .prepare(
+          "SELECT record_json FROM agent_instances WHERE run_id=? AND agent_id=? AND generation=?",
+        )
+        .get(run, identity.agentId, identity.agentGeneration) as { record_json: string };
+      const damaged = JSON.parse(original.record_json);
+      delete damaged.execution;
+      const raw = JSON.stringify(damaged);
+      const update = (record: string) =>
+        db
+          .prepare(
+            "UPDATE agent_instances SET record_json=? WHERE run_id=? AND agent_id=? AND generation=?",
+          )
+          .run(record, run, identity.agentId, identity.agentGeneration);
+      try {
+        update(raw);
+        if (nextCopy) {
+          const rejected = await s.dispatch({
+            kind: "run_review",
+            references: [],
+            ...candidate,
+            ...target(nextCopy),
+            agent: null,
+            instructions: "Integrity must be explicit at review admission",
+          });
+          expect(JSON.stringify(rejected)).toContain("agent_integrity_uncontained");
+          expect(s.journal.reviews.records(run)).toHaveLength(1);
+        }
+        const store = s.reopen(),
+          journal = store.orchestration;
+        expect(journal.agents.ownershipAssessment(run, identity).state).toBe(state);
+        expect(() => journal.agents.instance(run, identity)).toThrow();
+        const blocker =
+          state === "isolated" ? "review_turn_ineligible" : "agent_integrity_uncontained";
+        expect(journal.reviews.assessApproval(run, candidate)).toMatchObject({
+          approved: false,
+          blocker: { code: blocker },
+        });
+        expect(runStatusView(store, run).reviews).toContainEqual(
+          expect.objectContaining({
+            evidenceId: reviewed.evidence.evidenceId,
+            approved: false,
+            approvalBlocker: blocker,
+          }),
+        );
+        expect(buildOrchestratorContext(new ActionKernel(journal), run).reviews).toContainEqual(
+          expect.objectContaining({ approved: false, approvalBlocker: blocker }),
+        );
+        expect(journal.reviews.records(run)).toContainEqual(reviewed.evidence);
+        expect(
+          (
+            db
+              .prepare(
+                "SELECT record_json FROM agent_instances WHERE run_id=? AND agent_id=? AND generation=?",
+              )
+              .get(run, identity.agentId, identity.agentGeneration) as { record_json: string }
+          ).record_json,
+        ).toBe(raw);
+        if (state === "uncontained")
+          expect(() => journal.agents.operationalTurns(run)).toThrow("stop cannot be proved");
+        else
+          expect(
+            journal.agents
+              .operationalTurns(run)
+              .find((turn) => turn.identity.turnId === identity.turnId)?.resultEligible,
+          ).toBe(false);
+      } finally {
+        update(original.record_json);
+        db.close();
+      }
+    },
+  );
+
   it(
     "explains outstanding reviewer demands and admits only a fresh independent reassessment",
     { timeout: 15_000 },
@@ -562,15 +658,18 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     const run = s.authority.runId;
     const candidate = await s.capture(await s.define());
     await s.validate(candidate, await s.copy(candidate));
-    const runDriver = s.driver.run.bind(s.driver);
-    s.driver.run = async (authority, identity, signal) => {
-      const stopped = await runDriver(authority, identity, signal);
-      const copy = s.journal.agents.workspace(run, identity);
-      // Explicit host fault injection, not a permitted reviewer command.
-      writeFileSync(join(copy.path, "app.txt"), "host contamination\n");
-      return stopped;
-    };
+    const originalRun = ControlledSdkRuntime.prototype.run;
+    const fault = vi
+      .spyOn(ControlledSdkRuntime.prototype, "run")
+      .mockImplementation(async function (this: ControlledSdkRuntime, authority, identity, signal) {
+        const stopped = await originalRun.call(this, authority, identity, signal);
+        const copy = s.journal.agents.workspace(run, identity);
+        // Explicit host fault injection, not a permitted reviewer command.
+        writeFileSync(join(copy.path, "app.txt"), "host contamination\n");
+        return stopped;
+      });
     const reviewed = await s.review(candidate);
+    fault.mockRestore();
     expect(reviewed.result.status).toBe("failed");
     expect(reviewed.evidence).toMatchObject({
       status: "finished",
@@ -605,7 +704,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
       "owned final inspection",
     );
     s.newLease();
-    await expect(reconcileReview(s.journal, s.authority, review, s.driver)).rejects.toThrow(
+    await expect(reconcileReview(s.journal, s.authority, review, s.dispatcher)).rejects.toThrow(
       "independently settled",
     );
     expect(s.journal.agents.activeWorkspaceOperation(run, copy)?.operationId).toBe(
@@ -664,7 +763,7 @@ describe.skipIf(process.platform !== "linux")("independent pre-commit review evi
     const old = s.journal.reviews.records(s.authority.runId)[0]!;
     s.newLease();
     await expect(s.kernel.operation(running.operationId)!).rejects.toThrow("lease was lost");
-    const stopped = await reconcileReview(s.journal, s.authority, old, s.driver);
+    const stopped = await reconcileReview(s.journal, s.authority, old, s.dispatcher);
     expect(stopped).toMatchObject({ status: "finished", sourceIntact: false, report: null });
     expect(s.journal.reviews.approval(s.authority.runId, candidate)).toBeNull();
   });

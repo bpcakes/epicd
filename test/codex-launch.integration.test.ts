@@ -234,6 +234,21 @@ describe.skipIf(process.platform !== "linux")("confined Codex launcher", () => {
       expect(() => validateCodexArguments(launch, args)).toThrow();
   });
 
+  it("rejects mutable or changed launch-owned confinement policy", async () => {
+    const { input } = await fixture();
+    const { launch } = await createCodexLauncher(input, fileURLToPath(import.meta.url));
+    const policy = join(launch.controlDirectory, "config.toml");
+    await chmod(policy, 0o600);
+    await expect(codexLaunchCommand(launch, ["exec", "--version"])).rejects.toThrow(
+      "exact owner read-only",
+    );
+    await writeFile(policy, 'approval_policy = "on-request"\n');
+    await chmod(policy, 0o400);
+    await expect(codexLaunchCommand(launch, ["exec", "--version"])).rejects.toThrow(
+      "changed before launch",
+    );
+  });
+
   it("extracts only an access token without persisting or exposing the refresh bundle", async () => {
     const { root, input } = await fixture();
     const auth = join(root, "auth.json");
@@ -279,6 +294,13 @@ describe.skipIf(process.platform !== "linux")("confined Codex launcher", () => {
       fileURLToPath(import.meta.url),
     );
     const command = await codexLaunchCommand(launch, ["exec", "--version"]);
+    const policy = join(launch.controlDirectory, "config.toml");
+    const policyMount = command.args.indexOf(policy);
+    expect(command.args.slice(policyMount - 1, policyMount + 2)).toEqual([
+      "--ro-bind",
+      policy,
+      join(input.confinement.providerHome, "config.toml"),
+    ]);
     expect(command.env.CODEX_ACCESS_TOKEN).toBeUndefined();
     expect(JSON.stringify(command.args)).not.toContain("private-access-test");
     expect(command.args).not.toContain(auth);

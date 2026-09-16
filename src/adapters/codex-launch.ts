@@ -202,6 +202,11 @@ export async function materializeCodexLauncher(
         "Codex launcher requires a canonical compiled entrypoint and Node executable",
       );
   }
+  await writeFile(
+    join(launch.controlDirectory, "config.toml"),
+    codexConfinementConfig(launch.confinement),
+    { flag: "wx", mode: 0o400 },
+  );
   const manifestPath = join(launch.controlDirectory, "launch.json");
   await writeFile(manifestPath, JSON.stringify(launch), { flag: "wx", mode: 0o600 });
   const executable = join(launch.controlDirectory, "codex");
@@ -265,6 +270,8 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
   const launch = CodexLaunchSchema.parse(launchInput);
   const spec = launch.confinement;
   const config = codexConfinementConfig(spec);
+  const launchConfig = join(launch.controlDirectory, "config.toml");
+  const providerConfig = join(spec.providerHome, "config.toml");
   const packet = await verifyCodexReviewPacket(launch);
   for (const path of [spec.workspace, spec.providerHome, spec.scratch, spec.artifacts]) {
     if (overlap(path, launch.controlDirectory))
@@ -272,9 +279,10 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
     if (launch.authCachePath && overlap(path, launch.authCachePath))
       throw new Error("The managed auth cache must remain outside agent storage");
   }
-  await canonicalFile(join(spec.providerHome, "config.toml"));
-  if ((await readFile(join(spec.providerHome, "config.toml"), "utf8")) !== config)
-    throw new Error("Private Codex configuration changed before launch");
+  await canonicalReadOnlyFile(launchConfig);
+  await canonicalFile(providerConfig);
+  if ((await readFile(launchConfig, "utf8")) !== config)
+    throw new Error("Private launch configuration changed before launch");
   for (const path of [
     spec.workspace,
     spec.providerHome,
@@ -341,12 +349,6 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
   );
   for (const path of [spec.providerHome, spec.scratch, spec.artifacts])
     mounts.push("--bind", path, path);
-  // The provider can persist its conversation, but cannot replace its launch policy.
-  mounts.push(
-    "--ro-bind",
-    join(spec.providerHome, "config.toml"),
-    join(spec.providerHome, "config.toml"),
-  );
   for (const name of [".git", ".beads", ".epicd", ".codex", "AGENTS.md"]) {
     const path = join(spec.workspace, name);
     if (await exists(path)) {
@@ -370,6 +372,9 @@ export async function codexLaunchCommand(launchInput: CodexLaunch, argv: readonl
       throw new Error("A runtime mount would expose launch control or the managed auth cache");
     index += 2;
   }
+  // The provider home remains writable for session persistence, but the active
+  // generation sees only its controller-owned, read-only launch policy.
+  mounts.push("--ro-bind", launchConfig, providerConfig);
   if (launch.reviewPacket !== null) {
     const path = join(launch.controlDirectory, "review-evidence.json");
     if (launch.authCachePath && overlap(path, launch.authCachePath))
@@ -463,6 +468,17 @@ async function privateDirectory(path: string) {
 async function canonicalFile(path: string) {
   if (!(await lstat(path)).isFile() || (await realpath(path)) !== path)
     throw new Error("Codex launch inputs must be canonical regular files");
+}
+async function canonicalReadOnlyFile(path: string) {
+  const stat = await lstat(path);
+  if (
+    !stat.isFile() ||
+    stat.nlink !== 1 ||
+    stat.uid !== process.getuid?.() ||
+    (stat.mode & 0o777) !== 0o400 ||
+    (await realpath(path)) !== path
+  )
+    throw new Error("Codex launch policy must be an exact owner read-only file");
 }
 async function rejectSharedFiles(directory: string): Promise<void> {
   for (const entry of await readdir(directory, { withFileTypes: true })) {

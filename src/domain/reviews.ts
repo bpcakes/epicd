@@ -47,6 +47,7 @@ export type ReviewApprovalBlockerCode =
   | "review_failed"
   | "review_report_missing"
   | "review_turn_ineligible"
+  | "agent_integrity_uncontained"
   | "review_work_pending"
   | "verdict_not_approved"
   | "plan_inadequate"

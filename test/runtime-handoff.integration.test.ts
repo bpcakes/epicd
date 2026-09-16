@@ -2,7 +2,7 @@ import { freezeAccountDraft } from "../src/adapters/accounts.js";
 import { AccountPreferencesSchema, resolveAccountDraft } from "../src/domain/accounts.js";
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,17 +10,33 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Result from "effect/Result";
 import { StateStore } from "../src/adapters/store.js";
+import { OrchestrationJournal } from "../src/adapters/orchestration-journal.js";
+import { ControlledHerdrRuntime } from "../src/adapters/controlled-herdr.js";
+import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
+import { OrchestratorController } from "../src/controller.js";
+import { ControlledLaunches } from "../src/adapters/controlled-launch.js";
+import { codexConfinementConfig } from "../src/adapters/codex-confinement.js";
 import { PublicationGit, RUN_OWNERSHIP_REF } from "../src/adapters/publication-git.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { RepositoryAdmission } from "../src/kernel/repository-admission.js";
 import { runRepositoryIO } from "../dist/adapters/repository-io.js";
 import { handoffRuntime, handoffRuntimeEffect } from "../src/bootstrap.js";
+import { runStatusView, humanRunStatus } from "../src/status.js";
 import { RunOperator } from "../src/operator-controls.js";
 import * as codexSettings from "../src/adapters/codex-settings.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
-import { SdkAgentSessionContractSchema, resolveAgentRoleSettings } from "../src/domain/types.js";
+import {
+  HerdrAgentSessionContractSchema,
+  SdkAgentSessionContractSchema,
+  resolveAgentRoleSettings,
+} from "../src/domain/types.js";
 import { RuntimeHandoffTargetSchema } from "../src/domain/runtime-handoff.js";
 import { buildOrchestratorContext } from "../src/orchestrator/context.js";
+import {
+  coordinatorConversationPressure,
+  COORDINATOR_CONVERSATION_LIMITS,
+} from "../src/orchestrator/conversation.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
 
@@ -130,6 +146,7 @@ async function fixture() {
       candidateId: null,
       instructions: "Coordinate this bounded fixture",
       contract: SdkAgentSessionContractSchema.parse({
+        backend: "codex",
         runtime: "sdk",
         requested: settings,
         effective: settings,
@@ -184,7 +201,1340 @@ async function fixture() {
   };
 }
 
+function retainedTarget(f: Awaited<ReturnType<typeof fixture>>) {
+  const provider = f.journal.agents.instance(f.state.runId, f.agent).provider;
+  const sessionId = provider?.runtime === "sdk" ? provider.sessionId : randomUUID();
+  if (provider === null)
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId,
+    });
+  f.pause();
+  f.journal.handoffRuntime(f.authority, f.version(), f.target, true);
+  const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(f.state.runId, "herdr")!;
+  f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+  const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+  const contract = HerdrAgentSessionContractSchema.parse({
+    backend: "codex",
+    runtime: "herdr",
+    requested: settings,
+    effective: settings,
+  });
+  const target = f.journal.agents.reserveAgent(
+    f.authority,
+    {
+      ...f.workspace,
+      role: "orchestrator",
+      purpose: "coordination",
+      taskId: null,
+      candidateId: null,
+      instructions: "Resume retained session",
+      contract,
+      confinementProfile: "epicd-isolated",
+      replaces: f.agent,
+      conversationTransferId: transfer.transferId,
+    },
+    f.version(),
+  );
+  return { sessionId, transfer, target, contract };
+}
+
 describe.runIf(process.platform === "linux")("explicit current-format runtime handoff", () => {
+  it("keeps conversation pressure across the validated runtime-transfer lineage", async () => {
+    const f = await fixture();
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId: randomUUID(),
+    });
+    for (let index = 0; index < COORDINATOR_CONVERSATION_LIMITS.turns - 1; index += 1) {
+      const turn = f.journal.agents.prepareTurn(
+        f.authority,
+        f.agent,
+        randomUUID(),
+        `Retained source turn ${index}`,
+        { type: "object" },
+        f.version(),
+      );
+      f.journal.agents.markSubmitting(f.authority, turn.identity);
+      f.journal.agents.acknowledgePrompt(
+        f.authority,
+        turn.identity,
+        turn.promptDigest,
+        "Fixture accepted retained source turn",
+      );
+      f.journal.agents.finishTurn(f.authority, turn.identity, {
+        status: "completed",
+        result: { index },
+        stopEvidence: "Fixture has no external process",
+      });
+    }
+    const { sessionId, target } = retainedTarget(f);
+    f.journal.agents.bindProvider(f.authority, target, {
+      backend: "codex",
+      runtime: "herdr",
+      name: "continued",
+      paneId: "pane",
+      tabId: "tab",
+      terminalId: "terminal",
+      sessionId,
+    });
+    const targetTurn = f.journal.agents.prepareTurn(
+      f.authority,
+      target,
+      randomUUID(),
+      "Reach the retained conversation rollover boundary",
+      { type: "object" },
+      f.version(),
+    );
+    f.journal.agents.markSubmitting(f.authority, targetTurn.identity);
+    f.journal.agents.acknowledgePrompt(
+      f.authority,
+      targetTurn.identity,
+      targetTurn.promptDigest,
+      "Fixture accepted retained target turn",
+    );
+    f.journal.agents.finishTurn(f.authority, targetTurn.identity, {
+      status: "completed",
+      result: { retained: true },
+      stopEvidence: "Fixture has no external process",
+    });
+    const turns = f.journal.agents.operationalTurns(f.state.runId);
+    expect(coordinatorConversationPressure(target, turns).turns).toBe(1);
+    const lineage = f.journal.agents.conversationLineageIdentities(f.state.runId, target);
+    expect(coordinatorConversationPressure(target, turns, lineage)).toMatchObject({
+      reasons: ["turn_limit"],
+      turns: COORDINATOR_CONVERSATION_LIMITS.turns,
+    });
+    f.pause();
+    expect(() =>
+      f.journal.handoffRuntime(
+        f.authority,
+        f.version(),
+        { runtime: "sdk", executable: f.codex, herdr: null },
+        true,
+      ),
+    ).toThrow("reached its rollover boundary");
+    expect(f.journal.agents.instance(f.state.runId, target)).toMatchObject({
+      status: "ready",
+      provider: { sessionId },
+    });
+  });
+
+  it("rejects retained continuity from a revoked coordinator at handoff and journal boundaries", async () => {
+    const f = await fixture(),
+      run = f.state.runId;
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId: randomUUID(),
+    });
+    f.journal.agents.revokeAgent(f.authority, f.agent, "Conversation authority was revoked");
+    f.pause();
+    const version = f.version();
+
+    expect(() => f.journal.handoffRuntime(f.authority, version, f.target, true)).toThrow(
+      "Retaining continuity requires exactly one stopped coordinator",
+    );
+    expect(f.version()).toBe(version);
+    expect(f.store.get(run)?.runtime).toBe("sdk");
+    expect(f.journal.agents.instance(run, f.agent)).toMatchObject({
+      status: "revoked",
+      revokedReason: "Conversation authority was revoked",
+    });
+    expect(f.journal.agents.hasOpenConversationTransfers(run)).toBe(false);
+
+    const released = f.journal.agents.retireStoppedAgent(f.authority, f.agent);
+    expect(released).toMatchObject({
+      status: "released",
+      revokedReason: "Conversation authority was revoked",
+    });
+    expect(() =>
+      f.journal.agents.createCoordinatorConversationTransfer(f.authority, released, "herdr"),
+    ).toThrow("non-revoked");
+  });
+
+  it("does not rescan ownership when a continued provider binding is unchanged", async () => {
+    const f = await fixture();
+    const { target, sessionId } = retainedTarget(f);
+    const provider = {
+      backend: "codex" as const,
+      runtime: "herdr" as const,
+      name: "continued",
+      paneId: "pane",
+      tabId: "tab",
+      terminalId: "terminal",
+      sessionId,
+    };
+    let ownershipInventories = 0;
+    const db = new Database(f.path, {
+      verbose: (sql) => {
+        if (
+          typeof sql === "string" &&
+          sql.includes("FROM agent_instances agent") &&
+          sql.includes("LEFT JOIN agent_ownership_revisions")
+        )
+          ownershipInventories += 1;
+      },
+    });
+    const journal = new OrchestrationJournal(db, () => f.store.storageIdentity());
+    try {
+      expect(journal.agents.bindProvider(f.authority, target, provider)).toMatchObject({
+        provider,
+      });
+      expect(ownershipInventories).toBe(1);
+      for (let attempt = 0; attempt < 4; attempt += 1)
+        expect(journal.agents.bindProvider(f.authority, target, provider)).toMatchObject({
+          provider,
+        });
+      expect(ownershipInventories).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps a coordinator workspace registered while an open transfer pins it", async () => {
+    const f = await fixture();
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId: randomUUID(),
+    });
+    f.pause();
+    f.journal.handoffRuntime(f.authority, f.version(), f.target, true);
+    const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+      f.state.runId,
+      "herdr",
+    );
+    f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+
+    expect(() => f.journal.agents.retireWorkspace(f.authority, f.workspace)).toThrow(
+      "explicitly abandon",
+    );
+    expect(f.journal.agents.workspace(f.state.runId, f.workspace).status).toBe("ready");
+    expect(f.journal.agents.hasOpenConversationTransfers(f.state.runId)).toBe(true);
+    expect(transfer?.status).toBe("pending");
+  });
+
+  it.each(["claimed", "pending"] as const)(
+    "abandons a %s failed native resume through the operator boundary and starts fresh after reopen",
+    async (transferState) => {
+      const f = await fixture(),
+        run = f.state.runId;
+      const { transfer, target, sessionId } = retainedTarget(f);
+      const turn = f.journal.agents.prepareTurn(
+        f.authority,
+        target,
+        randomUUID(),
+        "Resume missing session",
+        { type: "object" },
+        f.version(),
+      );
+      vi.stubEnv("HERDR_ENV", "1");
+      const runtime = new ControlledHerdrRuntime(f.journal, {
+        root: target.execution.runtimeRoot,
+        executable: f.codex,
+        turnTimeoutMs: target.execution.turnTimeoutMs,
+        launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
+        herdrPath: f.herdr,
+        sessionName: "fixture",
+        workspaceId: "w-test",
+      });
+      const failed = await runtime.run(f.authority, turn.identity);
+      expect(failed.status).toBe("failed");
+      expect(
+        f.journal
+          .observations(run)
+          .filter((entry) => entry.kind === "runtime.problem")
+          .map((entry) => entry.summary)
+          .join(" "),
+      ).toContain("recorded native conversation is missing");
+      expect(failed.stopEvidence).not.toBeNull();
+      expect(failed.launch?.stop?.processTreeStopped).toBe(true);
+      expect(f.journal.agents.instance(run, target).provider).toBeNull();
+      if (transferState === "pending") {
+        f.journal.agents.retireStoppedAgent(f.authority, target);
+        const unrelatedCopy = await new WorkspaceManager(
+          f.journal,
+          f.state.runtimeConfiguration!.workspaceRoot,
+        ).create(f.authority, f.repo, f.state.epicBaseRevision, "coordinator");
+        const unrelated = f.journal.agents.reserveAgent(
+          f.authority,
+          {
+            ...unrelatedCopy,
+            role: "orchestrator",
+            purpose: "coordination",
+            taskId: null,
+            candidateId: null,
+            instructions: "Unrelated stopped historical owner",
+            confinementProfile: "epicd-isolated",
+            contract: target.contract,
+            replaces: target,
+          },
+          f.version(),
+        );
+        f.journal.agents.retireStoppedAgent(f.authority, unrelated);
+        const damaged = { ...f.journal.agents.instance(run, unrelated), schemaVersion: 1 };
+        f.db
+          .prepare(
+            "UPDATE agent_instances SET record_json=? WHERE run_id=? AND agent_id=? AND generation=?",
+          )
+          .run(JSON.stringify(damaged), run, unrelated.agentId, unrelated.agentGeneration);
+        expect(f.journal.agents.ownershipAssessment(run, unrelated).state).toBe("isolated");
+      }
+      f.pause();
+      const operator = new RunOperator(f.store, run);
+      await expect(
+        operator.submit({
+          kind: "abandon_conversation",
+          controlVersion: f.version(),
+          transferId: transfer.transferId,
+          reason: "Session is unavailable",
+        }),
+      ).rejects.toThrow();
+      expect(f.journal.agents.conversationTransfer(run, transfer.transferId).status).toBe(
+        transferState,
+      );
+      f.detach();
+      const version = f.version();
+      await expect(
+        operator.submit({
+          kind: "abandon_conversation",
+          controlVersion: version - 1,
+          transferId: transfer.transferId,
+          reason: "Session is unavailable",
+        }),
+      ).rejects.toThrow("Control changed");
+      if (transferState === "pending") {
+        const command = spawnSync(
+          process.execPath,
+          [
+            "dist/cli.js",
+            "abandon-conversation",
+            run,
+            transfer.transferId,
+            "--state",
+            f.path,
+            "--control-version",
+            String(version),
+            "--reason",
+            "Session is unavailable",
+          ],
+          { encoding: "utf8", timeout: 10000 },
+        );
+        expect(command.status, command.stderr).toBe(0);
+        expect(command.stdout).toContain("Conversation transfer abandoned");
+      } else {
+        await operator.submit({
+          kind: "abandon_conversation",
+          controlVersion: version,
+          transferId: transfer.transferId,
+          reason: "Session is unavailable",
+        });
+      }
+      expect(f.store.controllerLease(run)).toBeNull();
+      const acknowledgedVersion = f.version();
+      const acknowledgedEvents = f.store.events(run);
+      const acknowledgedObservations = f.store.orchestration.observations(run);
+      await operator.submit({
+        kind: "abandon_conversation",
+        controlVersion: version,
+        transferId: transfer.transferId,
+        reason: "Retry lost acknowledgement",
+      });
+      expect(f.version()).toBe(acknowledgedVersion);
+      expect(f.store.events(run)).toEqual(acknowledgedEvents);
+      expect(f.store.orchestration.observations(run)).toEqual(acknowledgedObservations);
+      expect(operator.status().conversationTransfers).toContainEqual(
+        expect.objectContaining({ transferId: transfer.transferId, status: "abandoned" }),
+      );
+      const store = f.reopen(),
+        journal = store.orchestration;
+      const abandoned = journal.agents.conversationTransfer(run, transfer.transferId);
+      expect(abandoned).toMatchObject({
+        status: "abandoned",
+        targetAgentId: transferState === "claimed" ? target.agentId : null,
+        abandonment: { reason: "Session is unavailable", stoppedTurnIds: [turn.identity.turnId] },
+      });
+      expect(journal.agents.instance(run, target).status).toBe("released");
+      expect(journal.agents.pendingCoordinatorConversationTransfer(run, "herdr")).toBeNull();
+      expect(journal.agents.openConversationTransfers(run)).toEqual([]);
+      expect(journal.agents.turn(run, turn.identity)).toEqual(failed);
+      const retryVersion = f.version();
+      const allObservations = journal.observations(run);
+      const allEvents = store.events(run);
+      expect(
+        allObservations.filter(
+          (entry) => entry.kind === "agent.conversation_transfer_relinquished",
+        ),
+      ).toHaveLength(transferState === "pending" ? 1 : 0);
+      const before = journal
+        .observations(run)
+        .filter((entry) => entry.kind === "operator.conversation_abandoned");
+      journal.abandonConversationTransfer(
+        f.authority,
+        f.version(),
+        transfer.transferId,
+        "Retry after lost acknowledgement",
+      );
+      journal.abandonConversationTransfer(
+        f.authority,
+        version,
+        transfer.transferId,
+        "Retry with original version",
+      );
+      expect(f.version()).toBe(retryVersion);
+      expect(journal.observations(run)).toEqual(allObservations);
+      expect(store.events(run)).toEqual(allEvents);
+      expect(
+        journal
+          .observations(run)
+          .filter((entry) => entry.kind === "operator.conversation_abandoned"),
+      ).toEqual(before);
+      expect(journal.agents.conversationTransfer(run, transfer.transferId)).toEqual(abandoned);
+      journal.handoffRuntime(f.authority, f.version(), {
+        runtime: "sdk",
+        executable: f.codex,
+        herdr: null,
+      });
+      journal.operatorControl(run, f.version(), { kind: "resume" });
+      // An abandoned ID cannot be claimed again, even with otherwise exact bindings.
+      if (transferState === "claimed")
+        expect(() =>
+          journal.agents.reserveAgent(
+            f.authority,
+            {
+              ...f.workspace,
+              role: "orchestrator",
+              purpose: "coordination",
+              taskId: null,
+              candidateId: null,
+              instructions: "Invalid retry",
+              confinementProfile: "epicd-isolated",
+              contract: f.agent.contract,
+              replaces: target,
+              conversationTransferId: transfer.transferId,
+            },
+            f.version(),
+          ),
+        ).toThrow("Conversation transfer does not match");
+      f.detach();
+      copyFileSync("/bin/false", join(f.root, "codex-code-mode-host"));
+      let freshSession: string | null = null;
+      await new OrchestratorController(store, run, {
+        dispatcher: () =>
+          new ControlledAgentDispatcher(journal, {
+            "codex:sdk": (j, execution) => ({
+              backend: "codex",
+              kind: "sdk",
+              async run(authority, identity, signal) {
+                const owner = j.agents.instance(run, identity);
+                expect(owner.conversationContinuation).toBeNull();
+                expect(owner.provider).toBeNull();
+                const prompt = j.agents.turn(run, identity).prompt.instructions;
+                const input = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1));
+                freshSession = randomUUID();
+                const decision = {
+                  explanation: "Fresh test conversation",
+                  evidenceIds: [],
+                  request: {
+                    schemaVersion: 1,
+                    decisionId: input.ticket.decisionId,
+                    observationCursor: input.ticket.observationCursor,
+                    expectedControlVersion: input.ticket.expectedControlVersion,
+                    action: {
+                      kind: "escalate",
+                      question: "Fresh conversation reached",
+                      reason: "judgment",
+                      evidenceIds: [],
+                    },
+                  },
+                };
+                const events = [
+                  { type: "thread.started", thread_id: freshSession },
+                  { type: "turn.started" },
+                  {
+                    type: "item.completed",
+                    item: { type: "agent_message", id: "decision", text: JSON.stringify(decision) },
+                  },
+                  {
+                    type: "turn.completed",
+                    usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
+                  },
+                ];
+                writeFileSync(
+                  f.codex,
+                  "#!/bin/sh\ncat >/dev/null\n" +
+                    events
+                      .map(
+                        (event) =>
+                          "printf '%s\\n' '" + JSON.stringify(event).replaceAll("'", "'\\''") + "'",
+                      )
+                      .join("\n") +
+                    "\n",
+                  { mode: 0o700 },
+                );
+                return new ControlledSdkRuntime(j, {
+                  root: execution.runtimeRoot,
+                  executable: execution.executable,
+                  turnTimeoutMs: execution.turnTimeoutMs,
+                  launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
+                }).run(authority, identity, signal);
+              },
+              reconcile: (authority, identity) =>
+                new ControlledSdkRuntime(j, {
+                  root: execution.runtimeRoot,
+                  executable: execution.executable,
+                  turnTimeoutMs: execution.turnTimeoutMs,
+                  launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
+                }).reconcile(authority, identity),
+            }),
+          }),
+      }).run();
+      expect(freshSession).not.toBeNull();
+      expect(freshSession).not.toBe(sessionId);
+      expect(
+        journal.pendingEscalation(run)?.question,
+        JSON.stringify(
+          journal.observations(run).filter((entry) => entry.kind === "runtime.problem"),
+        ),
+      ).toBe("Fresh conversation reached");
+      expect(journal.agents.conversationTransfer(run, transfer.transferId)).toEqual(abandoned);
+    },
+  );
+
+  it.each(["pending", "claimed"] as const)(
+    "abandons a %s transfer with an isolated unreadable source after restart",
+    async (status) => {
+      const f = await fixture(),
+        run = f.state.runId;
+      const { transfer, target } = retainedTarget(f);
+      if (status === "pending") f.journal.agents.retireStoppedAgent(f.authority, target);
+      f.pause();
+      const source = f.journal.agents.instance(run, f.agent);
+      const raw = JSON.stringify({ ...source, schemaVersion: 1 });
+      f.db
+        .prepare("UPDATE agent_instances SET record_json = ? WHERE agent_id = ? AND generation = ?")
+        .run(raw, source.agentId, source.agentGeneration);
+      f.detach();
+      const store = f.reopen(),
+        journal = store.orchestration;
+      const completionResources = () =>
+        (
+          f.store.orchestration as unknown as {
+            completionResources(runId: string, operationId: string): unknown;
+          }
+        ).completionResources(run, "no-operation");
+      expect(() => completionResources()).toThrow("Completion cannot abandon");
+      expect(journal.agents.ownershipAssessment(run, source).state).toBe("isolated");
+      expect(runStatusView(store, run).conversationTransfers).toContainEqual(
+        expect.objectContaining({ transferId: transfer.transferId, status }),
+      );
+      expect(() => journal.agents.conversationTransfer(run, transfer.transferId)).toThrow(
+        "abandon-conversation",
+      );
+      expect(() =>
+        journal.handoffRuntime(f.authority, f.version(), {
+          runtime: "sdk",
+          executable: f.codex,
+          herdr: null,
+        }),
+      ).toThrow("explicitly abandon");
+      if (status === "pending") {
+        f.detach();
+        journal.operatorControl(run, f.version(), { kind: "resume" });
+        await expect(new OrchestratorController(store, run).run()).rejects.toThrow(
+          "abandon-conversation",
+        );
+        expect(journal.pendingEscalation(run)?.question).toContain(transfer.transferId);
+        f.reopen();
+      }
+      const current = f.store.orchestration;
+      const abandoned = current.abandonConversationTransfer(
+        f.authority,
+        f.version(),
+        transfer.transferId,
+        "Isolated source cannot resume",
+      );
+      expect(abandoned.status).toBe("abandoned");
+      expect(current.agents.hasOpenConversationTransfers(run)).toBe(false);
+      expect(completionResources()).toMatchObject({ disposition: "retained_for_inspection" });
+      expect(current.agents.instance(run, target).status).toBe("released");
+      expect(() =>
+        current.handoffRuntime(f.authority, f.version(), {
+          runtime: "sdk",
+          executable: f.codex,
+          herdr: null,
+        }),
+      ).not.toThrow();
+      expect(
+        (
+          f.db
+            .prepare(
+              "SELECT record_json FROM agent_instances WHERE agent_id = ? AND generation = ?",
+            )
+            .get(source.agentId, source.agentGeneration) as { record_json: string }
+        ).record_json,
+      ).toBe(raw);
+    },
+  );
+
+  it("reports an unreadable exact transfer claimant through a stable recovery error", async () => {
+    const f = await fixture();
+    const { transfer, target } = retainedTarget(f);
+    const damaged = JSON.stringify({ ...target, schemaVersion: 1 });
+    f.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(damaged, f.state.runId, target.agentId, target.agentGeneration);
+    f.pause();
+
+    await expect(
+      Promise.resolve().then(() =>
+        f.journal.abandonConversationTransfer(
+          f.authority,
+          f.version(),
+          transfer.transferId,
+          "Unreadable claim target",
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "conversation_transfer_claimant_unreadable" });
+  });
+
+  it("does not abandon a transfer while its exact claimant still has uncontained work", async () => {
+    const f = await fixture(),
+      run = f.state.runId;
+    const { transfer, target } = retainedTarget(f);
+    const turn = f.journal.agents.prepareTurn(
+      f.authority,
+      target,
+      randomUUID(),
+      "Unsettled target",
+      { type: "object" },
+      f.version(),
+    );
+    f.pause();
+    const source = f.journal.agents.instance(run, f.agent);
+    f.db
+      .prepare("UPDATE agent_instances SET record_json = ? WHERE agent_id = ? AND generation = ?")
+      .run(JSON.stringify({ ...source, schemaVersion: 1 }), source.agentId, source.agentGeneration);
+    expect(f.journal.agents.ownershipAssessment(run, source).state).toBe("isolated");
+    const version = f.version(),
+      observations = f.journal.observations(run);
+    expect(() =>
+      f.journal.abandonConversationTransfer(
+        f.authority,
+        version,
+        transfer.transferId,
+        "Unsafe abandonment",
+      ),
+    ).toThrow(/stop/i);
+    expect(f.version()).toBe(version);
+    expect(f.journal.observations(run)).toEqual(observations);
+    expect(f.journal.agents.turn(run, turn.identity).stopEvidence).toBeNull();
+    expect(f.journal.agents.hasOpenConversationTransfers(run)).toBe(true);
+  });
+
+  it("abandons a stopped transfer without depending on unrelated damaged turn history", async () => {
+    const f = await fixture(),
+      run = f.state.runId;
+    const { transfer, target } = retainedTarget(f);
+    const diagnostic = await new WorkspaceManager(
+      f.journal,
+      f.state.runtimeConfiguration!.workspaceRoot,
+    ).create(f.authority, f.repo, f.state.epicBaseRevision, "diagnostic");
+    const unrelated = f.journal.agents.reserveAgent(
+      f.authority,
+      {
+        ...diagnostic,
+        role: "implementation",
+        purpose: "specialist",
+        taskId: null,
+        candidateId: null,
+        instructions: "Unrelated historical diagnostic",
+        confinementProfile: "epicd-isolated",
+        contract: target.contract,
+      },
+      f.version(),
+    );
+    const stopped = f.journal.agents.cancelPreparedTurn(
+      f.authority,
+      f.journal.agents.prepareTurn(
+        f.authority,
+        unrelated,
+        randomUUID(),
+        "Stopped unrelated diagnostic",
+        { type: "object" },
+        f.version(),
+      ).identity,
+    );
+    const damaged = structuredClone(stopped);
+    damaged.prompt.instructions = "Changed without updating the retained prompt digest";
+    f.db
+      .prepare("UPDATE agent_turns SET record_json=? WHERE run_id=? AND turn_id=?")
+      .run(JSON.stringify(damaged), run, stopped.identity.turnId);
+    cleanup.push(() =>
+      f.db
+        .prepare("UPDATE agent_turns SET record_json=? WHERE run_id=? AND turn_id=?")
+        .run(JSON.stringify(stopped), run, stopped.identity.turnId),
+    );
+    expect(f.journal.agents.ownershipAssessment(run, unrelated)).toMatchObject({
+      state: "uncontained",
+      incident: { ownerRecordReadable: true },
+    });
+    f.pause();
+
+    expect(
+      f.journal.abandonConversationTransfer(
+        f.authority,
+        f.version(),
+        transfer.transferId,
+        "Retained session is unused",
+      ),
+    ).toMatchObject({ status: "abandoned" });
+    expect(f.journal.agents.instance(run, target).status).toBe("released");
+    expect(f.journal.agents.ownershipAssessment(run, unrelated).state).toBe("uncontained");
+  });
+
+  it.each(["pending", "claimed"] as const)(
+    "keeps %s transfer diagnostics readable while malformed rows still block handoff",
+    async (transferStatus) => {
+      const f = await fixture(),
+        run = f.state.runId;
+      const { transfer, target } = retainedTarget(f);
+      if (transferStatus === "pending") f.journal.agents.retireStoppedAgent(f.authority, target);
+      f.pause();
+      const raw = JSON.stringify({
+        ...f.journal.agents.conversationTransfer(run, transfer.transferId),
+        schemaVersion: 999,
+      });
+      f.db
+        .prepare("UPDATE agent_conversation_transfers SET record_json = ? WHERE transfer_id = ?")
+        .run(raw, transfer.transferId);
+      f.detach();
+      const store = f.reopen();
+      const status = runStatusView(store, run);
+      expect(status.conversationTransfers).toContainEqual({
+        transferId: transfer.transferId,
+        status: transferStatus,
+        targetRuntime: "herdr",
+        unreadable: true,
+        abandonment: null,
+      });
+      expect(humanRunStatus(status)).toContain("unreadable record");
+      if (transferStatus === "pending")
+        expect(() =>
+          store.orchestration.agents.pendingCoordinatorConversationTransfer(run, "herdr"),
+        ).toThrow("is unreadable");
+      expect(() =>
+        store.orchestration.handoffRuntime(f.authority, f.version(), {
+          runtime: "sdk",
+          executable: f.codex,
+          herdr: null,
+        }),
+      ).toThrow("explicitly abandon");
+      expect(() =>
+        store.orchestration.abandonConversationTransfer(
+          f.authority,
+          f.version(),
+          transfer.transferId,
+          "Unknown record",
+        ),
+      ).toThrow("is unreadable");
+      expect(
+        (
+          f.db
+            .prepare("SELECT record_json FROM agent_conversation_transfers WHERE transfer_id = ?")
+            .get(transfer.transferId) as { record_json: string }
+        ).record_json,
+      ).toBe(raw);
+    },
+  );
+
+  it("rolls back claim retirement when recording the operator observation fails", async () => {
+    const f = await fixture(),
+      run = f.state.runId;
+    const { target, transfer } = retainedTarget(f);
+    f.pause();
+    const version = f.version();
+    const before = f.journal.agents.conversationTransfer(run, transfer.transferId);
+    f.db.exec(`CREATE TRIGGER reject_abandonment BEFORE INSERT ON observations
+      WHEN NEW.source_event_id LIKE 'conversation-abandoned-%'
+      BEGIN SELECT RAISE(ABORT, 'Injected observation failure'); END`);
+    expect(() =>
+      f.journal.abandonConversationTransfer(
+        f.authority,
+        version,
+        transfer.transferId,
+        "Unavailable session",
+      ),
+    ).toThrow("Injected observation failure");
+    expect(f.version()).toBe(version);
+    expect(f.journal.agents.conversationTransfer(run, transfer.transferId)).toEqual(before);
+    expect(f.journal.agents.instance(run, target).status).toBe("reserved");
+    f.db.exec("DROP TRIGGER reject_abandonment");
+    f.journal.abandonConversationTransfer(
+      f.authority,
+      version,
+      transfer.transferId,
+      "Unavailable session",
+    );
+    expect(f.journal.agents.conversationTransfer(run, transfer.transferId).status).toBe(
+      "abandoned",
+    );
+    expect(f.journal.agents.instance(run, target).status).toBe("released");
+  });
+
+  it("refuses abandonment for uncertain or consumed targets without changing the reservation", async () => {
+    const f = await fixture(),
+      run = f.state.runId;
+    const { target, transfer, sessionId } = retainedTarget(f);
+    const turn = f.journal.agents.prepareTurn(
+      f.authority,
+      target,
+      randomUUID(),
+      "No stop proof",
+      { type: "object" },
+      f.version(),
+    );
+    f.pause();
+    const before = f.journal.agents.conversationTransfer(run, transfer.transferId);
+    expect(() =>
+      f.journal.abandonConversationTransfer(
+        f.authority,
+        f.version(),
+        transfer.transferId,
+        "Unsafe",
+      ),
+    ).toThrow(/stop|busy/i);
+    expect(f.journal.agents.conversationTransfer(run, transfer.transferId)).toEqual(before);
+    expect(f.journal.agents.instance(run, target).status).toBe("busy");
+    f.journal.agents.cancelPreparedTurn(f.authority, turn.identity);
+    f.journal.operatorControl(run, f.version(), { kind: "resume" });
+    f.journal.agents.bindProvider(f.authority, target, {
+      backend: "codex",
+      runtime: "herdr",
+      name: "bound",
+      paneId: "pane",
+      tabId: "tab",
+      terminalId: "terminal",
+      sessionId,
+    });
+    f.pause();
+    expect(() =>
+      f.journal.abandonConversationTransfer(
+        f.authority,
+        f.version(),
+        transfer.transferId,
+        "Consumed",
+      ),
+    ).toThrow("Consumed conversation ownership");
+    expect(f.journal.agents.conversationTransfer(run, transfer.transferId).status).toBe("consumed");
+  });
+
+  it("keeps a consumed continuation executable after its stopped source becomes isolated", async () => {
+    const f = await fixture();
+    const { target, transfer, sessionId } = retainedTarget(f);
+    const provider = {
+      backend: "codex" as const,
+      runtime: "herdr" as const,
+      name: "continued",
+      paneId: "pane",
+      tabId: "tab",
+      terminalId: "terminal",
+      sessionId,
+    };
+    f.journal.agents.bindProvider(f.authority, target, provider);
+    const source = f.journal.agents.instance(f.state.runId, f.agent);
+    const damaged = JSON.stringify({ ...source, schemaVersion: 1 });
+    f.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(damaged, f.state.runId, source.agentId, source.agentGeneration);
+
+    expect(f.journal.agents.ownershipAssessment(f.state.runId, source).state).toBe("isolated");
+    expect(f.journal.agents.conversationTransfer(f.state.runId, transfer.transferId).status).toBe(
+      "consumed",
+    );
+    expect(() => f.journal.agents.bindProvider(f.authority, target, provider)).not.toThrow();
+    const turn = f.journal.agents.prepareTurn(
+      f.authority,
+      target,
+      randomUUID(),
+      "Continue despite isolated historical damage",
+      { type: "object" },
+      f.version(),
+    );
+    const launches = new ControlledLaunches({
+      root: target.execution.runtimeRoot,
+      executable: target.execution.executable,
+    });
+    expect(() => launches.reserve(f.journal, f.authority, turn.identity)).not.toThrow();
+    expect(
+      f.db
+        .prepare(
+          "SELECT conversation_transfer_id FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+        )
+        .get(f.state.runId, target.agentId, target.agentGeneration),
+    ).toEqual({ conversation_transfer_id: transfer.transferId });
+  });
+
+  it.each([false, true])(
+    "transfers one stopped coordinator session across runtimes (failed prior claim: %s)",
+    async (failedClaim) => {
+      const f = await fixture();
+      const sessionId = randomUUID();
+      f.journal.agents.bindProvider(f.authority, f.agent, {
+        backend: "codex",
+        runtime: "sdk",
+        sessionId,
+      });
+      const launches = new ControlledLaunches({
+        root: f.state.runtimeConfiguration!.runtimeRoot,
+        executable: f.codex,
+        launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
+      });
+      const sourceTurn = f.journal.agents.prepareTurn(
+        f.authority,
+        f.agent,
+        randomUUID(),
+        "Record a stopped source conversation",
+        { type: "object" },
+        f.version(),
+      );
+      const sourceLaunch = launches.reserve(f.journal, f.authority, sourceTurn.identity).manifest;
+      await launches.materialize(sourceLaunch, null);
+      f.journal.agents.acknowledgePrompt(
+        f.authority,
+        sourceTurn.identity,
+        sourceTurn.promptDigest,
+        "Fixture accepted source turn",
+      );
+      const sourceStop = {
+        generation: sourceLaunch.generation,
+        stoppedAt: new Date().toISOString(),
+        kind: "stopped" as const,
+        code: 0,
+        signal: null,
+        interrupted: false,
+        processTreeStopped: true as const,
+      };
+      f.journal.agents.recordLaunchStop(f.authority, sourceTurn.identity, sourceStop);
+      f.journal.agents.finishTurn(f.authority, sourceTurn.identity, {
+        status: "completed",
+        result: { kind: "decision" },
+        stopEvidence: JSON.stringify(sourceStop),
+      });
+      f.pause();
+      f.journal.handoffRuntime(f.authority, f.version(), f.target, true);
+      expect(f.journal.agents.instance(f.state.runId, f.agent).status).toBe("released");
+      const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+        f.state.runId,
+        "herdr",
+      );
+      expect(transfer).toMatchObject({
+        sourceAgentId: f.agent.agentId,
+        sourceAgentGeneration: f.agent.agentGeneration,
+        sessionId,
+        status: "pending",
+      });
+      expect(() =>
+        f.journal.handoffRuntime(f.authority, f.version(), {
+          runtime: "sdk",
+          executable: f.codex,
+          herdr: null,
+        }),
+      ).toThrow("claim the reserved coordinator conversation");
+
+      f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+      const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+      let predecessor = f.agent;
+      if (failedClaim) {
+        predecessor = f.journal.agents.reserveAgent(
+          f.authority,
+          {
+            ...f.workspace,
+            role: "orchestrator",
+            purpose: "coordination",
+            taskId: null,
+            candidateId: null,
+            instructions: "Claim whose launch fails before provider binding",
+            contract: HerdrAgentSessionContractSchema.parse({
+              backend: "codex",
+              runtime: "herdr",
+              requested: settings,
+              effective: settings,
+            }),
+            confinementProfile: "epicd-isolated",
+            replaces: f.agent,
+            conversationTransferId: transfer!.transferId,
+          },
+          f.version(),
+        );
+        const failedTurn = f.journal.agents.prepareTurn(
+          f.authority,
+          predecessor,
+          randomUUID(),
+          "Failed claim",
+          { type: "object" },
+          f.version(),
+        );
+        const failedLaunch = launches.reserve(f.journal, f.authority, failedTurn.identity).manifest;
+        f.journal.agents.recordLaunchStop(f.authority, failedTurn.identity, {
+          generation: failedLaunch.generation,
+          stoppedAt: new Date().toISOString(),
+          kind: "stopped",
+          code: 1,
+          signal: null,
+          interrupted: true,
+          processTreeStopped: true,
+        });
+        f.journal.agents.finishTurn(f.authority, failedTurn.identity, {
+          status: "failed",
+          result: null,
+          stopEvidence: "Failed launch stopped before provider binding",
+        });
+        f.journal.agents.retireStoppedAgent(f.authority, predecessor);
+      }
+      const replacement = f.journal.agents.reserveAgent(
+        f.authority,
+        {
+          ...f.workspace,
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          instructions: "Continue after explicit handoff",
+          contract: HerdrAgentSessionContractSchema.parse({
+            backend: "codex",
+            runtime: "herdr",
+            requested: settings,
+            effective: settings,
+          }),
+          confinementProfile: "epicd-isolated",
+          replaces: predecessor,
+          conversationTransferId: transfer!.transferId,
+        },
+        f.version(),
+      );
+      expect(replacement).toMatchObject({
+        agentId: f.agent.agentId,
+        agentGeneration: predecessor.agentGeneration + 1,
+        conversationContinuation: { sessionId, transferId: transfer!.transferId },
+        provider: null,
+      });
+      expect(
+        f.journal.agents.conversationTransfer(f.state.runId, transfer!.transferId).status,
+      ).toBe("claimed");
+      expect(() =>
+        f.journal.agents.bindProvider(f.authority, replacement, {
+          backend: "codex",
+          runtime: "herdr",
+          name: "continued",
+          paneId: "pane",
+          tabId: "tab",
+          terminalId: "terminal",
+          sessionId: "wrong-session",
+        }),
+      ).toThrow("exact stopped Codex session");
+      f.journal.agents.bindProvider(f.authority, replacement, {
+        backend: "codex",
+        runtime: "herdr",
+        name: "continued",
+        paneId: "pane",
+        tabId: "tab",
+        terminalId: "terminal",
+        sessionId,
+      });
+      expect(
+        f.journal.agents.conversationTransfer(f.state.runId, transfer!.transferId).status,
+      ).toBe("consumed");
+      expect(
+        f.journal.agents.pendingCoordinatorConversationTransfer(f.state.runId, "herdr"),
+      ).toBeNull();
+      const continuedTurn = f.journal.agents.prepareTurn(
+        f.authority,
+        replacement,
+        randomUUID(),
+        "Continue after runtime handoff",
+        { type: "object" },
+        f.version(),
+      );
+      const continuedLaunch = launches.reserve(
+        f.journal,
+        f.authority,
+        continuedTurn.identity,
+      ).manifest;
+      await launches.materialize(continuedLaunch, null);
+      expect(continuedLaunch.confinement).toMatchObject({
+        providerHome: transfer!.providerHome,
+        workspace: f.workspace.path,
+      });
+      expect(readFileSync(join(continuedLaunch.controlDirectory, "config.toml"), "utf8")).toBe(
+        codexConfinementConfig(continuedLaunch.confinement),
+      );
+      expect(readFileSync(join(transfer!.providerHome, "config.toml"), "utf8")).toBe(
+        codexConfinementConfig(sourceLaunch.confinement),
+      );
+      expect(continuedLaunch.confinement.scratch).not.toBe(sourceLaunch.confinement.scratch);
+      const native = {
+        sessionName: "fixture",
+        socketPath: "/fixture/socket",
+        socketIdentity: "fixture-server-incarnation",
+        workspaceId: "w-test",
+        tabId: "continued-tab",
+        paneId: "continued-pane",
+        terminalId: "continued-terminal",
+        name: "continued",
+      };
+      f.journal.agents.bindNativeLaunch(f.authority, continuedTurn.identity, native);
+      f.journal.agents.acknowledgePrompt(
+        f.authority,
+        continuedTurn.identity,
+        continuedTurn.promptDigest,
+        "Continued native prompt accepted",
+      );
+      expect(() =>
+        f.journal.agents.bindTurnProvider(f.authority, continuedTurn.identity, {
+          backend: "codex",
+          runtime: "herdr",
+          name: native.name,
+          paneId: native.paneId,
+          tabId: native.tabId,
+          terminalId: native.terminalId,
+          sessionId,
+        }),
+      ).not.toThrow();
+      const continuedStop = {
+        generation: continuedLaunch.generation,
+        stoppedAt: new Date().toISOString(),
+        kind: "stopped" as const,
+        code: 0,
+        signal: null,
+        interrupted: false,
+        processTreeStopped: true as const,
+      };
+      f.journal.agents.recordLaunchStop(f.authority, continuedTurn.identity, continuedStop);
+      f.journal.agents.finishTurn(f.authority, continuedTurn.identity, {
+        status: "completed",
+        result: { kind: "continued" },
+        stopEvidence: JSON.stringify(continuedStop),
+      });
+
+      f.pause();
+      f.journal.handoffRuntime(
+        f.authority,
+        f.version(),
+        { runtime: "sdk", executable: f.codex, herdr: null },
+        true,
+      );
+      const backTransfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+        f.state.runId,
+        "sdk",
+      )!;
+      f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+      const resumed = f.journal.agents.reserveAgent(
+        f.authority,
+        {
+          ...f.workspace,
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          instructions: "Continue the validated transfer lineage",
+          contract: SdkAgentSessionContractSchema.parse({
+            backend: "codex",
+            runtime: "sdk",
+            requested: settings,
+            effective: settings,
+          }),
+          confinementProfile: "epicd-isolated",
+          replaces: replacement,
+          conversationTransferId: backTransfer.transferId,
+        },
+        f.version(),
+      );
+      expect(() =>
+        f.journal.agents.bindProvider(f.authority, resumed, {
+          backend: "codex",
+          runtime: "sdk",
+          sessionId,
+        }),
+      ).not.toThrow();
+      const resumedTurn = f.journal.agents.prepareTurn(
+        f.authority,
+        resumed,
+        randomUUID(),
+        "Exercise the third generation's launch storage",
+        { type: "object" },
+        f.version(),
+      );
+      expect(() => launches.reserve(f.journal, f.authority, resumedTurn.identity)).not.toThrow();
+    },
+  );
+
+  it("releases a stopped unbound claim for a later retained replacement generation", async () => {
+    const f = await fixture();
+    const sessionId = randomUUID();
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId,
+    });
+    f.pause();
+    f.journal.handoffRuntime(f.authority, f.version(), f.target, true);
+    const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+      f.state.runId,
+      "herdr",
+    )!;
+    f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const contract = HerdrAgentSessionContractSchema.parse({
+      backend: "codex",
+      runtime: "herdr",
+      requested: settings,
+      effective: settings,
+    });
+    const firstTarget = f.journal.agents.reserveAgent(
+      f.authority,
+      {
+        ...f.workspace,
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        instructions: "First stopped claim attempt",
+        contract,
+        confinementProfile: "epicd-isolated",
+        replaces: f.agent,
+        conversationTransferId: transfer.transferId,
+      },
+      f.version(),
+    );
+    f.journal.agents.retireStoppedAgent(
+      f.authority,
+      firstTarget,
+      "Provider identity was never acquired",
+    );
+    expect(f.journal.agents.conversationTransfer(f.state.runId, transfer.transferId)).toMatchObject(
+      {
+        status: "pending",
+        targetAgentId: null,
+        targetAgentGeneration: null,
+        claimedAt: null,
+      },
+    );
+    const retry = f.journal.agents.reserveAgent(
+      f.authority,
+      {
+        ...f.workspace,
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        instructions: "Retry the same retained claim",
+        contract,
+        confinementProfile: "epicd-isolated",
+        replaces: firstTarget,
+        conversationTransferId: transfer.transferId,
+      },
+      f.version(),
+    );
+    expect(retry).toMatchObject({
+      agentId: f.agent.agentId,
+      agentGeneration: f.agent.agentGeneration + 2,
+      conversationContinuation: { transferId: transfer.transferId },
+    });
+  });
+
+  it.each(["providerHome", "workspaceId", "workspaceGeneration"] as const)(
+    "rejects a schema-valid transfer whose derived %s binding changed",
+    async (field) => {
+      const f = await fixture();
+      f.journal.agents.bindProvider(f.authority, f.agent, {
+        backend: "codex",
+        runtime: "sdk",
+        sessionId: randomUUID(),
+      });
+      f.pause();
+      f.journal.handoffRuntime(f.authority, f.version(), f.target, true);
+      const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+        f.state.runId,
+        "herdr",
+      )!;
+      const changed = structuredClone(transfer);
+      if (field === "providerHome") changed.providerHome = join(f.root, "redirected-provider");
+      else if (field === "workspaceId") changed.workspaceId = randomUUID();
+      else changed.workspaceGeneration += 1;
+      f.db
+        .prepare("UPDATE agent_conversation_transfers SET record_json = ? WHERE transfer_id = ?")
+        .run(JSON.stringify(changed), transfer.transferId);
+      expect(() =>
+        f.journal.agents.conversationTransfer(f.state.runId, transfer.transferId),
+      ).toThrow("derived transfer binding changed");
+    },
+  );
+
+  it("rejects a schema-valid target continuation that no longer matches its claimed transfer", async () => {
+    const f = await fixture();
+    const sessionId = randomUUID();
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId,
+    });
+    f.pause();
+    f.journal.handoffRuntime(f.authority, f.version(), f.target, true);
+    const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+      f.state.runId,
+      "herdr",
+    )!;
+    f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const target = f.journal.agents.reserveAgent(
+      f.authority,
+      {
+        ...f.workspace,
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        instructions: "Reject corrupted continuation metadata",
+        contract: HerdrAgentSessionContractSchema.parse({
+          backend: "codex",
+          runtime: "herdr",
+          requested: settings,
+          effective: settings,
+        }),
+        confinementProfile: "epicd-isolated",
+        replaces: f.agent,
+        conversationTransferId: transfer.transferId,
+      },
+      f.version(),
+    );
+    const changed = structuredClone(target);
+    changed.conversationContinuation!.providerHome = join(f.root, "redirected-provider");
+    f.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(JSON.stringify(changed), f.state.runId, target.agentId, target.agentGeneration);
+    expect(() =>
+      f.journal.agents.bindProvider(f.authority, target, {
+        backend: "codex",
+        runtime: "herdr",
+        name: "continued",
+        paneId: "pane",
+        tabId: "tab",
+        terminalId: "terminal",
+        sessionId,
+      }),
+    ).toThrow("exact durable transfer");
+  });
+
   it("uses the operator-console boundary for stopped native handoff without starting or answering work", async () => {
     const f = await fixture(),
       run = f.state.runId;
@@ -295,7 +1645,11 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
   it("retires a stopped conversation but preserves its exact successful turn and provider identity", async () => {
     const f = await fixture(),
       run = f.state.runId;
-    const provider = { runtime: "sdk" as const, sessionId: randomUUID() };
+    const provider = {
+      backend: "codex" as const,
+      runtime: "sdk" as const,
+      sessionId: randomUUID(),
+    };
     f.journal.agents.bindProvider(f.authority, f.agent, provider);
     const turn = f.journal.agents.prepareTurn(
       f.authority,
@@ -334,6 +1688,39 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
         f.version(),
       ),
     ).toThrow();
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const freshReplacement = f.journal.agents.reserveAgent(
+      f.authority,
+      {
+        ...f.workspace,
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        instructions: "Start fresh after the default handoff",
+        contract: HerdrAgentSessionContractSchema.parse({
+          backend: "codex",
+          runtime: "herdr",
+          requested: settings,
+          effective: settings,
+        }),
+        confinementProfile: "epicd-isolated",
+        replaces: f.agent,
+      },
+      f.version(),
+    );
+    expect(freshReplacement.conversationContinuation).toBeNull();
+    expect(() =>
+      f.journal.agents.bindProvider(f.authority, freshReplacement, {
+        backend: "codex",
+        runtime: "herdr",
+        name: "fresh",
+        paneId: "pane",
+        tabId: "tab",
+        terminalId: "terminal",
+        sessionId: provider.sessionId,
+      }),
+    ).toThrow("explicit runtime handoff");
   });
 
   it.each([

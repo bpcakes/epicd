@@ -25,6 +25,7 @@ import type {
   KernelAction,
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 import type { ValidationEvidence } from "../src/domain/delivery.js";
 import { journalRecordView } from "../src/adapters/journal-records.js";
 import { reconcileValidationIO } from "../src/adapters/validation-io.js";
@@ -69,10 +70,23 @@ async function fixture(policyInput: Partial<RepositoryPolicy> = {}) {
   stores.push(store);
   const initial = initialRun();
   initial.repoPath = source;
+  initial.runtimeConfiguration = {
+    commonDirectory: { path: join(source, ".git"), device: "1", inode: "1" },
+    executable: process.execPath,
+    trackerExecutable: process.execPath,
+    runtimeRoot: join(root, "runtime"),
+    workspaceRoot: join(root, "managed"),
+    accounts: fixtureAccounts(root),
+    turnTimeoutMs: 15_000,
+    herdr: null,
+  };
   const state = store.create(
     initial,
     RepositoryPolicySchema.parse({ schemaVersion: 1, requiredChecks: [check], ...policyInput }),
   );
+  const fixtureDatabase = new Database(path);
+  fixtureDatabase.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+  fixtureDatabase.close();
   const lease = store.acquireLease(state.runId);
   const authority: ControllerAuthority = {
     runId: state.runId,
@@ -94,6 +108,7 @@ async function fixture(policyInput: Partial<RepositoryPolicy> = {}) {
       instructions: "Implement the specified behavior",
       confinementProfile: "fixture-only",
       contract: SdkAgentSessionContractSchema.parse({
+        backend: "codex",
         runtime: "sdk",
         requested: settings,
         effective: settings,

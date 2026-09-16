@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
@@ -30,6 +31,7 @@ import {
 } from "../src/kernel/inspection.js";
 import { reconcileActions } from "../src/kernel/reconcile.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 
 const io = vi.hoisted(() => ({
   beforeOpen: null as ((path: string) => void) | null,
@@ -92,7 +94,20 @@ async function fixture(format: "sha1" | "sha256" = "sha1") {
   cleanup.push(() => store.close());
   const initial = initialRun();
   initial.repoPath = source;
+  initial.runtimeConfiguration = {
+    commonDirectory: { path: join(source, ".git"), device: "1", inode: "1" },
+    executable: process.execPath,
+    trackerExecutable: process.execPath,
+    runtimeRoot: join(root, "runtime"),
+    workspaceRoot: join(root, "managed"),
+    accounts: fixtureAccounts(root),
+    turnTimeoutMs: 15_000,
+    herdr: null,
+  };
   const state = store.create(initial, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
+  const fixtureDatabase = new Database(join(root, "state.sqlite3"));
+  fixtureDatabase.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+  fixtureDatabase.close();
   const lease = store.acquireLease(state.runId);
   const authority: ControllerAuthority = {
     runId: state.runId,
@@ -181,6 +196,7 @@ describe.skipIf(process.platform !== "linux")("kernel repository inspection", ()
         instructions: "Inspect the repository",
         confinementProfile: "test",
         contract: SdkAgentSessionContractSchema.parse({
+          backend: "codex",
           runtime: "sdk",
           requested: settings,
           effective: settings,
@@ -257,6 +273,7 @@ describe.skipIf(process.platform !== "linux")("kernel repository inspection", ()
         instructions: "Implement",
         confinementProfile: "test",
         contract: SdkAgentSessionContractSchema.parse({
+          backend: "codex",
           runtime: "sdk",
           requested: settings,
           effective: settings,

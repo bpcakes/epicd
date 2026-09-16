@@ -271,7 +271,7 @@ export class DeliveryJournal {
           "Candidate capture needs a stopped implementation workspace",
         );
       const agent = this.access.agents
-        .instances(authority.runId)
+        .operationalInstances(authority.runId)
         .find(
           (item) =>
             item.workspaceId === workspace.workspaceId &&
@@ -1141,6 +1141,12 @@ export class DeliveryJournal {
   ): boolean {
     const candidate = this.candidate(runId, identity);
     if (
+      this.access.agents
+        .recoveryIntegrity(runId)
+        .some((incident) => incident.state === "uncontained")
+    )
+      return false;
+    if (
       candidate.status !== "captured" ||
       this.latestCandidate(runId, candidate.taskId)?.candidateId !== candidate.candidateId ||
       this.latestPlan(runId, candidate.taskId)?.planId !== candidate.validationPlanId ||
@@ -1172,7 +1178,7 @@ export class DeliveryJournal {
       }
     }
     const agent = this.access.agents
-      .instances(runId)
+      .operationalInstances(runId)
       .find((item) => item.assignmentId === source.assignmentId);
     if (agent) {
       const assignment = this.access.agents.assignment(runId, agent.assignmentId);
@@ -1386,13 +1392,13 @@ export class DeliveryJournal {
   private latestSourceTurn(runId: string, assignmentId: string): string | null {
     return (
       this.access.agents
-        .turns(runId)
+        .operationalTurns(runId)
         .findLast((turn) => turn.identity.assignmentId === assignmentId)?.identity.turnId ?? null
     );
   }
   private taskWriters(runId: string, taskId: string | null) {
     const turns = this.access.agents
-      .turns(runId)
+      .operationalTurns(runId)
       .filter(
         (turn) =>
           (taskId === null || turn.prompt.assignment.taskId === taskId) &&

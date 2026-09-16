@@ -116,7 +116,7 @@ export class TrackerCommitJournal {
         return fail("A later tracker observation supersedes this export; request a fresh export");
       this.journal.tracker.exportBytes(authority.runId, exported.trackerOperationId);
       const activeWorkers = this.journal.agents
-        .turns(authority.runId)
+        .operationalTurns(authority.runId)
         .some((turn) => !turn.stopEvidence && turn.prompt.assignment.purpose !== "coordination");
       if (activeWorkers)
         return fail("Stop active workers before constructing a tracker-only descendant");

@@ -10,8 +10,9 @@ import {
 } from "../src/kernel/delivery-recovery.js";
 import { reconcileActions } from "../src/kernel/reconcile.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
-import { OrchestratorController, controlledDriver } from "../src/controller.js";
+import { OrchestratorController } from "../src/controller.js";
 import { runRepositoryIO } from "../dist/adapters/repository-io.js";
 import { closureFixture, publishVerified } from "./fixtures/tracker-closure.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
@@ -88,15 +89,9 @@ function cold(s: Setup) {
   s.newLease();
   const journal = s.reopen().orchestration;
   const manager = new WorkspaceManager(journal, join(s.root, "managed"));
-  const driver = new ControlledSdkRuntime(journal, {
-    root: join(s.root, "runtime"),
-    executable: join(s.root, "bin", "codex"),
-    authCachePath: null,
-    launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
-    turnTimeoutMs: 30000,
-  });
+  const dispatcher = new ControlledAgentDispatcher(journal);
   const kernel = new ActionKernel(journal);
-  registerDeliveryRecoveryCapabilities(kernel, manager, driver);
+  registerDeliveryRecoveryCapabilities(kernel, manager, dispatcher);
   journal.markInterruptedActions(s.authority);
   const decision = (action: KernelAction) => {
     const ticket = journal.beginDecision(
@@ -120,7 +115,7 @@ function cold(s: Setup) {
     const result = await kernel.execute(decision(action), s.authority);
     return result.status === "running" ? await kernel.operation(result.operationId)! : result;
   };
-  return { journal, manager, driver, kernel, decision, dispatch };
+  return { journal, manager, dispatcher, kernel, decision, dispatch };
 }
 function inspection(input: Awaited<ReturnType<Setup["dispatch"]>>) {
   const value = success(input);
@@ -200,7 +195,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
       expect(await targetResult).toMatchObject({ status: expectedStatus });
       const original = s.journal.action(run, running.actionId);
       const recovered = cold(s);
-      const reconcileDriver = vi.spyOn(recovered.driver, "reconcile");
+      const reconcileDriver = vi.spyOn(recovered.dispatcher, "reconcile");
       if (via === "model") {
         expect(
           inspection(
@@ -218,7 +213,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
             (await reconcileDeliveryAction(
               recovered.journal,
               recovered.manager,
-              recovered.driver,
+              recovered.dispatcher,
               s.authority,
               record,
             ))!,
@@ -282,7 +277,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
       const recovered = cold(s);
       const writes = vi.spyOn(recovered.manager, "writeCandidateCommit");
       const copies = vi.spyOn(recovered.manager, "create");
-      const turns = vi.spyOn(recovered.driver, "run");
+      const turns = vi.spyOn(recovered.dispatcher, "run");
       const beforeTurns = recovered.journal.agents.turns(run).length;
       const decision = recovered.decision({ kind: "reconcile_action", actionId: parent.actionId });
       const running = await recovered.kernel.execute(decision, s.authority);
@@ -359,7 +354,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
         (await reconcileDeliveryAction(
           recovered.journal,
           recovered.manager,
-          recovered.driver,
+          recovered.dispatcher,
           s.authority,
           record,
         ))!,
@@ -462,7 +457,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     const review = s.journal.reviews.records(run)[0]!;
     expect(s.journal.agents.turn(run, review.turnIdentity!).stopEvidence).toBeTruthy();
     const recovered = cold(s);
-    const turns = vi.spyOn(recovered.driver, "run");
+    const turns = vi.spyOn(recovered.dispatcher, "run");
     expect(
       inspection(await recovered.dispatch({ kind: "reconcile_action", actionId: lost.actionId }))
         .status,
@@ -716,36 +711,48 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
     let decisions = 0;
     const controller = new OrchestratorController(store, run, {
       repositoryIO: runRepositoryIO,
-      driver: (selected, state) => {
-        const actual = controlledDriver(selected, state);
-        return {
-          kind: actual.kind,
-          reconcile: actual.reconcile.bind(actual),
-          async run(authority, identity, signal) {
-            expect(selected.orchestration.action(run, parent.actionId)?.status).toBe("succeeded");
-            const prompt = selected.orchestration.agents.turn(run, identity).prompt.instructions;
-            const input = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1));
-            s.response({
-              explanation: "Bounded scripted recovery probe, not an autonomous model judgment",
-              evidenceIds: [],
-              request: {
-                schemaVersion: 1,
-                decisionId: input.ticket.decisionId,
-                observationCursor: input.ticket.observationCursor,
-                expectedControlVersion: input.ticket.expectedControlVersion,
-                action: {
-                  kind: "escalate",
-                  question: "Recovery probe finished; delivery is not claimed",
-                  reason: "judgment",
-                  evidenceIds: [],
-                },
-              },
+      dispatcher: (selected) =>
+        new ControlledAgentDispatcher(selected.orchestration, {
+          "codex:sdk": (journal, execution) => {
+            const actual = new ControlledSdkRuntime(journal, {
+              root: execution.runtimeRoot,
+              executable: execution.executable,
+              launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
+              turnTimeoutMs: execution.turnTimeoutMs,
             });
-            decisions++;
-            return actual.run(authority, identity, signal);
+            return {
+              backend: "codex" as const,
+              kind: "sdk" as const,
+              reconcile: actual.reconcile.bind(actual),
+              async run(authority, identity, signal) {
+                expect(selected.orchestration.action(run, parent.actionId)?.status).toBe(
+                  "succeeded",
+                );
+                const prompt = selected.orchestration.agents.turn(run, identity).prompt
+                  .instructions;
+                const input = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1));
+                s.response({
+                  explanation: "Bounded scripted recovery probe, not an autonomous model judgment",
+                  evidenceIds: [],
+                  request: {
+                    schemaVersion: 1,
+                    decisionId: input.ticket.decisionId,
+                    observationCursor: input.ticket.observationCursor,
+                    expectedControlVersion: input.ticket.expectedControlVersion,
+                    action: {
+                      kind: "escalate",
+                      question: "Recovery probe finished; delivery is not claimed",
+                      reason: "judgment",
+                      evidenceIds: [],
+                    },
+                  },
+                });
+                decisions++;
+                return actual.run(authority, identity, signal);
+              },
+            };
           },
-        };
-      },
+        }),
     });
     const status = await controller.run();
     expect(status.control.status).toBe("awaiting_user");
@@ -794,7 +801,7 @@ describe.skipIf(process.platform !== "linux")("model-requested and cold delivery
         (await reconcileDeliveryAction(
           second.journal,
           second.manager,
-          second.driver,
+          second.dispatcher,
           s.authority,
           record,
         ))!,

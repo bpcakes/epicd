@@ -19,6 +19,12 @@ const grant = { fixtureId: id, expiresAt: z.string().min(1).max(100), psqlPath: 
 export const OperatorRequestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("pause"), ...observed }),
   z.strictObject({
+    kind: z.literal("abandon_conversation"),
+    ...observed,
+    transferId: id,
+    reason: z.string().trim().min(1).max(4000),
+  }),
+  z.strictObject({
     kind: z.literal("respond"),
     ...observed,
     escalationId: id,
@@ -39,6 +45,7 @@ export const OperatorRequestSchema = z.discriminatedUnion("kind", [
     runtime: RuntimeKindSchema,
     codexPath: path.optional(),
     herdrPath: path.optional(),
+    retainCoordinatorSession: z.boolean().optional(),
   }),
 ]);
 export type OperatorRequest = z.infer<typeof OperatorRequestSchema>;
@@ -79,9 +86,29 @@ export class RunOperator {
   private async apply(request: OperatorRequest, signal?: AbortSignal): Promise<string> {
     const journal = this.store.orchestration;
     signal?.throwIfAborted();
-    if (journal.control(this.runId).controlVersion !== request.controlVersion)
+    // Abandonment owns its version check inside the fenced transaction, where
+    // an already-terminal transfer can acknowledge a lost response without mutation.
+    if (
+      request.kind !== "abandon_conversation" &&
+      journal.control(this.runId).controlVersion !== request.controlVersion
+    )
       throw new Error("Control changed; inspect the run before retrying");
     switch (request.kind) {
+      case "abandon_conversation": {
+        // Synchronous lease scope: no external I/O or model execution occurs.
+        const lease = this.store.acquireLease(this.runId);
+        try {
+          journal.abandonConversationTransfer(
+            { runId: this.runId, ownerToken: lease.ownerToken, leaseId: lease.leaseId },
+            request.controlVersion,
+            request.transferId,
+            request.reason,
+          );
+        } finally {
+          this.store.releaseLease(this.runId, lease.ownerToken);
+        }
+        return "Conversation transfer abandoned. Evidence and resources retained. Inspect status, resolve any pending question, then resume with a fresh conversation.";
+      }
       case "pause":
         journal.operatorControl(this.runId, request.controlVersion, { kind: "pause" });
         return "Pause recorded. External work is not considered stopped until its runtime receipt confirms it.";
@@ -134,10 +161,11 @@ export class RunOperator {
             controlVersion: request.controlVersion,
             ...(request.codexPath ? { codexPath: request.codexPath } : {}),
             ...(request.herdrPath ? { herdrPath: request.herdrPath } : {}),
+            ...(request.retainCoordinatorSession ? { retainCoordinatorSession: true } : {}),
           },
           signal,
         );
-        return `Runtime ${state.runtime} recorded. Stopped conversations are retired; evidence, memory, budgets and resources are retained. No model started and no pending question was answered. Inspect status, then resume this run.`;
+        return `Runtime ${state.runtime} recorded. ${request.retainCoordinatorSession ? "The stopped coordinator conversation is reserved for one replacement generation." : "Stopped conversations are retired."} Evidence, memory, budgets and resources are retained. No model started and no pending question was answered. Inspect status, then resume this run.`;
       }
     }
   }

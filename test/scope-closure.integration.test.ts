@@ -146,7 +146,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     const reopened = s.reopen();
     const controller = new OrchestratorController(reopened, run, {
       repositoryIO: runRepositoryIO,
-      driver: () => {
+      dispatcher: () => {
         throw new Error("Completed-run cleanup must not initialize a model");
       },
     });

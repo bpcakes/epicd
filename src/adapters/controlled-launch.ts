@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { OrchestrationJournal } from "./orchestration-journal.js";
 import type { ControllerAuthority, TurnIdentity } from "../domain/orchestration.js";
+import type { AgentInstance } from "../domain/agents.js";
 import {
   CodexLaunchSchema,
   type CodexLaunch,
   type CodexLaunchStop,
 } from "../domain/codex-launch.js";
-import { codexConfinementConfig, writeCodexConfinement } from "./codex-confinement.js";
+import { writeCodexConfinement } from "./codex-confinement.js";
 import {
   controlCodexLaunch,
   materializeCodexLauncher,
@@ -22,10 +23,39 @@ import { digestJson } from "../domain/repository-policy.js";
 export type ControlledLaunchOptions = {
   root: string;
   executable: string;
-  authCachePath: string | null;
   launcherEntrypoint?: string;
   turnTimeoutMs?: number;
 };
+
+export function providerHomeForAgent(agent: AgentInstance): string {
+  return (
+    agent.conversationContinuation?.providerHome ??
+    join(
+      agent.execution.runtimeRoot,
+      agent.runId,
+      `${agent.agentId}-${agent.agentGeneration}`,
+      "provider",
+    )
+  );
+}
+
+/** Validate the caller's adapter tuple before any launch reservation or I/O. */
+export function assertControlledExecution(
+  agent: AgentInstance,
+  options: ControlledLaunchOptions,
+  runtime: "sdk" | "herdr",
+): number {
+  const timeout = options.turnTimeoutMs ?? agent.execution.turnTimeoutMs;
+  if (
+    agent.contract.backend !== "codex" ||
+    agent.contract.runtime !== runtime ||
+    options.root !== agent.execution.runtimeRoot ||
+    options.executable !== agent.execution.executable ||
+    timeout !== agent.execution.turnTimeoutMs
+  )
+    throw new Error("Controlled adapter configuration differs from the recorded agent execution");
+  return timeout;
+}
 
 /** Shared process/storage ownership, not a delivery workflow or provider transport. */
 export class ControlledLaunches {
@@ -48,9 +78,10 @@ export class ControlledLaunches {
       throw new Error("Reconcile an existing launch instead of dispatching it again");
     const agent = journal.agents.instance(authority.runId, identity);
     const workspace = journal.agents.workspace(authority.runId, identity);
+    assertControlledExecution(agent, this.options, agent.contract.runtime);
     const packet = journal.reviews.packetForTurn(authority.runId, identity);
     const home = join(
-      this.options.root,
+      agent.execution.runtimeRoot,
       authority.runId,
       `${agent.agentId}-${agent.agentGeneration}`,
     );
@@ -60,13 +91,13 @@ export class ControlledLaunches {
         executable: this.options.executable,
         workspace: workspace.path,
         sourceMode: workspace.sourceMode === "immutable" ? "read-only" : "workspace-write",
-        providerHome: join(home, "provider"),
+        providerHome: providerHomeForAgent(agent),
         scratch: join(home, "scratch"),
         artifacts: join(home, "artifacts"),
       },
       model: agent.contract.effective.model,
       reasoningEffort: agent.contract.effective.reasoningEffort,
-      authCachePath: agent.accountBinding?.source.authCachePath ?? this.options.authCachePath,
+      authCachePath: agent.accountBinding?.source.authCachePath ?? null,
       ...(agent.accountBinding ? { accountBinding: agent.accountBinding } : {}),
       controlDirectory: join(home, "launches", identity.turnId),
       reviewPacket: packet === null ? null : reviewPacketBinding(packet),
@@ -95,13 +126,14 @@ export class ControlledLaunches {
       manifest.confinement.artifacts,
     ])
       await privateDirectory(path);
-    const config = join(manifest.confinement.providerHome, "config.toml");
+    // CODEX_HOME owns durable conversation state and is intentionally shared by
+    // an explicit continuation. Confinement policy is launch-owned: scratch and
+    // artifact paths change with the generation and must never be inferred from
+    // the first generation's persistent config.toml.
+    const providerConfig = join(manifest.confinement.providerHome, "config.toml");
     try {
-      if (
-        (await realpath(config)) !== config ||
-        (await readFile(config, "utf8")) !== codexConfinementConfig(manifest.confinement)
-      )
-        throw new Error("The private runtime profile changed");
+      if ((await realpath(providerConfig)) !== providerConfig)
+        throw new Error("The private provider configuration path changed");
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT")
         await writeCodexConfinement(manifest.confinement);

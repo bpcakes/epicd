@@ -10,6 +10,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -18,6 +19,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import { ControlledLaunches } from "../src/adapters/controlled-launch.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { registerWorkspaceDisposalCapabilities } from "../src/kernel/workspace-disposal.js";
 import { registerInspectionCapabilities } from "../src/kernel/inspection.js";
@@ -41,6 +43,7 @@ import type {
 } from "../src/domain/orchestration.js";
 import type { WorkspaceRecord } from "../src/domain/agents.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 import { git, success, target, fixture as reviewFixture } from "./fixtures/review.js";
 
 const cleanup: (() => void)[] = [];
@@ -49,7 +52,10 @@ afterEach(() => {
   for (const close of cleanup.splice(0).reverse()) close();
 });
 
-async function fixture(purpose: WorkspaceRecord["purpose"] = "diagnostic") {
+async function fixture(
+  purpose: WorkspaceRecord["purpose"] = "diagnostic",
+  runtime: "sdk" | "herdr" = "sdk",
+) {
   const root = mkdtempSync("/var/tmp/epicd-disposal-");
   const source = join(root, "source"),
     path = join(root, "state.sqlite3");
@@ -64,7 +70,29 @@ async function fixture(purpose: WorkspaceRecord["purpose"] = "diagnostic") {
     workspaceRoot = join(root, "workspaces");
   let store = new StateStore(path);
   const run = store.create(
-    { ...initialRun(), repoPath: source, epicBaseRevision: revision },
+    {
+      ...initialRun(),
+      repoPath: source,
+      epicBaseRevision: revision,
+      runtime,
+      runtimeConfiguration: {
+        commonDirectory: {
+          path: join(source, ".git"),
+          device: String(statSync(join(source, ".git")).dev),
+          inode: String(statSync(join(source, ".git")).ino),
+        },
+        executable: process.execPath,
+        trackerExecutable: process.execPath,
+        runtimeRoot: join(root, "runtime"),
+        workspaceRoot,
+        accounts: fixtureAccounts(root),
+        turnTimeoutMs: 30_000,
+        herdr:
+          runtime === "herdr"
+            ? { executable: process.execPath, sessionName: "fixture-only", workspaceId: "w1" }
+            : null,
+      },
+    },
     RepositoryPolicySchema.parse({ schemaVersion: 1 }),
   );
   const lease = store.acquireLease(run.runId);
@@ -79,15 +107,22 @@ async function fixture(purpose: WorkspaceRecord["purpose"] = "diagnostic") {
   const install = () => {
     registerWorkspaceDisposalCapabilities(kernel, manager);
     registerInspectionCapabilities(kernel, manager);
-    registerDeliveryRecoveryCapabilities(kernel, manager, {
-      kind: "sdk",
-      run: async () => {
-        throw new Error("No model transport in disposal fixture");
-      },
-      reconcile: async () => {
-        throw new Error("No model transport in disposal fixture");
-      },
-    });
+    registerDeliveryRecoveryCapabilities(
+      kernel,
+      manager,
+      new ControlledAgentDispatcher(journal, {
+        "codex:sdk": () => ({
+          backend: "codex",
+          kind: "sdk",
+          run: async () => {
+            throw new Error("No model transport in disposal fixture");
+          },
+          reconcile: async () => {
+            throw new Error("No model transport in disposal fixture");
+          },
+        }),
+      }),
+    );
   };
   install();
   const workspace = await manager.create(authority, source, revision, purpose);
@@ -133,6 +168,7 @@ async function fixture(purpose: WorkspaceRecord["purpose"] = "diagnostic") {
           ? SdkAgentSessionContractSchema
           : HerdrAgentSessionContractSchema
         ).parse({
+          backend: "codex",
           runtime,
           requested: settings,
           effective: settings,
@@ -235,7 +271,7 @@ describe.runIf(process.platform === "linux")("recoverable workspace disposal", (
   it.each(["stopped", "not_started"] as const)(
     "preserves native endpoint history and treats %s as distinct from host-shell stop",
     async (kind) => {
-      const f = await fixture(),
+      const f = await fixture("diagnostic", "herdr"),
         agent = f.reserveAgent("herdr");
       const prepared = f.journal.agents.prepareTurn(
         f.authority,
@@ -248,7 +284,6 @@ describe.runIf(process.platform === "linux")("recoverable workspace disposal", (
       const launches = new ControlledLaunches({
         root: join(f.root, "runtime"),
         executable: process.execPath,
-        authCachePath: null,
       });
       const { turn, manifest } = launches.reserve(f.journal, f.authority, prepared.identity);
       const endpoint = {

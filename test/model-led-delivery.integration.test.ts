@@ -4,8 +4,16 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../dist/adapters/store.js";
 import { createRun, resolveExecutable, selectedCodexExecutable } from "../dist/bootstrap.js";
-import { OrchestratorController, controlledDriver } from "../dist/controller.js";
-import { receiptProject, receiptFaultDriver, RECEIPT_FILES } from "./fixtures/receipt-incident.js";
+import { OrchestratorController } from "../dist/controller.js";
+import { ControlledAgentDispatcher } from "../dist/adapters/agent-dispatch.js";
+import { ControlledSdkRuntime } from "../dist/adapters/controlled-sdk.js";
+import { ControlledHerdrRuntime } from "../dist/adapters/controlled-herdr.js";
+import {
+  receiptProject,
+  receiptFaultDriver,
+  RECEIPT_FILES,
+  type ReceiptFaultState,
+} from "./fixtures/receipt-incident.js";
 import { buildBrowserBundle, browserProject } from "./fixtures/browser-incident.js";
 import {
   probeBrowserExecution,
@@ -271,19 +279,54 @@ describe.runIf(process.platform === "linux" && process.env.EPICD_LIVE_DELIVERY =
             );
           }, 30_000);
           let receiptIncident: ReturnType<typeof receiptFaultDriver> | null = null;
+          const receiptState: ReceiptFaultState = { fault: null };
           const result = await new OrchestratorController(
             store,
             run.runId,
             scenario === "receipts"
               ? {
-                  driver: (currentStore, state) => {
-                    receiptIncident = receiptFaultDriver(
-                      currentStore.orchestration,
-                      controlledDriver(currentStore, state),
-                      state.runtimeConfiguration!.workspaceRoot,
-                    );
-                    return receiptIncident.driver;
-                  },
+                  dispatcher: (currentStore) =>
+                    new ControlledAgentDispatcher(currentStore.orchestration, {
+                      "codex:sdk": (journal, execution) => {
+                        const actual = new ControlledSdkRuntime(journal, {
+                          root: execution.runtimeRoot,
+                          executable: execution.executable,
+                          launcherEntrypoint: join(
+                            process.cwd(),
+                            "dist/adapters/codex-launch-cli.js",
+                          ),
+                          turnTimeoutMs: execution.turnTimeoutMs,
+                        });
+                        const incident = receiptFaultDriver(
+                          journal,
+                          actual,
+                          currentStore.get(run.runId)!.runtimeConfiguration!.workspaceRoot,
+                          receiptState,
+                        );
+                        receiptIncident ??= incident;
+                        return incident.driver;
+                      },
+                      "codex:herdr": (journal, execution) => {
+                        if (!execution.herdr)
+                          throw new Error("Missing persisted Herdr execution endpoint");
+                        const actual = new ControlledHerdrRuntime(journal, {
+                          root: execution.runtimeRoot,
+                          executable: execution.executable,
+                          turnTimeoutMs: execution.turnTimeoutMs,
+                          herdrPath: execution.herdr.executable,
+                          sessionName: execution.herdr.sessionName,
+                          workspaceId: execution.herdr.workspaceId,
+                        });
+                        const incident = receiptFaultDriver(
+                          journal,
+                          actual,
+                          currentStore.get(run.runId)!.runtimeConfiguration!.workspaceRoot,
+                          receiptState,
+                        );
+                        receiptIncident ??= incident;
+                        return incident.driver;
+                      },
+                    }),
                 }
               : {},
           ).run(abort.signal);

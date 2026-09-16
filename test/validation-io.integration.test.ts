@@ -11,7 +11,7 @@ import { ActionKernel } from "../src/kernel/actions.js";
 import { registerDeliveryCapabilities } from "../src/kernel/delivery.js";
 import { registerDeliveryRecoveryCapabilities } from "../src/kernel/delivery-recovery.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
-import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { RequiredCheckSchema } from "../src/domain/repository-policy.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
 import { fixture, git, success, target } from "./fixtures/review.js";
@@ -225,16 +225,9 @@ describe.skipIf(process.platform !== "linux")("whole validation I/O recovery", (
       f.newLease();
       const journal = f.reopen().orchestration;
       const manager = new WorkspaceManager(journal, join(f.root, "managed"));
-      const driver = new ControlledSdkRuntime(journal, {
-        root: join(f.root, "runtime"),
-        executable: join(f.root, "bin/codex"),
-        authCachePath: null,
-        turnTimeoutMs: 30_000,
-        launcherEntrypoint: resolve("dist/adapters/codex-launch-cli.js"),
-      });
       kernel = new ActionKernel(journal);
       registerDeliveryCapabilities(kernel, manager);
-      registerDeliveryRecoveryCapabilities(kernel, manager, driver);
+      registerDeliveryRecoveryCapabilities(kernel, manager, new ControlledAgentDispatcher(journal));
       journal.markInterruptedActions(f.authority);
       const dispatch = async (action: KernelAction) => {
         const ticket = journal.beginDecision(

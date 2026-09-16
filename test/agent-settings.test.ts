@@ -3,6 +3,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { ActionKernel } from "../src/kernel/actions.js";
 import { registerSettingsCapabilities } from "../src/kernel/settings.js";
 import { registerAgentCapabilities } from "../src/kernel/agents.js";
@@ -14,6 +15,7 @@ import {
 } from "../src/domain/types.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -26,7 +28,23 @@ function fixture(allow = true, runtime: RuntimeKind = "sdk") {
   const store = new StateStore(path);
   cleanup.push(() => store.close());
   const run = store.create(
-    { ...initialRun(), runtime },
+    {
+      ...initialRun(),
+      runtime,
+      runtimeConfiguration: {
+        commonDirectory: { path: join(root, "repo", ".git"), device: "1", inode: "1" },
+        executable: process.execPath,
+        trackerExecutable: process.execPath,
+        runtimeRoot: join(root, "runtime"),
+        workspaceRoot: join(root, "workspaces"),
+        accounts: fixtureAccounts(root),
+        turnTimeoutMs: 30 * 60_000,
+        herdr:
+          runtime === "herdr"
+            ? { executable: process.execPath, sessionName: "owned", workspaceId: "w1" }
+            : null,
+      },
+    },
     RepositoryPolicySchema.parse({
       schemaVersion: 1,
       autonomousWorkerSettings: allow
@@ -35,10 +53,29 @@ function fixture(allow = true, runtime: RuntimeKind = "sdk") {
       coordinator: { reasoningEfforts: ["high", "xhigh"] },
     }),
   );
+  const fixtureDb = new Database(path);
+  fixtureDb.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(run.runId);
+  fixtureDb.close();
   const lease = store.acquireLease(run.runId);
   const authority = { runId: run.runId, leaseId: lease.leaseId, ownerToken: lease.ownerToken };
   const journal = store.orchestration;
   const kernel = new ActionKernel(journal);
+  const noProvider = (kind: RuntimeKind) => ({
+    backend: "codex" as const,
+    kind,
+    run: async () => {
+      throw new Error("Reservation must not start a provider");
+    },
+    reconcile: async () => {
+      throw new Error("Reservation must not control a provider");
+    },
+  });
+  const dispatcher = new ControlledAgentDispatcher(
+    journal,
+    runtime === "sdk"
+      ? { "codex:sdk": () => noProvider("sdk") }
+      : { "codex:herdr": () => noProvider("herdr") },
+  );
   registerSettingsCapabilities(kernel, store);
   const decision = (action: KernelAction) => {
     const ticket = journal.beginDecision(
@@ -58,7 +95,7 @@ function fixture(allow = true, runtime: RuntimeKind = "sdk") {
       },
     };
   };
-  return { root, path, store, run, authority, journal, kernel, decision };
+  return { root, path, store, run, authority, journal, kernel, dispatcher, decision };
 }
 const change: KernelAction = {
   kind: "change_agent_settings",
@@ -155,24 +192,13 @@ describe("policy-bound autonomous agent settings", () => {
       const contractFor = () => {
         const settings = resolveAgentRoleSettings(f.store.get(f.run.runId)!, "implementation");
         return AgentSessionContractSchema.parse({
+          backend: "codex",
           runtime,
           requested: settings,
           effective: settings,
         });
       };
-      registerAgentCapabilities(
-        f.kernel,
-        {
-          kind: runtime,
-          run: async () => {
-            throw new Error("Reservation must not start a provider");
-          },
-          reconcile: async () => {
-            throw new Error("Reservation must not control a provider");
-          },
-        },
-        contractFor,
-      );
+      registerAgentCapabilities(f.kernel, f.dispatcher, contractFor);
       const workspace = () => {
         const record = f.journal.agents.reserveWorkspace(
           f.authority,

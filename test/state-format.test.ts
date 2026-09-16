@@ -139,7 +139,7 @@ describe("hard-cut state format", () => {
     expect(reopened.get(run.runId)).toEqual(run);
     expect(reopened.orchestration.policy(run.runId).coordinator.model).toBe("gpt-6-astra");
     expect(db.prepare("SELECT * FROM runs").all()).toEqual(before);
-    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 43 }]);
+    expect(db.prepare("SELECT version FROM orchestration_schema").all()).toEqual([{ version: 48 }]);
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE name = 'diagnostic_artifacts'").get(),
     ).toBeDefined();
@@ -150,6 +150,8 @@ describe("hard-cut state format", () => {
     { label: "unmarked", versions: null },
     { label: "empty marker", versions: [] },
     { label: "older format", versions: [23] },
+    { label: "previous format without conversation abandonment", versions: [45] },
+    { label: "previous format without relational conversation claims", versions: [46] },
     { label: "previous format without durable repository I/O", versions: [26] },
     { label: "previous format without durable turn usage", versions: [27] },
     { label: "previous format without frozen observation windows", versions: [28] },
@@ -167,7 +169,9 @@ describe("hard-cut state format", () => {
     { label: "previous format without grouped workspace creation proof", versions: [40] },
     { label: "previous format without supervised publication inspection", versions: [41] },
     { label: "previous format without standalone inspection worker proof", versions: [42] },
-    { label: "newer format", versions: [44] },
+    { label: "previous format without exclusive conversation transfer", versions: [44] },
+    { label: "previous format without per-owner integrity revisions", versions: [47] },
+    { label: "newer format", versions: [49] },
     { label: "previous format without evidence-preserving retirement", versions: [25] },
     { label: "multiple format markers", versions: [26, 27] },
   ])("refuses $label without migration, backups or deletion", ({ versions }) => {

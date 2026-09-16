@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore } from "../src/adapters/store.js";
 import { ControlledLaunches } from "../src/adapters/controlled-launch.js";
+import { assertRuntimeHandoffReady } from "../src/adapters/runtime-handoff.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import type { NativeLaunchEndpoint } from "../src/domain/codex-launch.js";
 import { ActionKernel } from "../src/kernel/actions.js";
@@ -21,6 +22,7 @@ import type {
   OrchestratorDecision,
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 import {
   coordinatorConversationPressure,
   COORDINATOR_CONVERSATION_LIMITS,
@@ -35,16 +37,37 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-function fixture(maxWorkers = 4) {
+function fixture(maxWorkers = 4, runtime: "sdk" | "herdr" = "sdk") {
   const root = mkdtempSync(join(tmpdir(), "epicd-agent-journal-"));
   roots.push(root);
   const path = join(root, "state.sqlite3");
   const store = new StateStore(path);
   stores.push(store);
   const state = store.create(
-    initialRun(),
+    {
+      ...initialRun(),
+      runtime,
+      runtimeConfiguration: {
+        commonDirectory: { path: join(root, "repo", ".git"), device: "1", inode: "1" },
+        executable: process.execPath,
+        trackerExecutable: process.execPath,
+        runtimeRoot: join(root, "runtime"),
+        workspaceRoot: join(root, "workspaces"),
+        accounts: fixtureAccounts(root),
+        turnTimeoutMs: 30 * 60_000,
+        herdr:
+          runtime === "herdr"
+            ? { executable: process.execPath, sessionName: "owned", workspaceId: "w1" }
+            : null,
+      },
+    },
     RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { maxWorkers } }),
   );
+  // This journal fixture supplies execution/account state without a tracker graph;
+  // keep the historical component-only reservation setup independent of claims.
+  const fixtureDb = new Database(path);
+  fixtureDb.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+  fixtureDb.close();
   const lease = store.acquireLease(state.runId);
   const authority: ControllerAuthority = {
     runId: state.runId,
@@ -90,6 +113,7 @@ function fixture(maxWorkers = 4) {
           ? SdkAgentSessionContractSchema
           : HerdrAgentSessionContractSchema
         ).parse({
+          backend: "codex",
           runtime,
           requested: settings,
           effective: settings,
@@ -105,7 +129,11 @@ function fixture(maxWorkers = 4) {
     replaces?: AgentIdentity,
   ) {
     const agent = reserve(purpose, replaces);
-    return agents.bindProvider(authority, agent, { runtime: "sdk", sessionId: randomUUID() });
+    return agents.bindProvider(authority, agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId: randomUUID(),
+    });
   }
   const prepare = (
     agent: AgentIdentity,
@@ -128,7 +156,6 @@ function fixture(maxWorkers = 4) {
   const launches = new ControlledLaunches({
     root: join(root, "runtime"),
     executable: process.execPath,
-    authCachePath: null,
   });
   return {
     root,
@@ -185,7 +212,7 @@ describe("coordinator conversation accounting", () => {
   it.each(["sdk", "herdr"] as const)(
     "bounds %s history without relying on usage or agent prose",
     (runtime) => {
-      const f = fixture(),
+      const f = fixture(4, runtime),
         agent = f.reserve("specialist", undefined, runtime);
       const turn = f.prepare(agent);
       const turns = Array.from({ length: COORDINATOR_CONVERSATION_LIMITS.turns - 1 }, () =>
@@ -272,7 +299,11 @@ describe("coordinator conversation accounting", () => {
       prepared = f.prepare(agent);
     const { turn, manifest } = f.launches.reserve(f.journal, f.authority, prepared.identity);
     const sessionId = randomUUID();
-    f.agents.bindTurnProvider(f.authority, turn.identity, { runtime: "sdk", sessionId });
+    f.agents.bindTurnProvider(f.authority, turn.identity, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId,
+    });
     f.agents.acknowledgePrompt(
       f.authority,
       turn.identity,
@@ -530,7 +561,7 @@ describe("durable agent coordination", () => {
   ] as const)(
     "rejects an incomplete %s turn (%s) without forgetting its launch",
     (runtime, field) => {
-      const setup = fixture();
+      const setup = fixture(4, runtime);
       const agent = runtime === "herdr" ? setup.native() : setup.ready();
       const prepared = setup.prepare(agent);
       const { turn } = setup.launches.reserve(setup.journal, setup.authority, prepared.identity);
@@ -562,7 +593,7 @@ describe("durable agent coordination", () => {
   );
 
   it("binds a native terminal once before accepting provider identity and never reuses it for a later turn", () => {
-    const setup = fixture();
+    const setup = fixture(4, "herdr");
     const agent = setup.native();
     const prepared = setup.prepare(agent);
     const { turn, manifest } = setup.launches.reserve(
@@ -572,6 +603,7 @@ describe("durable agent coordination", () => {
     );
     const endpoint = nativeEndpoint(setup.root);
     const provider = {
+      backend: "codex" as const,
       runtime: "herdr" as const,
       name: endpoint.name,
       paneId: endpoint.paneId,
@@ -664,7 +696,7 @@ describe("durable agent coordination", () => {
   });
 
   it("excludes another native agent from the same terminal and fences old-controller endpoint binding", () => {
-    const setup = fixture();
+    const setup = fixture(4, "herdr");
     const first = setup.launches.reserve(
       setup.journal,
       setup.authority,
@@ -749,9 +781,19 @@ describe("durable agent coordination", () => {
     expect(inspected.latestResult.truncated).toBe(false);
   });
 
-  it("binds native identities monotonically without sharing a Codex session across runtimes", () => {
+  it("rejects concurrent or implicit Codex session sharing across runtimes", () => {
     const setup = fixture();
     const sdk = setup.ready("specialist");
+    const current = setup.store.get(setup.authority.runId)!;
+    const herdr = { executable: process.execPath, sessionName: "owned", workspaceId: "w1" };
+    setup.db.prepare("UPDATE runs SET state_json = ? WHERE run_id = ?").run(
+      JSON.stringify({
+        ...current,
+        runtime: "herdr",
+        runtimeConfiguration: { ...current.runtimeConfiguration!, herdr },
+      }),
+      setup.authority.runId,
+    );
     const ws = setup.workspace("review");
     const settings = { model: "review-model", reasoningEffort: "high" as const };
     const native = setup.agents.reserveAgent(
@@ -765,6 +807,7 @@ describe("durable agent coordination", () => {
         instructions: "Review independently",
         confinementProfile: "test-only",
         contract: HerdrAgentSessionContractSchema.parse({
+          backend: "codex",
           runtime: "herdr",
           requested: settings,
           effective: settings,
@@ -773,6 +816,7 @@ describe("durable agent coordination", () => {
       setup.version(),
     );
     const provider = {
+      backend: "codex" as const,
       runtime: "herdr" as const,
       name: "reviewer",
       paneId: "w1:p1",
@@ -781,31 +825,439 @@ describe("durable agent coordination", () => {
       sessionId: null,
     };
     setup.agents.bindProvider(setup.authority, native, provider);
+    const sharedSessionId = sdk.provider!.sessionId;
     expect(() =>
       setup.agents.bindProvider(setup.authority, native, {
         ...provider,
-        sessionId: sdk.provider!.sessionId,
+        sessionId: sharedSessionId,
       }),
     ).toThrow("already bound");
     expect(
       setup.agents.bindProvider(setup.authority, native, {
         ...provider,
         sessionId: "native-session",
-      }).provider?.sessionId,
-    ).toBe("native-session");
-    expect(() =>
-      setup.agents.bindProvider(setup.authority, native, {
-        ...provider,
-        sessionId: "other-session",
-      }),
-    ).toThrow("replaced in place");
+      }).provider,
+    ).toEqual({ ...provider, sessionId: "native-session" });
     expect(() =>
       setup.agents.bindProvider(setup.authority, native, {
         ...provider,
         terminalId: "other-terminal",
-        sessionId: "native-session",
+        sessionId: sharedSessionId,
       }),
     ).toThrow("replaced in place");
+  });
+
+  it("removes authority from a corrupt stopped owner without disabling healthy reservations", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const prepared = setup.prepare(owner);
+    const { manifest } = setup.launches.reserve(setup.journal, setup.authority, prepared.identity);
+    setup.agents.acknowledgePrompt(
+      setup.authority,
+      prepared.identity,
+      prepared.promptDigest,
+      "Fixture observed exact submitted turn",
+    );
+    const stop = {
+      generation: manifest.generation,
+      stoppedAt: new Date().toISOString(),
+      kind: "stopped" as const,
+      code: 0,
+      signal: null,
+      interrupted: false,
+      processTreeStopped: true as const,
+    };
+    setup.agents.recordLaunchStop(setup.authority, prepared.identity, stop);
+    expect(
+      setup.agents.finishTurn(setup.authority, prepared.identity, {
+        status: "completed",
+        result: { answer: "historical" },
+        stopEvidence: JSON.stringify(stop),
+      }).resultEligible,
+    ).toBe(true);
+
+    const raw = setup.db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .get(setup.authority.runId, owner.agentId, owner.agentGeneration) as {
+      record_json: string;
+    };
+    const corrupt = JSON.parse(raw.record_json);
+    corrupt.schemaVersion = 2;
+    delete corrupt.conversationContinuation;
+    setup.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(JSON.stringify(corrupt), setup.authority.runId, owner.agentId, owner.agentGeneration);
+
+    expect(() => setup.agents.instance(setup.authority.runId, owner)).toThrow();
+    expect(() => setup.agents.turns(setup.authority.runId)).toThrow();
+    expect(setup.agents.operationalInstances(setup.authority.runId)).toEqual([]);
+    expect(setup.agents.workspaceWasAssigned(setup.authority.runId, owner)).toBe(true);
+    expect(setup.agents.workspaceHasNonReleasedOwner(setup.authority.runId, owner)).toBe(true);
+    expect(setup.agents.assignmentIds(setup.authority.runId)).toContain(owner.assignmentId);
+    const assignment = setup.agents.assignment(setup.authority.runId, owner.assignmentId);
+    expect(() =>
+      setup.agents.reserveAgent(
+        setup.authority,
+        {
+          workspaceId: owner.workspaceId,
+          workspaceGeneration: owner.workspaceGeneration,
+          role: owner.role,
+          purpose: assignment.purpose,
+          taskId: assignment.taskId,
+          candidateId: assignment.candidateId,
+          instructions: "Never treat an unreadable owner as an available workspace",
+          contract: owner.contract,
+          confinementProfile: owner.confinementProfile,
+        },
+        setup.version(),
+      ),
+    ).toThrow("fresh workspace");
+    const malformedAssignment = structuredClone(assignment) as Partial<typeof assignment>;
+    delete malformedAssignment.purpose;
+    setup.db
+      .prepare("UPDATE agent_assignments SET record_json = ? WHERE assignment_id = ?")
+      .run(JSON.stringify(malformedAssignment), assignment.assignmentId);
+    expect(
+      setup.agents.agentHadPurpose(setup.authority.runId, owner.agentId, ["implementation"]),
+    ).toBe(true);
+    expect(setup.agents.recoveryIntegrity(setup.authority.runId)).toMatchObject([
+      {
+        identity: { agentId: owner.agentId, agentGeneration: owner.agentGeneration },
+        state: "isolated",
+        affectedTurnIds: [prepared.identity.turnId],
+      },
+    ]);
+    expect(setup.agents.operationalTurns(setup.authority.runId)[0]).toMatchObject({
+      result: { answer: "historical" },
+      resultEligible: false,
+    });
+    expect(setup.agents.operationalTurnEntries(setup.authority.runId)[0]).toMatchObject({
+      owner: { state: "isolated", role: "worker" },
+      turn: { identity: prepared.identity, resultEligible: false },
+    });
+    expect(setup.reserve("specialist")).toMatchObject({ status: "reserved" });
+  });
+
+  it("keeps a readable owner visible when damaged turn history makes it uncontained", () => {
+    const setup = fixture(),
+      run = setup.authority.runId;
+    const owner = setup.ready("specialist");
+    const stopped = setup.agents.cancelPreparedTurn(setup.authority, setup.prepare(owner).identity);
+    const damaged = structuredClone(stopped);
+    damaged.prompt.instructions = "Changed without updating the retained prompt digest";
+    setup.db
+      .prepare("UPDATE agent_turns SET record_json=? WHERE run_id=? AND turn_id=?")
+      .run(JSON.stringify(damaged), run, stopped.identity.turnId);
+
+    expect(setup.agents.ownershipAssessment(run, owner)).toMatchObject({
+      state: "uncontained",
+      incident: { ownerRecordReadable: true },
+      agent: { agentId: owner.agentId, agentGeneration: owner.agentGeneration },
+    });
+    expect(setup.agents.summaries(run)).toMatchObject({
+      unreadableInstances: 0,
+      uncontainedUnreadableOwners: 0,
+      uncontainedReadableOwners: 1,
+      instances: [
+        {
+          agentId: owner.agentId,
+          agentGeneration: owner.agentGeneration,
+          ownershipState: "uncontained",
+        },
+      ],
+    });
+  });
+
+  it("classifies inconsistent stopped history as uncontained while preserving unexpected read failures", () => {
+    const setup = fixture(),
+      run = setup.authority.runId;
+    const owner = setup.ready("specialist");
+    const prepared = setup.prepare(owner);
+    const stopped = setup.agents.cancelPreparedTurn(setup.authority, prepared.identity);
+    const damaged = { ...setup.agents.instance(run, owner), schemaVersion: 1 };
+    setup.db
+      .prepare(
+        "UPDATE agent_instances SET record_json=? WHERE run_id=? AND agent_id=? AND generation=?",
+      )
+      .run(JSON.stringify(damaged), run, owner.agentId, owner.agentGeneration);
+    expect(setup.agents.ownershipAssessment(run, owner).state).toBe("isolated");
+    const changed = structuredClone(stopped);
+    changed.prompt.instructions = "Changed without updating the retained prompt digest";
+    setup.db
+      .prepare("UPDATE agent_turns SET record_json=? WHERE run_id=? AND turn_id=?")
+      .run(JSON.stringify(changed), run, stopped.identity.turnId);
+    expect(setup.agents.ownershipAssessment(run, owner).state).toBe("uncontained");
+    expect(() => setup.agents.operationalTurns(run)).toThrow("stop cannot be proved");
+    const failure = vi.spyOn(setup.agents, "workspace").mockImplementation(() => {
+      throw new Error("Unexpected database failure");
+    });
+    try {
+      setup.db
+        .prepare(
+          "UPDATE workspaces SET record_json = record_json WHERE run_id = ? AND workspace_id = ? AND generation = ?",
+        )
+        .run(run, owner.workspaceId, owner.workspaceGeneration);
+      expect(() => setup.agents.ownershipAssessment(run, owner)).toThrow(
+        "Unexpected database failure",
+      );
+    } finally {
+      failure.mockRestore();
+    }
+  });
+
+  it("fails closed only for a corrupt owner whose submitted launch has no stop proof", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const turn = setup.prepare(owner);
+    setup.launches.reserve(setup.journal, setup.authority, turn.identity);
+
+    const row = setup.db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .get(setup.authority.runId, owner.agentId, owner.agentGeneration) as {
+      record_json: string;
+    };
+    const corrupt = JSON.parse(row.record_json);
+    corrupt.schemaVersion = 2;
+    delete corrupt.conversationContinuation;
+    setup.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(JSON.stringify(corrupt), setup.authority.runId, owner.agentId, owner.agentGeneration);
+
+    expect(setup.agents.recoveryIntegrity(setup.authority.runId)).toMatchObject([
+      {
+        identity: { agentId: owner.agentId, agentGeneration: owner.agentGeneration },
+        state: "uncontained",
+        affectedTurnIds: [turn.identity.turnId],
+      },
+    ]);
+    expect(() => setup.agents.operationalTurns(setup.authority.runId)).toThrow(
+      "stop cannot be proved",
+    );
+  });
+
+  it("settles a stopped launch from intrinsic proof after its owner becomes unreadable", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const message = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      owner,
+      randomUUID(),
+      "Preserve uncertain delivery while isolating the unreadable owner",
+    );
+    const prepared = setup.prepare(owner);
+    const { manifest } = setup.launches.reserve(setup.journal, setup.authority, prepared.identity);
+    const stop = {
+      generation: manifest.generation,
+      stoppedAt: new Date().toISOString(),
+      kind: "stopped" as const,
+      code: 1,
+      signal: null,
+      interrupted: true,
+      processTreeStopped: true as const,
+    };
+    setup.agents.recordLaunchStop(setup.authority, prepared.identity, stop);
+    const raw = setup.db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .get(setup.authority.runId, owner.agentId, owner.agentGeneration) as {
+      record_json: string;
+    };
+    const corrupt = JSON.parse(raw.record_json);
+    corrupt.schemaVersion = 2;
+    delete corrupt.conversationContinuation;
+    setup.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(JSON.stringify(corrupt), setup.authority.runId, owner.agentId, owner.agentGeneration);
+
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner).state).toBe("isolated");
+    expect(setup.agents.turnForRecovery(setup.authority.runId, prepared.identity)).toMatchObject({
+      turn: { identity: prepared.identity, stopEvidence: null },
+      ownerValidity: "not_required",
+    });
+    const settled = setup.agents.settleStoppedTurnWithoutOwner(setup.authority, prepared.identity);
+    expect(settled).toMatchObject({
+      status: "cancelled",
+      stopRequested: true,
+      stopEvidence: JSON.stringify(stop),
+      result: null,
+      resultEligible: false,
+    });
+    expect(setup.agents.workspace(setup.authority.runId, owner)).toMatchObject({
+      status: "quarantined",
+      activeTurnId: null,
+    });
+    expect(
+      setup.db
+        .prepare("SELECT record_json FROM agent_messages WHERE message_id = ?")
+        .get(message.messageId),
+    ).toMatchObject({ record_json: expect.stringContaining('"status":"indeterminate"') });
+    expect(setup.agents.recoveryIntegrity(setup.authority.runId)).toMatchObject([
+      { state: "isolated", affectedTurnIds: [prepared.identity.turnId] },
+    ]);
+  });
+
+  it("isolates an unreadable stopped owner and preserves its undelivered mailbox record", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const message = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      owner,
+      randomUUID(),
+      "Pending authority cannot disappear with its malformed owner",
+    );
+    const row = setup.db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .get(setup.authority.runId, owner.agentId, owner.agentGeneration) as {
+      record_json: string;
+    };
+    const corrupt = JSON.parse(row.record_json);
+    corrupt.schemaVersion = 2;
+    delete corrupt.conversationContinuation;
+    setup.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(JSON.stringify(corrupt), setup.authority.runId, owner.agentId, owner.agentGeneration);
+
+    expect(setup.agents.recoveryIntegrity(setup.authority.runId)).toMatchObject([
+      {
+        state: "isolated",
+        identity: { agentId: owner.agentId, agentGeneration: owner.agentGeneration },
+        ownerRecordReadable: false,
+        affectedMessageIds: [message.messageId],
+      },
+    ]);
+    expect(setup.agents.operationalTurns(setup.authority.runId)).toEqual([]);
+    expect(setup.agents.supersedeQueuedMessagesForIsolatedOwners(setup.authority)).toEqual([
+      message.messageId,
+    ]);
+    expect(
+      setup.db
+        .prepare("SELECT record_json FROM agent_messages WHERE message_id = ?")
+        .get(message.messageId),
+    ).toMatchObject({
+      record_json: expect.stringContaining('"status":"superseded"'),
+    });
+    expect(setup.agents.supersedeQueuedMessagesForIsolatedOwners(setup.authority)).toEqual([]);
+    expect(
+      setup.db
+        .prepare(
+          "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+        )
+        .get(setup.authority.runId, owner.agentId, owner.agentGeneration),
+    ).toEqual(
+      expect.objectContaining({
+        record_json: JSON.stringify(corrupt),
+      }),
+    );
+  });
+
+  it("keeps malformed mailbox records inside completion and handoff recovery", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const message = setup.agents.enqueueAgentMessage(
+      setup.authority,
+      owner,
+      randomUUID(),
+      "A damaged durable instruction must remain a recovery blocker",
+    );
+    const ownerRow = setup.db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .get(setup.authority.runId, owner.agentId, owner.agentGeneration) as {
+      record_json: string;
+    };
+    setup.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(
+        JSON.stringify({ ...JSON.parse(ownerRow.record_json), schemaVersion: 1 }),
+        setup.authority.runId,
+        owner.agentId,
+        owner.agentGeneration,
+      );
+    const messageRow = setup.db
+      .prepare("SELECT record_json FROM agent_messages WHERE message_id = ?")
+      .get(message.messageId) as { record_json: string };
+    const malformedMessage = JSON.parse(messageRow.record_json);
+    delete malformedMessage.content;
+    setup.db
+      .prepare("UPDATE agent_messages SET record_json = ? WHERE message_id = ?")
+      .run(JSON.stringify(malformedMessage), message.messageId);
+
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner)).toMatchObject({
+      state: "uncontained",
+      incident: {
+        ownerRecordReadable: false,
+        affectedMessageIds: [message.messageId],
+      },
+    });
+    expect(setup.agents.supersedeQueuedMessagesForIsolatedOwners(setup.authority)).toEqual([]);
+    expect(() =>
+      (
+        setup.journal as unknown as {
+          completionResources(runId: string, operationId: string): unknown;
+        }
+      ).completionResources(setup.authority.runId, "completion-check"),
+    ).toThrow("stop cannot be proved");
+    setup.journal.operatorControl(setup.authority.runId, setup.version(), { kind: "pause" });
+    expect(() =>
+      assertRuntimeHandoffReady(setup.journal, setup.authority, setup.version()),
+    ).toThrow("stop cannot be proved");
+  });
+
+  it("propagates unexpected owner lookup failures during prepared-turn recovery", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const turn = setup.prepare(owner);
+    const lookup = vi.spyOn(setup.agents, "instance").mockImplementation(() => {
+      throw new Error("Unexpected database failure");
+    });
+    try {
+      expect(() => setup.agents.turnForRecovery(setup.authority.runId, turn.identity)).toThrow(
+        "Unexpected database failure",
+      );
+    } finally {
+      lookup.mockRestore();
+    }
+  });
+
+  it("reports malformed turn history even when its owner record remains readable", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const turn = setup.agents.cancelPreparedTurn(setup.authority, setup.prepare(owner).identity);
+    const changed = structuredClone(turn);
+    changed.prompt.instructions = "Changed without updating the prompt digest";
+    setup.db
+      .prepare("UPDATE agent_turns SET record_json = ? WHERE run_id = ? AND turn_id = ?")
+      .run(JSON.stringify(changed), setup.authority.runId, turn.identity.turnId);
+
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner)).toMatchObject({
+      state: "uncontained",
+      incident: {
+        ownerRecordReadable: true,
+        affectedTurnIds: [turn.identity.turnId],
+      },
+    });
+    expect(setup.agents.operationalInstances(setup.authority.runId)).toEqual([]);
+    expect(() => setup.agents.operationalTurns(setup.authority.runId)).toThrow(
+      "stop cannot be proved",
+    );
   });
 
   it("cannot reserve two turns from different SQLite connections for one conversation", () => {
@@ -834,6 +1286,7 @@ describe("durable agent coordination", () => {
     expect(setup.agents.instance(setup.authority.runId, agent).provider).toBeNull();
     expect(() =>
       setup.agents.bindTurnProvider(setup.authority, turn.identity, {
+        backend: "codex",
         runtime: "sdk",
         sessionId: "thread",
       }),
@@ -843,17 +1296,19 @@ describe("durable agent coordination", () => {
       setup.agents.bindTurnProvider(
         setup.authority,
         { ...turn.identity, assignmentId: "wrong" },
-        { runtime: "sdk", sessionId: "thread" },
+        { backend: "codex", runtime: "sdk", sessionId: "thread" },
       ),
     ).toThrow("identity");
     expect(
       setup.agents.bindTurnProvider(setup.authority, turn.identity, {
+        backend: "codex",
         runtime: "sdk",
         sessionId: "thread",
       }),
     ).toMatchObject({ status: "busy", provider: { runtime: "sdk", sessionId: "thread" } });
     expect(() =>
       setup.agents.bindTurnProvider(setup.authority, turn.identity, {
+        backend: "codex",
         runtime: "sdk",
         sessionId: "different-thread",
       }),
@@ -1108,6 +1563,7 @@ describe("durable agent coordination", () => {
     );
     expect(() =>
       setup.agents.bindProvider(setup.authority, other, {
+        backend: "codex",
         runtime: "herdr",
         name: "agent",
         paneId: "p",
@@ -1115,7 +1571,7 @@ describe("durable agent coordination", () => {
         terminalId: "x",
         sessionId: null,
       }),
-    ).toThrow("pinned runtime");
+    ).toThrow("pinned agent contract");
     expect(() => setup.agents.workspace("another-run", agent)).toThrow("another run");
     expect(() =>
       setup.agents.instance(setup.authority.runId, { ...agent, agentGeneration: 9 }),
@@ -1134,6 +1590,7 @@ describe("durable agent coordination", () => {
       candidateId: "candidate",
       instructions: "Review",
       contract: SdkAgentSessionContractSchema.parse({
+        backend: "codex",
         runtime: "sdk",
         requested: settings,
         effective: settings,

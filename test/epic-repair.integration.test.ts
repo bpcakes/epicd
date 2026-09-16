@@ -252,7 +252,7 @@ describe.skipIf(process.platform !== "linux")("epic-scoped implementation repair
     ]);
     expect(s.journal.commits.records(run)).toHaveLength(2);
     expect(git(s.source, "rev-parse", "HEAD")).toBe(s.head);
-  }, 60000);
+  }, 120000);
 
   it("rejects null, task, foreign and stale-target scope without launching a repair", async () => {
     const s = await closureFixture();

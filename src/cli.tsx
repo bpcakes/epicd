@@ -526,10 +526,28 @@ export function createProgram() {
     });
   stateOption(
     program
+      .command("abandon-conversation <run-id> <transfer-id>")
+      .description("Abandon a stopped, unbound conversation transfer and allow a fresh session"),
+  )
+    .requiredOption("--control-version <number>", "version observed in status", versionNumber)
+    .requiredOption("--reason <text>", "reason retained in the run journal")
+    .action(
+      async (
+        runId: string,
+        transferId: string,
+        options: BaseOptions & { controlVersion: number; reason: string },
+      ) =>
+        operatorCommand(options, runId, {
+          kind: "abandon_conversation",
+          transferId,
+          reason: options.reason,
+          controlVersion: options.controlVersion,
+        }),
+    );
+  stateOption(
+    program
       .command("handoff <run-id>")
-      .description(
-        "Explicitly switch a stopped run's runtime without migrating conversations or starting work",
-      ),
+      .description("Explicitly switch a stopped run's runtime without starting work"),
   )
     .addOption(
       new Option("--runtime <runtime>", "target native runtime")
@@ -539,6 +557,10 @@ export function createProgram() {
     .requiredOption("--control-version <number>", "version observed in status", versionNumber)
     .option("--codex-path <path>", "selected native Codex executable")
     .option("--herdr-path <path>", "Herdr executable for read-only caller discovery")
+    .option(
+      "--retain-coordinator-session",
+      "reserve the stopped coordinator conversation for exactly one replacement generation",
+    )
     .action(
       async (
         runId: string,
@@ -547,6 +569,7 @@ export function createProgram() {
           controlVersion: number;
           codexPath?: string;
           herdrPath?: string;
+          retainCoordinatorSession?: boolean;
         },
       ) =>
         operatorCommand(options, runId, {
@@ -555,6 +578,7 @@ export function createProgram() {
           controlVersion: options.controlVersion,
           ...(options.codexPath ? { codexPath: options.codexPath } : {}),
           ...(options.herdrPath ? { herdrPath: options.herdrPath } : {}),
+          ...(options.retainCoordinatorSession ? { retainCoordinatorSession: true } : {}),
         }),
     );
   stateOption(

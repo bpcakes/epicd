@@ -61,11 +61,13 @@ export function journalRecordView(
       break;
     }
     case "agent_turn": {
-      const turn = required(
-        journal.agents.turns(runId).find((item) => item.identity.turnId === id),
+      const entry = required(
+        journal.agents
+          .operationalTurnEntries(runId)
+          .find((item) => item.turn.identity.turnId === id),
       );
-      const agent = journal.agents.instance(runId, turn.identity);
-      if (agent.role === "orchestrator")
+      const { turn, owner } = entry;
+      if (owner.role === "orchestrator")
         throw new JournalRecordError(
           "coordinator_record_private",
           "Coordinator reasoning and prompts are not worker evidence",
@@ -74,7 +76,8 @@ export function journalRecordView(
       record = {
         runId: turn.identity.runId,
         identity: turn.identity,
-        role: agent.role,
+        role: owner.state === "valid" ? owner.role : null,
+        ...(owner.state === "isolated" ? { ownerIntegrity: "isolated" } : {}),
         status: turn.status,
         result: turn.result,
         resultEligible: turn.resultEligible,

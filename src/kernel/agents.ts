@@ -9,10 +9,27 @@ import {
   REVIEW_OUTPUT_SCHEMA,
   type AgentRole,
   type AgentSessionContract,
+  type BackendKind,
   type RuntimeKind,
 } from "../domain/types.js";
+import { AgentDispatchUnavailable, type AgentDispatcher } from "../adapters/agent-dispatch.js";
+
+export function assertAgentDispatchReady(
+  dispatcher: AgentDispatcher,
+  contract: AgentSessionContract,
+): void {
+  try {
+    dispatcher.assertReady(contract);
+  } catch (error) {
+    if (error instanceof AgentDispatchUnavailable)
+      throw new CapabilityRejected(error.code, error.message);
+    throw error;
+  }
+}
 
 export interface ControlledAgentDriver {
+  /** Concrete adapters are Codex-only today; routing still records this identity explicitly. */
+  readonly backend: BackendKind;
   readonly kind: RuntimeKind;
   run(
     authority: ControllerAuthority,
@@ -25,7 +42,7 @@ export interface ControlledAgentDriver {
 /** The model chooses start/follow-up/interruption; these handlers only enforce and execute the request. */
 export function registerAgentCapabilities(
   kernel: ActionKernel,
-  driver: ControlledAgentDriver,
+  dispatcher: AgentDispatcher,
   contractFor: (role: Exclude<AgentRole, "orchestrator">) => AgentSessionContract,
 ) {
   const agents = kernel.journal.agents;
@@ -36,12 +53,11 @@ export function registerAgentCapabilities(
         "coordinator_owned",
         "Coordinator rotation belongs to the decision source; use change_agent_settings for a policy-approved effort change",
       );
-    if (old.contract.runtime !== driver.kind)
-      throw new CapabilityRejected("wrong_runtime", "Agent belongs to a different runtime");
+    dispatcher.assertSupported(old.contract);
     if (
       old.activeTurnId ||
       agents
-        .turns(authority.runId)
+        .operationalTurns(authority.runId)
         .some(
           (turn) =>
             turn.identity.agentId === old.agentId &&
@@ -72,11 +88,7 @@ export function registerAgentCapabilities(
         );
     }
     const contract = contractFor(old.role);
-    if (contract.runtime !== driver.kind)
-      throw new CapabilityRejected(
-        "wrong_runtime",
-        "Replacement settings belong to a different driver",
-      );
+    assertAgentDispatchReady(dispatcher, contract);
     // executeLocalAction owns one transaction: invalid reservation, audit failure
     // or result failure rolls back revocation and the new generation together.
     agents.revokeAgent(authority, old, action.reason);
@@ -117,8 +129,7 @@ export function registerAgentCapabilities(
         "coordinator_owned",
         "The decision source, not worker capabilities, owns coordinator turns",
       );
-    if (instance.contract.runtime !== driver.kind)
-      throw new CapabilityRejected("wrong_runtime", "Agent belongs to a different runtime");
+    assertAgentDispatchReady(dispatcher, instance.contract);
     const turn = agents.prepareTurn(
       context.authority,
       agent,
@@ -133,7 +144,7 @@ export function registerAgentCapabilities(
       undefined,
       reviewDiagnostic,
     );
-    const stopped = await driver.run(context.authority, turn.identity, context.signal);
+    const stopped = await dispatcher.run(context.authority, turn.identity, context.signal);
     if (!stopped.stopEvidence)
       throw new Error("Agent stop is unconfirmed; retain this operation for reconciliation");
     if (stopped.status !== "completed")
@@ -157,11 +168,7 @@ export function registerAgentCapabilities(
         "Use run_review to start independent candidate review",
       );
     const contract = contractFor(action.role);
-    if (contract.runtime !== driver.kind)
-      throw new CapabilityRejected(
-        "wrong_runtime",
-        "Selected contract belongs to a different driver",
-      );
+    assertAgentDispatchReady(dispatcher, contract);
     const agent = agents.reserveAgent(
       context.authority,
       { ...action, contract, confinementProfile: "epicd-isolated" },
@@ -171,11 +178,7 @@ export function registerAgentCapabilities(
   });
   kernel.registerExternal("start_specialist", async (context, action) => {
     const contract = contractFor(action.settingsRole);
-    if (contract.runtime !== driver.kind)
-      throw new CapabilityRejected(
-        "wrong_runtime",
-        "Selected contract belongs to a different driver",
-      );
+    assertAgentDispatchReady(dispatcher, contract);
     const agent = agents.reserveAgent(
       context.authority,
       {
@@ -196,7 +199,7 @@ export function registerAgentCapabilities(
   );
   kernel.registerExternal("interrupt_agent", async (context, action) => {
     const turn = agents
-      .turns(context.authority.runId)
+      .operationalTurns(context.authority.runId)
       .find((item) => item.identity.turnId === action.turnId);
     if (
       !turn ||
@@ -213,9 +216,8 @@ export function registerAgentCapabilities(
         "coordinator_owned",
         "Use operator control to interrupt the coordinator",
       );
-    if (instance.contract.runtime !== driver.kind)
-      throw new CapabilityRejected("wrong_runtime", "Agent belongs to a different runtime");
-    const stopped = await driver.reconcile(context.authority, turn.identity);
+    dispatcher.assertSupported(instance.contract);
+    const stopped = await dispatcher.reconcile(context.authority, turn.identity);
     if (!stopped.stopEvidence)
       throw new Error("Interruption requested but process stop remains unconfirmed");
     return { kind: "resource", resourceId: action.agentId, generation: action.agentGeneration };

@@ -70,6 +70,8 @@ export type NativeLaunchEndpoint = z.infer<typeof NativeLaunchEndpointSchema>;
 
 export const TurnLaunchSchema = z.strictObject({
   controllerLeaseId: z.string().min(1),
+  backend: z.literal("codex"),
+  runtime: z.enum(["sdk", "herdr"]),
   manifest: CodexLaunchSchema,
   manifestDigest: z.string().length(64),
   stop: CodexLaunchStopSchema.nullable(),

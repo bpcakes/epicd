@@ -16,13 +16,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RUN_OWNERSHIP_REF } from "../dist/adapters/publication-git.js";
 import { StateStore } from "../dist/adapters/store.js";
 import { ControlledSdkRuntime } from "../dist/adapters/controlled-sdk.js";
+import { ControlledLaunches } from "../dist/adapters/controlled-launch.js";
+import { ControlledAgentDispatcher } from "../dist/adapters/agent-dispatch.js";
+import type { AgentDispatcher } from "../dist/adapters/agent-dispatch.js";
 import { WorkspaceManager } from "../dist/adapters/workspaces.js";
 import * as commandLifetime from "../dist/adapters/command-lifetime.js";
-import { OrchestratorController, controlledDriver } from "../dist/controller.js";
+import { OrchestratorController } from "../dist/controller.js";
 import { ActionKernel } from "../dist/kernel/actions.js";
 import { buildOrchestratorContext } from "../dist/orchestrator/context.js";
 import { ControlledDecisionSource } from "../dist/orchestrator/sdk-source.js";
 import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
+import { SdkAgentSessionContractSchema } from "../src/domain/types.js";
 import type {
   ControllerAuthority,
   KernelAction,
@@ -33,6 +37,7 @@ import { initialRun } from "./fixtures/orchestration/state.js";
 const cleanup: (() => void)[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const close of cleanup.splice(0).reverse()) close();
 });
 const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -43,7 +48,7 @@ const question: KernelAction = {
   reason: "judgment",
   evidenceIds: [],
 };
-function fixture(identicalFailures = 3) {
+function fixture(identicalFailures = 3, runtime: "sdk" | "herdr" = "sdk") {
   const root = mkdtempSync("/var/tmp/epicd-controller-");
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   const source = join(root, "source");
@@ -65,6 +70,7 @@ function fixture(identicalFailures = 3) {
   const state = store.create(
     {
       ...initialRun(),
+      runtime,
       repoPath: source,
       epicBaseRevision: git("rev-parse", "HEAD"),
       runtimeConfiguration: {
@@ -79,7 +85,14 @@ function fixture(identicalFailures = 3) {
         workspaceRoot: join(root, "workspaces"),
         accounts: fixtureAccounts(),
         turnTimeoutMs: 15_000,
-        herdr: null,
+        herdr:
+          runtime === "herdr"
+            ? {
+                executable: "/usr/bin/false",
+                sessionName: "controller-test",
+                workspaceId: "controller-workspace",
+              }
+            : null,
       },
     },
     RepositoryPolicySchema.parse({ schemaVersion: 1, budgets: { identicalFailures } }),
@@ -89,56 +102,72 @@ function fixture(identicalFailures = 3) {
     ticket: Record<string, unknown>;
     context: { objective: unknown; capabilities: { kind: string; available: boolean }[] };
   }[] = [];
-  function driverFactory(actions: KernelAction[], hang = false, inputTokens = 10) {
+  function driverFactory(
+    actions: KernelAction[],
+    hang = false,
+    inputTokens = 10,
+  ): (selectedStore: StateStore) => AgentDispatcher {
     return (selectedStore: StateStore) => {
       const journal = selectedStore.orchestration;
-      const driver = controlledDriver(selectedStore, state);
-      expect(driver).toBeInstanceOf(ControlledSdkRuntime);
-      return {
-        kind: "sdk" as const,
-        async run(authority: ControllerAuthority, identity: TurnIdentity, signal?: AbortSignal) {
-          const key = `${identity.agentId}/${identity.agentGeneration}`;
-          const providerId = providerIds.get(key) ?? randomUUID();
-          providerIds.set(key, providerId);
-          const prompt = journal.agents.turn(authority.runId, identity).prompt.instructions;
-          const input = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1));
-          observed.push(input);
-          const action = actions.shift() ?? question;
-          const decision = {
-            explanation: "Scripted next action for bootstrap integration, not model reasoning",
-            evidenceIds: [],
-            request: {
-              schemaVersion: 1,
-              decisionId: input.ticket.decisionId,
-              observationCursor: input.ticket.observationCursor,
-              expectedControlVersion: input.ticket.expectedControlVersion,
-              action,
+      return new ControlledAgentDispatcher(journal, {
+        "codex:sdk": (dispatchJournal, execution) => {
+          const driver = new ControlledSdkRuntime(dispatchJournal, {
+            root: execution.runtimeRoot,
+            executable: execution.executable,
+            turnTimeoutMs: execution.turnTimeoutMs,
+          });
+          return {
+            backend: "codex" as const,
+            kind: "sdk" as const,
+            async run(
+              authority: ControllerAuthority,
+              identity: TurnIdentity,
+              signal?: AbortSignal,
+            ) {
+              const key = `${identity.agentId}/${identity.agentGeneration}`;
+              const providerId = providerIds.get(key) ?? randomUUID();
+              providerIds.set(key, providerId);
+              const prompt = journal.agents.turn(authority.runId, identity).prompt.instructions;
+              const input = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1));
+              observed.push(input);
+              const action = actions.shift() ?? question;
+              const decision = {
+                explanation: "Scripted next action for bootstrap integration, not model reasoning",
+                evidenceIds: [],
+                request: {
+                  schemaVersion: 1,
+                  decisionId: input.ticket.decisionId,
+                  observationCursor: input.ticket.observationCursor,
+                  expectedControlVersion: input.ticket.expectedControlVersion,
+                  action,
+                },
+              };
+              writeFileSync(
+                executable,
+                [
+                  "#!/bin/sh",
+                  "cat >/dev/null",
+                  emit({ type: "thread.started", thread_id: providerId }),
+                  emit({ type: "turn.started" }),
+                  ...(hang ? ["sleep 30"] : []),
+                  emit({
+                    type: "item.completed",
+                    item: { type: "agent_message", id: "decision", text: JSON.stringify(decision) },
+                  }),
+                  emit({
+                    type: "turn.completed",
+                    usage: { input_tokens: inputTokens, cached_input_tokens: 0, output_tokens: 5 },
+                  }),
+                  "",
+                ].join("\n"),
+                { mode: 0o700 },
+              );
+              return driver.run(authority, identity, signal);
             },
+            reconcile: driver.reconcile.bind(driver),
           };
-          writeFileSync(
-            executable,
-            [
-              "#!/bin/sh",
-              "cat >/dev/null",
-              emit({ type: "thread.started", thread_id: providerId }),
-              emit({ type: "turn.started" }),
-              ...(hang ? ["sleep 30"] : []),
-              emit({
-                type: "item.completed",
-                item: { type: "agent_message", id: "decision", text: JSON.stringify(decision) },
-              }),
-              emit({
-                type: "turn.completed",
-                usage: { input_tokens: inputTokens, cached_input_tokens: 0, output_tokens: 5 },
-              }),
-              "",
-            ].join("\n"),
-            { mode: 0o700 },
-          );
-          return driver.run(authority, identity, signal);
         },
-        reconcile: driver.reconcile.bind(driver),
-      };
+      });
     };
   }
   return { root, source, path, store, state, git, observed, driverFactory };
@@ -158,6 +187,512 @@ function coordinatorCreations(store: StateStore, run: string) {
 // Real SQLite, private Git copies, SDK event parsing and supervised process stop.
 // Decision content is scripted; green does not establish Astra's delivery competence.
 describe.runIf(process.platform === "linux")("single orchestrator controller bootstrap", () => {
+  it("rejects unavailable Herdr before creating a coordinator or spending decision budget", async () => {
+    const f = fixture(3, "herdr");
+    vi.stubEnv("HERDR_ENV", "0");
+
+    await expect(new OrchestratorController(f.store, f.state.runId).run()).rejects.toThrow(
+      "Controlled Herdr requires HERDR_ENV=1",
+    );
+
+    const journal = f.store.orchestration;
+    expect(journal.control(f.state.runId)).toMatchObject({
+      status: "awaiting_user",
+      decisionsUsed: 0,
+    });
+    expect(journal.pendingDecision(f.state.runId)).toBeNull();
+    expect(journal.agents.instances(f.state.runId)).toEqual([]);
+    expect(coordinatorCreations(f.store, f.state.runId)).toEqual([]);
+    expect(f.observed).toEqual([]);
+    expect(f.store.controllerLease(f.state.runId)).toBeNull();
+  });
+
+  it("allocates a fresh workspace after its sole controller-created coordinator becomes isolated", async () => {
+    const f = fixture(),
+      run = f.state.runId;
+    await new OrchestratorController(f.store, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
+    const original = f.store.orchestration.agents.instances(run)[0]!;
+    const db = new Database(f.path);
+    cleanup.push(() => db.close());
+    const damaged = { ...original, schemaVersion: 1 };
+    db.prepare(
+      "UPDATE agent_instances SET record_json = ? WHERE agent_id = ? AND generation = ?",
+    ).run(JSON.stringify(damaged), original.agentId, original.agentGeneration);
+    const reopened = new StateStore(f.path);
+    cleanup.push(() => reopened.close());
+    const journal = reopened.orchestration;
+    expect(journal.agents.ownershipAssessment(run, original).state).toBe("isolated");
+    journal.operatorControl(run, journal.control(run).controlVersion, {
+      kind: "respond",
+      escalationId: journal.pendingEscalation(run)!.escalationId,
+      message: "Continue the recovery regression",
+    });
+    await new OrchestratorController(reopened, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
+    const replacement = journal.agents.operationalInstances(run)[0]!;
+    expect(replacement.workspaceId).not.toBe(original.workspaceId);
+    expect(coordinatorCreations(reopened, run)).toHaveLength(2);
+    expect(f.observed).toHaveLength(2);
+    expect(journal.agents.ownershipAssessment(run, original).state).toBe("isolated");
+    // Reopening and resuming the healthy generation must reuse its existing slot.
+    journal.operatorControl(run, journal.control(run).controlVersion, {
+      kind: "respond",
+      escalationId: journal.pendingEscalation(run)!.escalationId,
+      message: "Continue the recovery regression",
+    });
+    await new OrchestratorController(reopened, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
+    expect(coordinatorCreations(reopened, run)).toHaveLength(2);
+  });
+
+  it("blocks new dispatch when a readable owner has malformed persisted turn history", async () => {
+    const f = fixture();
+    const run = f.state.runId;
+    await new OrchestratorController(f.store, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
+    const journal = f.store.orchestration;
+    const turn = journal.agents.turns(run)[0]!;
+    const changed = structuredClone(turn);
+    changed.prompt.instructions = "Changed without updating its durable prompt digest";
+    const db = new Database(f.path);
+    cleanup.push(() => db.close());
+    db.prepare("UPDATE agent_turns SET record_json = ? WHERE run_id = ? AND turn_id = ?").run(
+      JSON.stringify(changed),
+      run,
+      turn.identity.turnId,
+    );
+    journal.operatorControl(run, journal.control(run).controlVersion, {
+      kind: "respond",
+      escalationId: journal.pendingEscalation(run)!.escalationId,
+      message: "Attempt recovery without dispatching past damaged history",
+    });
+
+    await expect(
+      new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([]) }).run(),
+    ).rejects.toThrow("readable owner(s) with damaged turn history");
+    expect(f.observed).toHaveLength(1);
+    expect(journal.agents.recoveryIntegrity(run)).toMatchObject([
+      {
+        state: "uncontained",
+        ownerRecordReadable: true,
+        affectedTurnIds: [turn.identity.turnId],
+      },
+    ]);
+    expect(journal.observations(run)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "recovery.owner_uncontained",
+          summary: expect.stringContaining(
+            "persisted work whose integrity or stop cannot be proved",
+          ),
+        }),
+      ]),
+    );
+  });
+
+  it("reassesses containment after inspection recovery and deduplicates restart observations", async () => {
+    const f = fixture(),
+      run = f.state.runId,
+      journal = f.store.orchestration;
+    const lease = f.store.acquireLease(run);
+    const authority = { runId: run, ownerToken: lease.ownerToken, leaseId: lease.leaseId };
+    const workspace = journal.agents.reserveWorkspace(
+      authority,
+      {
+        root: join(f.root, "workspaces"),
+        purpose: "coordinator",
+        sourceMode: "immutable",
+        baselineRevision: f.state.epicBaseRevision,
+      },
+      journal.control(run).controlVersion,
+    );
+    mkdirSync(workspace.path, { recursive: true });
+    journal.agents.markWorkspaceReady(authority, workspace, "fixture");
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const agent = journal.agents.reserveAgent(
+      authority,
+      {
+        ...workspace,
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        instructions: "Stopped historical owner",
+        confinementProfile: "epicd-isolated",
+        contract: SdkAgentSessionContractSchema.parse({
+          backend: "codex",
+          runtime: "sdk",
+          requested: settings,
+          effective: settings,
+        }),
+      },
+      journal.control(run).controlVersion,
+    );
+    const message = journal.agents.enqueueAgentMessage(
+      authority,
+      agent,
+      randomUUID(),
+      "Supersede only after later recovery proves this owner isolated",
+    );
+    const inspection = journal.workspaceInspections.reserve(
+      authority,
+      join(f.root, "workspaces"),
+      workspace,
+      { kind: "materialization" },
+    );
+    const db = new Database(f.path);
+    cleanup.push(() => db.close());
+    const damaged = { ...agent, schemaVersion: 1 };
+    const raw = JSON.stringify(damaged);
+    db.prepare(
+      "UPDATE agent_instances SET record_json=? WHERE run_id=? AND agent_id=? AND generation=?",
+    ).run(raw, run, agent.agentId, agent.agentGeneration);
+    journal.operatorControl(run, journal.control(run).controlVersion, { kind: "pause" });
+    f.store.releaseLease(run, lease.ownerToken);
+    const finish = vi.spyOn(journal.workspaceInspections, "finish").mockImplementationOnce(() => {
+      throw new Error("Temporary settlement failure");
+    });
+    await expect(
+      new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([]) }).run(),
+    ).rejects.toThrow("unreadable agent owner");
+    finish.mockRestore();
+    expect(journal.agents.recoveryIntegrity(run)[0]?.state).toBe("uncontained");
+    const messageStatus = () =>
+      JSON.parse(
+        (
+          db
+            .prepare("SELECT record_json FROM agent_messages WHERE message_id = ?")
+            .get(message.messageId) as { record_json: string }
+        ).record_json,
+      ).status;
+    expect(messageStatus()).toBe("queued");
+    const restarted = new StateStore(f.path);
+    cleanup.push(() => restarted.close());
+    const status = await new OrchestratorController(restarted, run, {
+      dispatcher: f.driverFactory([]),
+    }).run();
+    expect(status.agents.isolatedUnreadableOwners).toBe(1);
+    expect(
+      restarted.orchestration.workspaceInspections.get(run, inspection.inspectionId).outcome,
+    ).toBe("failed");
+    expect(messageStatus()).toBe("superseded");
+    await new OrchestratorController(restarted, run, { dispatcher: f.driverFactory([]) }).run();
+    const incidents = restarted.orchestration
+      .observations(run)
+      .filter((entry) => entry.kind.startsWith("recovery.owner_"));
+    expect(incidents.map((entry) => entry.kind)).toEqual([
+      "recovery.owner_uncontained",
+      "recovery.owner_isolated",
+    ]);
+    expect(new Set(incidents.map((entry) => entry.sourceEventId)).size).toBe(2);
+    expect(
+      (
+        db
+          .prepare(
+            "SELECT record_json FROM agent_instances WHERE run_id=? AND agent_id=? AND generation=?",
+          )
+          .get(run, agent.agentId, agent.agentGeneration) as { record_json: string }
+      ).record_json,
+    ).toBe(raw);
+    restarted.orchestration.operatorControl(run, status.control.controlVersion, { kind: "resume" });
+    await new OrchestratorController(restarted, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
+    expect(f.observed).toHaveLength(1);
+    expect(restarted.orchestration.agents.operationalInstances(run)).toHaveLength(1);
+  });
+
+  it("recovers submitted turns from exact stop proof when owning agent records are malformed", async () => {
+    const f = fixture();
+    const run = f.state.runId;
+    const journal = f.store.orchestration;
+    const lease = f.store.acquireLease(run);
+    const authority: ControllerAuthority = {
+      runId: run,
+      ownerToken: lease.ownerToken,
+      leaseId: lease.leaseId,
+    };
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const contract = SdkAgentSessionContractSchema.parse({
+      backend: "codex",
+      runtime: "sdk",
+      requested: settings,
+      effective: settings,
+    });
+    const reserveAgent = (label: string) => {
+      const workspace = journal.agents.reserveWorkspace(
+        authority,
+        {
+          root: join(f.root, "workspaces"),
+          purpose: "coordinator",
+          sourceMode: "immutable",
+          baselineRevision: f.state.epicBaseRevision,
+        },
+        journal.control(run).controlVersion,
+      );
+      mkdirSync(workspace.path, { recursive: true, mode: 0o700 });
+      writeFileSync(join(workspace.path, `${label}.txt`), "fixture\n");
+      journal.agents.markWorkspaceReady(authority, workspace, `${label}-fingerprint`);
+      return journal.agents.reserveAgent(
+        authority,
+        {
+          ...workspace,
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          instructions: `Recovery fixture ${label}`,
+          confinementProfile: "epicd-isolated",
+          contract,
+        },
+        journal.control(run).controlVersion,
+      );
+    };
+    const validAgent = reserveAgent("valid");
+    const validPreparedAgent = reserveAgent("valid-prepared");
+    const corruptAgent = reserveAgent("corrupt");
+    const corruptStoppedAgent = reserveAgent("corrupt-stopped");
+    const validTurn = journal.agents.prepareTurn(
+      authority,
+      validAgent,
+      "recovery-valid-turn",
+      "Recover the valid submitted turn",
+      { type: "object" },
+      journal.control(run).controlVersion,
+    );
+    const launches = new ControlledLaunches({
+      root: validAgent.execution.runtimeRoot,
+      executable: validAgent.execution.executable,
+      turnTimeoutMs: validAgent.execution.turnTimeoutMs,
+    });
+    launches.reserve(journal, authority, validTurn.identity);
+    const validPreparedTurn = journal.agents.prepareTurn(
+      authority,
+      validPreparedAgent,
+      "recovery-valid-prepared-turn",
+      "Cancel the valid never-submitted turn through its readable owner",
+      { type: "object" },
+      journal.control(run).controlVersion,
+    );
+    const corruptTurn = journal.agents.prepareTurn(
+      authority,
+      corruptAgent,
+      "recovery-corrupt-turn",
+      "Preserve the malformed owner turn",
+      { type: "object" },
+      journal.control(run).controlVersion,
+    );
+    const corruptStoppedTurn = journal.agents.prepareTurn(
+      authority,
+      corruptStoppedAgent,
+      "recovery-corrupt-stopped-turn",
+      "Recover this turn from its exact persisted launch-stop receipt",
+      { type: "object" },
+      journal.control(run).controlVersion,
+    );
+    const corruptStoppedLaunch = launches.reserve(
+      journal,
+      authority,
+      corruptStoppedTurn.identity,
+    ).manifest;
+    const corruptStop = {
+      generation: corruptStoppedLaunch.generation,
+      stoppedAt: new Date().toISOString(),
+      kind: "stopped" as const,
+      code: 1,
+      signal: null,
+      interrupted: true,
+      processTreeStopped: true as const,
+    };
+    journal.agents.recordLaunchStop(authority, corruptStoppedTurn.identity, corruptStop);
+    const corruptWorkspace = journal.agents.workspace(run, corruptTurn.identity);
+    const corruptStoppedWorkspace = journal.agents.workspace(run, corruptStoppedTurn.identity);
+    const persistedCorruptAgent = journal.agents.instance(run, corruptTurn.identity);
+    const persistedCorruptStoppedAgent = journal.agents.instance(run, corruptStoppedTurn.identity);
+    const corruptRecord = structuredClone(persistedCorruptAgent) as Record<string, unknown>;
+    corruptRecord.schemaVersion = 1;
+    delete corruptRecord.execution;
+    const corruptAgentRecord = JSON.stringify(corruptRecord);
+    const corruptStoppedRecord = structuredClone(persistedCorruptStoppedAgent) as Record<
+      string,
+      unknown
+    >;
+    corruptStoppedRecord.schemaVersion = 1;
+    delete corruptStoppedRecord.execution;
+    const corruptStoppedAgentRecord = JSON.stringify(corruptStoppedRecord);
+    const corruptWorkspaceRecord = JSON.stringify(corruptWorkspace);
+    const database = new Database(f.path);
+    database
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(corruptAgentRecord, run, corruptAgent.agentId, corruptAgent.agentGeneration);
+    database
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(
+        corruptStoppedAgentRecord,
+        run,
+        corruptStoppedAgent.agentId,
+        corruptStoppedAgent.agentGeneration,
+      );
+    database.close();
+    expect(() => journal.agents.turns(run)).toThrow();
+    journal.operatorControl(run, journal.control(run).controlVersion, { kind: "pause" });
+    f.store.releaseLease(run, authority.ownerToken);
+
+    const reconciled: TurnIdentity[] = [];
+    let adapterRuns = 0;
+    let adapterReconciles = 0;
+    const dispatcher: AgentDispatcher = new ControlledAgentDispatcher(journal, {
+      "codex:sdk": (dispatchJournal, execution) => {
+        const driver = new ControlledSdkRuntime(dispatchJournal, {
+          root: execution.runtimeRoot,
+          executable: execution.executable,
+          turnTimeoutMs: execution.turnTimeoutMs,
+        });
+        return {
+          backend: driver.backend,
+          kind: driver.kind,
+          run: async (
+            dispatchAuthority: ControllerAuthority,
+            dispatchIdentity: TurnIdentity,
+            signal?: AbortSignal,
+          ) => {
+            adapterRuns += 1;
+            return driver.run(dispatchAuthority, dispatchIdentity, signal);
+          },
+          reconcile: async (recoveryAuthority: ControllerAuthority, identity: TurnIdentity) => {
+            adapterReconciles += 1;
+            reconciled.push(identity);
+            return driver.reconcile(recoveryAuthority, identity);
+          },
+        };
+      },
+    });
+    const status = await new OrchestratorController(f.store, run, {
+      dispatcher: () => dispatcher,
+    }).run();
+    expect(status).toMatchObject({
+      control: { status: "paused" },
+      agents: { unreadableInstances: 2 },
+    });
+
+    expect(reconciled).toEqual([validTurn.identity]);
+    expect(adapterReconciles).toBe(1);
+    expect(adapterRuns).toBe(0);
+    expect(
+      journal
+        .observations(run)
+        .filter(
+          (observation) =>
+            observation.kind === "recovery.owner_isolated" && observation.identity === null,
+        ),
+    ).toHaveLength(2);
+    const recoveredValid = journal.agents.turn(run, validTurn.identity);
+    expect(recoveredValid).toMatchObject({
+      status: "cancelled",
+      result: null,
+      resultEligible: false,
+      stopEvidence: expect.any(String),
+      launch: {
+        stop: {
+          kind: "not_started",
+          code: null,
+          signal: null,
+          interrupted: true,
+          processTreeStopped: true,
+        },
+      },
+    });
+    expect(recoveredValid.stopEvidence).toBe(JSON.stringify(recoveredValid.launch!.stop));
+    expect(journal.agents.instance(run, validTurn.identity)).toMatchObject({
+      status: "reserved",
+      provider: null,
+      activeTurnId: null,
+    });
+    const recoveredWorkspace = journal.agents.workspace(run, validTurn.identity);
+    expect(recoveredWorkspace).toMatchObject({ status: "ready", activeTurnId: null });
+    expect(journal.agents.activeWorkspaceOperation(run, recoveredWorkspace)).toBeNull();
+    expect(journal.agents.turn(run, validPreparedTurn.identity)).toMatchObject({
+      status: "cancelled",
+      stopEvidence: expect.any(String),
+    });
+    expect(journal.agents.instance(run, validPreparedTurn.identity)).toMatchObject({
+      status: "reserved",
+      activeTurnId: null,
+    });
+    expect(journal.agents.workspace(run, validPreparedTurn.identity)).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+    const after = new Database(f.path);
+    try {
+      const agentRow = after
+        .prepare(
+          "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+        )
+        .get(run, corruptAgent.agentId, corruptAgent.agentGeneration) as { record_json: string };
+      const workspaceRow = after
+        .prepare(
+          "SELECT record_json FROM workspaces WHERE run_id = ? AND workspace_id = ? AND generation = ?",
+        )
+        .get(run, corruptWorkspace.workspaceId, corruptWorkspace.workspaceGeneration) as {
+        record_json: string;
+      };
+      expect(JSON.parse(agentRow.record_json)).toMatchObject({
+        schemaVersion: 1,
+        status: "busy",
+        activeTurnId: corruptTurn.identity.turnId,
+      });
+      expect(JSON.parse(agentRow.record_json)).toEqual(JSON.parse(corruptAgentRecord));
+      expect(JSON.parse(workspaceRow.record_json)).toMatchObject({
+        status: "quarantined",
+        activeTurnId: null,
+      });
+      expect(JSON.parse(workspaceRow.record_json)).not.toEqual(JSON.parse(corruptWorkspaceRecord));
+      const stoppedAgentRow = after
+        .prepare(
+          "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+        )
+        .get(run, corruptStoppedAgent.agentId, corruptStoppedAgent.agentGeneration) as {
+        record_json: string;
+      };
+      const stoppedWorkspaceRow = after
+        .prepare(
+          "SELECT record_json FROM workspaces WHERE run_id = ? AND workspace_id = ? AND generation = ?",
+        )
+        .get(
+          run,
+          corruptStoppedWorkspace.workspaceId,
+          corruptStoppedWorkspace.workspaceGeneration,
+        ) as { record_json: string };
+      const stoppedTurnRow = after
+        .prepare("SELECT record_json FROM agent_turns WHERE run_id = ? AND turn_id = ?")
+        .get(run, corruptStoppedTurn.identity.turnId) as { record_json: string };
+      expect(stoppedAgentRow.record_json).toBe(corruptStoppedAgentRecord);
+      expect(JSON.parse(stoppedWorkspaceRow.record_json)).toMatchObject({
+        status: "quarantined",
+        activeTurnId: null,
+      });
+      expect(JSON.parse(stoppedTurnRow.record_json)).toMatchObject({
+        status: "cancelled",
+        stopRequested: true,
+        stopEvidence: JSON.stringify(corruptStop),
+        result: null,
+        resultEligible: false,
+      });
+    } finally {
+      after.close();
+    }
+  });
+
   it.each(["unbound", "stopped", "missing_receipt"] as const)(
     "recovers a %s orphaned bootstrap inspection after settings select a different coordinator",
     async (phase) => {
@@ -188,7 +723,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
         return record;
       });
       await expect(
-        new OrchestratorController(f.store, run, { driver: f.driverFactory([]) }).run(),
+        new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([]) }).run(),
       ).rejects.toThrow("Lost inspection settlement");
       vi.restoreAllMocks();
       const pending = journal.workspaceInspections.unsettled(run)[0]!;
@@ -217,7 +752,9 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
                   : recoverStop(intent),
               )
           : null;
-      await new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run();
+      await new OrchestratorController(f.store, run, {
+        dispatcher: f.driverFactory([question]),
+      }).run();
       expect(journal.agents.instances(run)).toHaveLength(1);
       expect(journal.agents.instances(run)[0]!.workspaceId).not.toBe(oldWorkspace.workspaceId);
       if (receiptFault) {
@@ -226,7 +763,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
         expect(journal.control(run).status).toBe("awaiting_user");
         receiptFault.mockRestore();
         // A later startup recovers orphaned reads even without resuming delivery.
-        await new OrchestratorController(f.store, run, { driver: f.driverFactory([]) }).run();
+        await new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([]) }).run();
         expect(journal.control(run).status).toBe("awaiting_user");
         expect(journal.agents.instances(run)).toHaveLength(1);
       }
@@ -257,7 +794,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     );
     try {
       await expect(
-        new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+        new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([question]) }).run(),
       ).resolves.toMatchObject({ control: { status: "awaiting_user" } });
       const copies = coordinatorCreations(f.store, run);
       expect(copies).toHaveLength(2);
@@ -306,7 +843,9 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       );
       try {
         await expect(
-          new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+          new OrchestratorController(f.store, run, {
+            dispatcher: f.driverFactory([question]),
+          }).run(),
         ).rejects.toThrow("attempt budget exhausted");
         const copies = coordinatorCreations(f.store, run);
         expect(copies).toHaveLength(journal.policy(run).budgets.identicalFailures);
@@ -324,7 +863,9 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
         const reopened = new StateStore(f.path);
         cleanup.push(() => reopened.close());
         await expect(
-          new OrchestratorController(reopened, run, { driver: f.driverFactory([question]) }).run(),
+          new OrchestratorController(reopened, run, {
+            dispatcher: f.driverFactory([question]),
+          }).run(),
         ).rejects.toThrow("attempt budget exhausted");
         expect(coordinatorCreations(f.store, run)).toEqual(copies);
         expect(journal.agents.instances(run)).toEqual([]);
@@ -350,7 +891,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
         return creation ? Promise.resolve(null) : recover(execution);
       });
     await expect(
-      new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+      new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([question]) }).run(),
     ).rejects.toThrow("no independent stop receipt");
     const copies = coordinatorCreations(f.store, run);
     expect(copies).toHaveLength(1);
@@ -375,7 +916,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     const reopened = new StateStore(f.path);
     cleanup.push(() => reopened.close());
     await expect(
-      new OrchestratorController(reopened, run, { driver: f.driverFactory([question]) }).run(),
+      new OrchestratorController(reopened, run, { dispatcher: f.driverFactory([question]) }).run(),
     ).resolves.toMatchObject({ control: { status: "awaiting_user" } });
     expect(coordinatorCreations(f.store, run)).toHaveLength(1);
     expect(journal.workspaceCreations.get(run, original.creationId)).toMatchObject({
@@ -402,7 +943,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
           throw new Error("Lost coordinator creation acknowledgement");
         });
       const running = new OrchestratorController(f.store, run, {
-        driver: f.driverFactory([question]),
+        dispatcher: f.driverFactory([question]),
       }).run();
       if (changed) await expect(running).rejects.toThrow("incomplete");
       else await expect(running).resolves.toMatchObject({ control: { status: "awaiting_user" } });
@@ -447,7 +988,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
         });
       try {
         const running = new OrchestratorController(f.store, run, {
-          driver: f.driverFactory([question]),
+          dispatcher: f.driverFactory([question]),
         }).run(signal.signal);
         if (intervention === "abort")
           await expect(running).resolves.toMatchObject({ control: { status: "paused" } });
@@ -477,7 +1018,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       .spyOn(WorkspaceManager.prototype, "create")
       .mockRejectedValueOnce(new Error("No workspace was admitted"));
     await expect(
-      new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run(),
+      new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([question]) }).run(),
     ).rejects.toThrow("No workspace was admitted");
     expect(fault).toHaveBeenCalledOnce();
     expect(f.store.orchestration.agents.workspaces(run)).toEqual([]);
@@ -489,7 +1030,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     const f = fixture(),
       run = f.state.runId;
     await new OrchestratorController(f.store, run, {
-      driver: f.driverFactory([
+      dispatcher: f.driverFactory([
         {
           kind: "record_memory",
           entry: {
@@ -533,7 +1074,9 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       escalationId: pending.escalationId,
       message: "Continue the same epic after runtime handoff",
     });
-    await new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run();
+    await new OrchestratorController(f.store, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
     const agents = journal.agents.instances(run);
     expect(agents).toHaveLength(2);
     const fresh = agents.find((agent) => agent.agentId !== prior.agentId)!;
@@ -557,7 +1100,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     const f = fixture();
     const baseline = f.git("rev-parse", "HEAD");
     const controller = new OrchestratorController(f.store, f.state.runId, {
-      driver: f.driverFactory([{ kind: "inspect_run" }, question]),
+      dispatcher: f.driverFactory([{ kind: "inspect_run" }, question]),
     });
     const status = await controller.run();
     expect(status.control.status).toBe("awaiting_user");
@@ -606,7 +1149,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
   it("reopens the same coordinator conversation after a correlated operator response", async () => {
     const f = fixture();
     await new OrchestratorController(f.store, f.state.runId, {
-      driver: f.driverFactory([question]),
+      dispatcher: f.driverFactory([question]),
     }).run();
     const first = f.store.orchestration.agents.instances(f.state.runId)[0]!;
     const escalation = f.store.orchestration.pendingEscalation(f.state.runId)!;
@@ -622,7 +1165,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       },
     );
     await new OrchestratorController(second, f.state.runId, {
-      driver: f.driverFactory([{ kind: "inspect_run" }, question]),
+      dispatcher: f.driverFactory([{ kind: "inspect_run" }, question]),
     }).run();
     const agents = second.orchestration.agents.instances(f.state.runId);
     expect(agents).toHaveLength(1);
@@ -717,7 +1260,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       expect(result?.status).toBe("indeterminate");
       f.store.releaseLease(f.state.runId, authority.ownerToken);
       await new OrchestratorController(f.store, f.state.runId, {
-        driver: f.driverFactory([question]),
+        dispatcher: f.driverFactory([question]),
       }).run();
       expect(journal.action(f.state.runId, pending.actionId)?.status).toBe("failed");
       expect(journal.fixtures.creations(f.state.runId)).toEqual([]);
@@ -727,7 +1270,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
   it("pauses a live coordinator and waits for its supervised stop before releasing ownership", async () => {
     const f = fixture();
     const controller = new OrchestratorController(f.store, f.state.runId, {
-      driver: f.driverFactory([question], true),
+      dispatcher: f.driverFactory([question], true),
     });
     const pending = controller.run();
     await expect
@@ -755,7 +1298,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
   it("changes coordinator effort through a journaled capability and cold-starts a new conversation without operator restart", async () => {
     const f = fixture();
     await new OrchestratorController(f.store, f.state.runId, {
-      driver: f.driverFactory([
+      dispatcher: f.driverFactory([
         {
           kind: "record_memory",
           entry: {
@@ -805,7 +1348,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     const f = fixture(),
       run = f.state.runId;
     await new OrchestratorController(f.store, run, {
-      driver: f.driverFactory(
+      dispatcher: f.driverFactory(
         [
           {
             kind: "record_memory",
@@ -843,7 +1386,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       message: "Continue the bounded inspection",
     });
     await new OrchestratorController(reopened, run, {
-      driver: f.driverFactory([{ kind: "inspect_run" }, question]),
+      dispatcher: f.driverFactory([{ kind: "inspect_run" }, question]),
     }).run();
     const agents = journal.agents.instances(run);
     expect(agents).toHaveLength(3);
@@ -880,7 +1423,9 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
   it("reconciles a stopped coordinator result before rollover instead of invalidating its frozen ticket", async () => {
     const f = fixture(),
       run = f.state.runId;
-    await new OrchestratorController(f.store, run, { driver: f.driverFactory([question]) }).run();
+    await new OrchestratorController(f.store, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
     const journal = f.store.orchestration;
     journal.operatorControl(run, journal.control(run).controlVersion, {
       kind: "respond",
@@ -911,7 +1456,9 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     f.store.releaseLease(run, authority.ownerToken);
     const reopened = new StateStore(f.path);
     cleanup.push(() => reopened.close());
-    await new OrchestratorController(reopened, run, { driver: f.driverFactory([question]) }).run();
+    await new OrchestratorController(reopened, run, {
+      dispatcher: f.driverFactory([question]),
+    }).run();
     const resumed = reopened.orchestration;
     expect(
       resumed.actions(run).filter((action) => action.request.decisionId === ticket.decisionId),
@@ -930,7 +1477,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     const lease = f.store.acquireLease(f.state.runId);
     let invoked = false;
     const controller = new OrchestratorController(f.store, f.state.runId, {
-      driver: () => {
+      dispatcher: () => {
         invoked = true;
         throw new Error("unexpected");
       },
@@ -946,7 +1493,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     async (runtime) => {
       const f = fixture();
       await new OrchestratorController(f.store, f.state.runId, {
-        driver: f.driverFactory([question]),
+        dispatcher: f.driverFactory([question]),
       }).run();
       expect(f.store.controllerLease(f.state.runId)).toBeNull();
       const other = new StateStore(join(f.root, "other.sqlite3"));
@@ -972,7 +1519,7 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       );
       let invoked = false;
       const controller = new OrchestratorController(other, next.runId, {
-        driver: () => {
+        dispatcher: () => {
           invoked = true;
           throw new Error("Unexpected runtime");
         },
@@ -1008,10 +1555,12 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
       },
     ]);
     const controller = new OrchestratorController(f.store, f.state.runId, {
-      driver: (store) => {
+      dispatcher: (store) => {
         const actual = factory(store);
         return {
-          ...actual,
+          assertSupported: actual.assertSupported.bind(actual),
+          assertReady: actual.assertReady.bind(actual),
+          reconcile: actual.reconcile.bind(actual),
           async run(...args) {
             const result = await actual.run(...args);
             f.git("update-ref", RUN_OWNERSHIP_REF, f.state.epicBaseRevision);

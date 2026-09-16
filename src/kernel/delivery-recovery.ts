@@ -8,7 +8,7 @@ import {
 import { digestJson } from "../domain/repository-policy.js";
 import { redactSensitiveText } from "../util/redact.js";
 import type { ActionKernel } from "./actions.js";
-import type { ControlledAgentDriver } from "./agents.js";
+import type { AgentDispatcher } from "../adapters/agent-dispatch.js";
 import { reconcileCommit } from "./commits.js";
 import { reconcileReview } from "./reviews.js";
 import { CapabilityRejected } from "./guards.js";
@@ -42,7 +42,7 @@ const resource = (resourceId: string, generation: number): RecoveryObservation =
 export function registerDeliveryRecoveryCapabilities(
   kernel: ActionKernel,
   workspaces: WorkspaceManager,
-  driver: ControlledAgentDriver,
+  dispatcher: AgentDispatcher,
 ) {
   kernel.registerExternal("reconcile_action", async ({ authority, signal }, request) => {
     const parent = kernel.journal.action(authority.runId, request.actionId);
@@ -61,7 +61,7 @@ export function registerDeliveryRecoveryCapabilities(
       const outcome = await reconcileDeliveryAction(
         kernel.journal,
         workspaces,
-        driver,
+        dispatcher,
         authority,
         parent,
         signal,
@@ -106,7 +106,7 @@ export function registerDeliveryRecoveryCapabilities(
 export async function reconcileDeliveryAction(
   journal: OrchestrationJournal,
   workspaces: WorkspaceManager,
-  driver: ControlledAgentDriver,
+  dispatcher: AgentDispatcher,
   authority: ControllerAuthority,
   input: ActionRecord,
   signal?: AbortSignal,
@@ -184,7 +184,7 @@ export async function reconcileDeliveryAction(
         .records(run)
         .find((entry) => entry.operationId === record.operationId);
       if (!intent) return failed("No review admission exists; no independent turn was authorized");
-      const review = await reconcileReview(journal, authority, intent, driver);
+      const review = await reconcileReview(journal, authority, intent, dispatcher);
       return review.failure === null &&
         review.status === "finished" &&
         review.sourceIntact &&

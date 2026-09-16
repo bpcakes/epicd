@@ -30,6 +30,7 @@ import type {
   ActionResult,
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 
 const roots: string[] = [],
   stores: StateStore[] = [];
@@ -151,6 +152,16 @@ else: sys.exit('unsupported')
   stores.push(store);
   const run = initialRun();
   run.repoPath = repo;
+  run.runtimeConfiguration = {
+    commonDirectory: { path: join(repo, ".git"), device: "1", inode: "1" },
+    executable: process.execPath,
+    trackerExecutable: executable,
+    runtimeRoot: join(root, "runtime"),
+    workspaceRoot: join(root, "workspaces"),
+    accounts: fixtureAccounts(root),
+    turnTimeoutMs: 15_000,
+    herdr: null,
+  };
   store.create(run, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
   let lease = store.acquireLease(run.runId);
   const authority = (): ControllerAuthority => ({
@@ -822,6 +833,7 @@ describe.skipIf(process.platform !== "linux")(
         candidateId: null,
         instructions: "Implement the assigned task",
         contract: SdkAgentSessionContractSchema.parse({
+          backend: "codex",
           runtime: "sdk",
           requested: settings,
           effective: settings,

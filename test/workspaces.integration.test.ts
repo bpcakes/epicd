@@ -25,6 +25,7 @@ import { SdkAgentSessionContractSchema } from "../src/domain/types.js";
 import type { ControllerAuthority } from "../src/domain/orchestration.js";
 import type { WorkspaceRecord } from "../src/domain/agents.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
+import { fixtureAccounts } from "./fixtures/accounts.js";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
@@ -58,7 +59,20 @@ function fixture(format: "sha1" | "sha256" = "sha1") {
   stores.push(store);
   const initial = initialRun();
   initial.repoPath = source;
+  initial.runtimeConfiguration = {
+    commonDirectory: { path: join(source, ".git"), device: "1", inode: "1" },
+    executable: process.execPath,
+    trackerExecutable: process.execPath,
+    runtimeRoot: join(root, "runtime"),
+    workspaceRoot: join(root, "managed"),
+    accounts: fixtureAccounts(root),
+    turnTimeoutMs: 15_000,
+    herdr: null,
+  };
   const state = store.create(initial, RepositoryPolicySchema.parse({ schemaVersion: 1 }));
+  const fixtureDatabase = new Database(join(root, "state.sqlite3"));
+  fixtureDatabase.prepare("DELETE FROM tracker_roots WHERE run_id = ?").run(state.runId);
+  fixtureDatabase.close();
   const lease = store.acquireLease(state.runId);
   const authority: ControllerAuthority = {
     runId: state.runId,
@@ -82,6 +96,7 @@ function reserveWriter(setup: ReturnType<typeof fixture>, workspace: WorkspaceRe
       instructions: "Implement",
       confinementProfile: "fixture",
       contract: SdkAgentSessionContractSchema.parse({
+        backend: "codex",
         runtime: "sdk",
         requested: settings,
         effective: settings,
@@ -247,6 +262,7 @@ describe("managed independent Git workspaces", () => {
         instructions: "Implement",
         confinementProfile: "fixture",
         contract: SdkAgentSessionContractSchema.parse({
+          backend: "codex",
           runtime: "sdk",
           requested: settings,
           effective: settings,

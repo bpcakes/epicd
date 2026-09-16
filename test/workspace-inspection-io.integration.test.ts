@@ -8,6 +8,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -31,7 +32,7 @@ import type { WorkspaceRecord } from "../src/domain/agents.js";
 import { reconcileCommit } from "../src/kernel/commits.js";
 import { reconcileTrackerCommit } from "../src/kernel/tracker-commits.js";
 import { journalRecordView } from "../src/adapters/journal-records.js";
-import { ControlledSdkRuntime } from "../src/adapters/controlled-sdk.js";
+import { ControlledAgentDispatcher } from "../src/adapters/agent-dispatch.js";
 import { reconcileDeliveryAction } from "../src/kernel/delivery-recovery.js";
 import { reconcileDiagnosticWorkspace } from "../src/kernel/diagnostic-workspaces.js";
 import { reconcileActions } from "../src/kernel/reconcile.js";
@@ -726,7 +727,7 @@ describe.skipIf(process.platform !== "linux")("standalone workspace inspection l
       const result = await reconcileDeliveryAction(
         f.journal,
         f.manager,
-        f.driver,
+        new ControlledAgentDispatcher(f.journal),
         f.authority,
         record,
       );
@@ -749,7 +750,19 @@ describe.skipIf(process.platform !== "linux")("standalone workspace inspection l
         const source = join(f.root, "foreign-source");
         git(f.root, "clone", "--quiet", f.source, source);
         const otherRun = f.store.create(
-          { ...f.store.get(f.authority.runId)!, runId: randomUUID(), repoPath: source },
+          {
+            ...f.store.get(f.authority.runId)!,
+            runId: randomUUID(),
+            repoPath: source,
+            runtimeConfiguration: {
+              ...f.store.get(f.authority.runId)!.runtimeConfiguration!,
+              commonDirectory: {
+                path: join(source, ".git"),
+                device: String(statSync(join(source, ".git")).dev),
+                inode: String(statSync(join(source, ".git")).ino),
+              },
+            },
+          },
           f.journal.policy(f.authority.runId),
         );
         const lease = f.store.acquireLease(otherRun.runId);
@@ -783,7 +796,7 @@ describe.skipIf(process.platform !== "linux")("standalone workspace inspection l
           const result = await reconcileDeliveryAction(
             f.journal,
             f.manager,
-            f.driver,
+            new ControlledAgentDispatcher(f.journal),
             f.authority,
             record,
           );
@@ -1658,18 +1671,13 @@ describe.skipIf(process.platform !== "linux")("standalone workspace inspection l
       const journal = f.reopen().orchestration;
       const control = journal.control(f.authority.runId);
       const manager = new WorkspaceManager(journal, join(f.root, "managed"));
-      const driver = new ControlledSdkRuntime(journal, {
-        root: join(f.root, "runtime"),
-        executable: join(f.root, "bin/codex"),
-        authCachePath: null,
-        turnTimeoutMs: 30000,
-      });
+      const dispatcher = new ControlledAgentDispatcher(journal);
       const launches = vi.spyOn(lifetime, "startDurableCommand");
       const copies = vi.spyOn(manager, "create");
       await reconcileActions(journal, f.authority, async (record) =>
         kind === "diagnostic"
           ? reconcileDiagnosticWorkspace(journal, manager, f.authority, record)
-          : ((await reconcileDeliveryAction(journal, manager, driver, f.authority, record)) ?? {
+          : ((await reconcileDeliveryAction(journal, manager, dispatcher, f.authority, record)) ?? {
               status: "unresolved",
               detail: "No matching recovery",
             }),

@@ -1,7 +1,8 @@
 import { z } from "zod";
 import type { OrchestrationJournal } from "../adapters/orchestration-journal.js";
 import { AgentCoordinationError } from "../adapters/agent-journal.js";
-import type { ControlledAgentDriver } from "../kernel/agents.js";
+import type { AgentDispatcher } from "../adapters/agent-dispatch.js";
+import { AgentDispatchUnavailable } from "../adapters/agent-dispatch.js";
 import type { AgentIdentity } from "../domain/agents.js";
 import {
   DecisionSourceError,
@@ -34,8 +35,11 @@ export class ControlledDecisionSource implements DecisionSource {
     private readonly journal: OrchestrationJournal,
     private readonly authority: ControllerAuthority,
     private readonly agent: AgentIdentity,
-    private readonly runtime: ControlledAgentDriver,
-  ) {}
+    dispatcher: AgentDispatcher,
+  ) {
+    this.dispatcher = dispatcher;
+  }
+  private readonly dispatcher: AgentDispatcher;
 
   async decide(
     input: Parameters<DecisionSource["decide"]>[0],
@@ -65,13 +69,19 @@ export class ControlledDecisionSource implements DecisionSource {
     const instance = this.journal.agents.instance(this.authority.runId, this.agent);
     if (
       instance.role !== "orchestrator" ||
-      instance.contract.runtime !== this.runtime.kind ||
       instance.contract.effective.model !== ORCHESTRATOR_MODEL
     )
       throw new DecisionSourceError(
         "configuration",
         "Coordinator requires its pinned Astra runtime assignment; no model fallback is allowed",
       );
+    try {
+      this.dispatcher.assertReady(instance.contract);
+    } catch (error) {
+      if (error instanceof AgentDispatchUnavailable)
+        throw new DecisionSourceError("configuration", error.message);
+      throw error;
+    }
     let turn;
     try {
       turn = this.journal.agents.prepareTurn(
@@ -94,7 +104,7 @@ export class ControlledDecisionSource implements DecisionSource {
       throw error;
     }
     this.journal.decisionSource.bindTurn(this.authority, input.attemptId, turn.identity);
-    const stopped = await this.runtime.run(this.authority, turn.identity, signal);
+    const stopped = await this.dispatcher.run(this.authority, turn.identity, signal);
     if (!stopped.stopEvidence) throw new Error("Coordinator launcher stop is unconfirmed");
     // A provider rejection and a control-plane cancellation are independent facts.
     // Preserve the provider cause after stop proof even when the same failure also
@@ -116,6 +126,6 @@ export class ControlledDecisionSource implements DecisionSource {
   async reconcile(attempt: DecisionSourceAttempt): Promise<void> {
     if (!attempt.turnIdentity)
       throw new Error("Coordinator attempt has no bound launch to reconcile");
-    await this.runtime.reconcile(this.authority, attempt.turnIdentity);
+    await this.dispatcher.reconcile(this.authority, attempt.turnIdentity);
   }
 }

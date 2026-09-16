@@ -2,7 +2,7 @@
 
 Epicd is being rebuilt as a persistent autonomous engineering lead. GPT-6 Astra chooses delivery strategy, coordinates agents, investigates failures, and requests actions from a deterministic Git and Beads safety kernel.
 
-This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 43. Use a fresh state path; unsupported existing data is left intact.
+This branch has one orchestrator controller. There is no legacy phase dispatcher, compatibility mode, state conversion, or database migration. Current storage format is 47. Use a fresh state path; unsupported existing data is left intact.
 
 Default state lives at `$XDG_STATE_HOME/epicd/epicd.sqlite3`, or
 `~/.local/state/epicd/epicd.sqlite3` when `XDG_STATE_HOME` is unset. `--state` overrides
@@ -91,7 +91,7 @@ Standalone materialization, application-commit and tracker-commit inspections no
 
 The [inspection contracts](docs/workspace-inspection-contracts.md) explain custody versus content failures, cancellation after durable settlement, and recovery after quarantine. Workspace previews enforce one aggregate JSON budget, preserve the newest recovery IDs, and report omitted history or shortened diagnostics without changing retained records.
 
-These boundaries share the command-lifetime mechanism across SDK and native Herdr runtimes. Fresh format-43 state is required, with no migration or legacy defaults. Missing or invalid stop proof still requires intervention rather than inference from an absent PID. Retained-resource cleanup, external ownership guards and full live acceptance remain unfinished.
+These boundaries share the command-lifetime mechanism across SDK and native Herdr runtimes. Fresh format-47 state is required, with no migration or legacy defaults. Missing or invalid stop proof still requires intervention rather than inference from an absent PID. Retained-resource cleanup, external ownership guards and full live acceptance remain unfinished.
 
 ### Recoverable workspace disposal
 
@@ -391,7 +391,22 @@ Use `--runtime sdk` to switch back. `--codex-path` selects a native executable; 
 
 The handoff holds a controller lease, verifies physical repository ownership, and rechecks the observed control version before one atomic journal transaction. All turns, launchers, workspace I/O and delivery/fixture operations must have recorded stop and settlement. Pending agent instructions are not discarded. If work is uncertain, reconcile it in its recorded runtime first; a dead controller is not stop proof.
 
-Stopped conversations are retired without copying provider session IDs into another runtime. Existing workspaces, native endpoint identities, exact evidence, findings, memory, policy, grants and budgets remain intact. The next coordinator starts a fresh Astra conversation using durable context. Retirement does not revoke valid historical evidence, but later contamination can still revoke it. No retired conversation can take another turn. Switching runtime never changes repository identity, private storage, authentication paths, worker defaults or permission grants, and does not imply cleanup of old resources.
+By default, stopped conversations are retired without copying provider session IDs into another runtime, and the next coordinator starts a fresh Astra conversation using durable context. Pass `--retain-coordinator-session` only when the exact stopped coordinator conversation should continue. That option atomically reserves its session, provider home, and workspace for one replacement coordinator generation in the target runtime; the old generation is released first, and any implicit, mismatched, or concurrent reuse is rejected.
+
+If a retained session cannot resume, inspect `status RUN_ID --json` for its `conversationTransfers` entry. After the controller detaches and the failed target has confirmed stop, abandon that exact reservation explicitly:
+
+```bash
+node dist/cli.js abandon-conversation RUN_ID TRANSFER_ID --state STATE_PATH \
+  --control-version VERSION --reason "The retained session is unavailable"
+```
+
+The operator console exposes the same action as **8 abandon conversation**. It rejects unproven stop, pending instructions, unfinished actions, and already-consumed transfers. Abandonment retains the transfer, reason, stop-evidence references, files, and journal history; the abandoned transfer cannot be claimed again. Inspect status, answer any pending escalation, then resume with a fresh conversation in the recorded runtime or perform another handoff. This lifecycle uses orchestration format 47; older formats are rejected without rewriting their databases.
+
+An isolated unreadable source does not prevent abandonment when the transfer itself is valid and its source workspace and all claim targets have proven stop. Status marks malformed transfer records as unreadable and retains their IDs; those records still block handoff and completion and require record-level recovery rather than guessed bindings. Retrying an already completed abandonment returns its original result, including with the original control version, without new events or control changes. A live controller lease still prevents the command from taking ownership.
+
+A failed native resume escalates as a runtime failure; it does not automatically reclaim the transfer in a loop. Current controlled coordinator provider failures, including provider-classified transient failures after prompt acknowledgement, are not replayed automatically. The three-attempt transient path is reserved for a trusted decision source that explicitly proves its request settled before reporting a retryable transport failure. Respond to the escalation and choose continued recovery or abandonment before proceeding.
+
+Existing workspaces, native endpoint identities, exact evidence, findings, memory, policy, grants and budgets remain intact. Retirement does not revoke valid historical evidence, but later contamination can still revoke it. A corrupt historical owner loses authority and makes its retained results ineligible without disabling healthy generations; only associated work whose integrity or stop cannot be proved pauses automatic recovery for intervention. No retired conversation can take another turn. Switching runtime never changes repository identity, authentication paths, worker defaults or permission grants, and does not imply cleanup of old resources.
 
 ## Fixture authority, inspection and creation
 

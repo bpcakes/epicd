@@ -878,7 +878,7 @@ export class PublicationJournal {
           !concurrentWithPublication(JSON.parse(row.request_json).action.kind),
       ) ||
       this.access.agents
-        .turns(runId)
+        .operationalTurns(runId)
         .some((turn) => !turn.stopEvidence && turn.prompt.assignment.purpose !== "coordination") ||
       this.db
         .prepare(

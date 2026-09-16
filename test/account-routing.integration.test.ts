@@ -225,6 +225,7 @@ else: sys.exit('Unexpected fixture tracker command')
         candidateId: role === "review" && purpose !== "specialist" ? "candidate" : null,
         instructions: "Report the fixture account",
         contract: AgentSessionContractSchema.parse({
+          backend: "codex",
           runtime,
           requested: settings,
           effective: settings,
@@ -255,7 +256,6 @@ else: sys.exit('Unexpected fixture tracker command')
     const options = {
       root: config.runtimeRoot,
       executable: config.executable,
-      authCachePath: null,
       launcherEntrypoint: join(process.cwd(), "dist/adapters/codex-launch-cli.js"),
       turnTimeoutMs: config.turnTimeoutMs,
     };

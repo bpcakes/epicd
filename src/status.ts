@@ -4,6 +4,9 @@ import { actionContextRecord } from "./kernel/action-context.js";
 
 /** Delivery status is a journal projection, never a caller-owned phase snapshot. */
 export function runStatusView(store: StateStore, runId: string) {
+  return store.orchestration.readSnapshot(() => snapshotStatus(store, runId));
+}
+function snapshotStatus(store: StateStore, runId: string) {
   const state = store.get(runId);
   if (!state) throw new RunNotFoundError(runId);
   const journal = store.orchestration;
@@ -27,6 +30,7 @@ export function runStatusView(store: StateStore, runId: string) {
       : null,
     escalation: journal.pendingEscalation(runId),
     agents: journal.agents.summaries(runId),
+    conversationTransfers: journal.agents.conversationTransferSummaries(runId),
     actions: journal
       .actions(runId)
       .slice(-20)
@@ -59,6 +63,10 @@ export function humanRunStatus(status: RunStatus): string {
   ];
   if (status.escalation)
     lines.push(`Question ${status.escalation.escalationId}: ${status.escalation.question}`);
+  for (const transfer of status.conversationTransfers)
+    lines.push(
+      `Conversation transfer ${transfer.transferId}: ${transfer.status} (${transfer.targetRuntime})${transfer.unreadable ? " — unreadable record; preserve for recovery" : ""}`,
+    );
   for (const event of status.events.slice(-5))
     lines.push(`${event.at} ${event.kind}: ${event.message}`);
   return lines.join("\n");
