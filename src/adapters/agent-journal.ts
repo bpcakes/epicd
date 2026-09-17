@@ -1004,14 +1004,30 @@ export class AgentJournal {
   }
   /** Malformed ownership is a conflict, never evidence that a workspace is available. */
   workspaceHasNonReleasedOwner(runId: string, identity: WorkspaceIdentity): boolean {
+    return this.workspaceHasConflictingOwner(runId, identity, new Set());
+  }
+
+  /** A validated transfer may cross only its own isolated, stopped historical owners. */
+  private workspaceHasConflictingOwner(
+    runId: string,
+    identity: WorkspaceIdentity,
+    isolatedTransferAncestors: ReadonlySet<string>,
+  ): boolean {
     const rows = this.db
       .prepare(
-        "SELECT record_json FROM agent_instances WHERE run_id = ? AND workspace_id = ? AND workspace_generation = ?",
+        "SELECT agent_id, generation, record_json FROM agent_instances WHERE run_id = ? AND workspace_id = ? AND workspace_generation = ?",
       )
-      .all(runId, identity.workspaceId, identity.workspaceGeneration) as { record_json: string }[];
-    return rows.some(({ record_json }) => {
+      .all(runId, identity.workspaceId, identity.workspaceGeneration) as {
+      agent_id: string;
+      generation: number;
+      record_json: string;
+    }[];
+    return rows.some(({ agent_id, generation, record_json }) => {
       const parsed = AgentInstanceSchema.safeParse(JSON.parse(record_json));
-      return !parsed.success || parsed.data.status !== "released";
+      if (parsed.success) return parsed.data.status !== "released";
+      return !isolatedTransferAncestors.has(
+        agentIdentityKey({ agentId: agent_id, agentGeneration: generation }),
+      );
     });
   }
   /** Invalid historical assignments conservatively disqualify independence. */
@@ -1899,11 +1915,6 @@ export class AgentJournal {
           "workspace_unavailable",
           "Agent needs a ready, unoccupied workspace",
         );
-      if (this.workspaceHasNonReleasedOwner(authority.runId, workspace))
-        throw new AgentCoordinationError(
-          "workspace_assigned",
-          "Use a fresh workspace for each agent instance",
-        );
       let identity: AgentIdentity = { agentId: randomUUID(), agentGeneration: 1 };
       let replaced: AgentInstance | null = null;
       if (input.replaces) {
@@ -2000,6 +2011,19 @@ export class AgentJournal {
         throw new AgentCoordinationError(
           "conversation_transfer_mismatch",
           "Conversation transfer does not match the stopped coordinator replacement",
+        );
+      const isolatedTransferAncestors = new Set<string>();
+      if (transferSource) {
+        const lineage = this.conversationLineage(authority.runId, transferSource);
+        for (const ancestor of lineage.identities) {
+          const key = agentIdentityKey(ancestor);
+          if (lineage.ownership?.get(key)?.state === "isolated") isolatedTransferAncestors.add(key);
+        }
+      }
+      if (this.workspaceHasConflictingOwner(authority.runId, workspace, isolatedTransferAncestors))
+        throw new AgentCoordinationError(
+          "workspace_assigned",
+          "Use a fresh workspace for each agent instance",
         );
       const agent = AgentInstanceSchema.parse({
         ...(binding ? { accountBinding: binding } : {}),
@@ -2914,6 +2938,30 @@ export class AgentJournal {
     });
   }
 
+  /** Recovery workspace authority comes from the turn owner's relational binding, not turn JSON. */
+  private relationalOwnerWorkspaceForTurn(runId: string, turnId: string): WorkspaceRecord {
+    const binding = this.db
+      .prepare(
+        `SELECT owner.workspace_id, owner.workspace_generation
+         FROM agent_turns turn_record
+         JOIN agent_instances owner
+           ON owner.run_id = turn_record.run_id
+             AND owner.agent_id = turn_record.agent_id
+             AND owner.generation = turn_record.agent_generation
+         WHERE turn_record.run_id = ? AND turn_record.turn_id = ?`,
+      )
+      .get(runId, turnId) as { workspace_id: string; workspace_generation: number } | undefined;
+    if (!binding)
+      throw new AgentCoordinationError(
+        "unknown_turn",
+        "Turn owner binding is missing, stale, or belongs to another run",
+      );
+    return this.workspace(runId, {
+      workspaceId: binding.workspace_id,
+      workspaceGeneration: binding.workspace_generation,
+    });
+  }
+
   /** Recovery-only cancellation whose no-launch proof is intrinsic to the turn row. */
   cancelPreparedTurnWithoutOwner(
     authority: ControllerAuthority,
@@ -2938,6 +2986,7 @@ export class AgentJournal {
           "prompt_may_be_submitted",
           "Owner-independent cancellation requires an intrinsically valid never-launched turn",
         );
+      const workspace = this.relationalOwnerWorkspaceForTurn(authority.runId, identity.turnId);
       const messages = this.all(
         AgentMailboxMessageSchema,
         "SELECT record_json FROM agent_messages WHERE run_id = ? AND agent_id = ? AND agent_generation = ? ORDER BY rowid",
@@ -2954,7 +3003,6 @@ export class AgentJournal {
       turn.resultEligible = false;
       turn.stopEvidence = "Kernel cancelled the prepared turn before dispatch";
       this.saveTurnIntrinsic(turn);
-      const workspace = this.workspace(authority.runId, identity);
       if (workspace.activeTurnId === identity.turnId) workspace.activeTurnId = null;
       if (!["retired", "disposed"].includes(workspace.status)) workspace.status = "quarantined";
       this.saveWorkspace(workspace);
@@ -2994,6 +3042,7 @@ export class AgentJournal {
           "launch_not_stopped",
           "Owner-independent settlement requires the exact launch's trusted stop receipt",
         );
+      const workspace = this.relationalOwnerWorkspaceForTurn(authority.runId, identity.turnId);
       const messages = this.all(
         AgentMailboxMessageSchema,
         "SELECT record_json FROM agent_messages WHERE run_id = ? AND agent_id = ? AND agent_generation = ? ORDER BY rowid",
@@ -3010,7 +3059,6 @@ export class AgentJournal {
       turn.resultEligible = false;
       turn.stopEvidence = JSON.stringify(stop);
       this.saveTurnIntrinsic(turn);
-      const workspace = this.workspace(authority.runId, identity);
       if (workspace.activeTurnId === identity.turnId) workspace.activeTurnId = null;
       if (!["retired", "disposed"].includes(workspace.status)) workspace.status = "quarantined";
       this.saveWorkspace(workspace);

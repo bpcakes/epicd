@@ -1082,6 +1082,106 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
     ).toEqual({ conversation_transfer_id: transfer.transferId });
   });
 
+  it("reuses the coordinator workspace past an isolated transferred ancestor", async () => {
+    const f = await fixture();
+    const sessionId = randomUUID();
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId,
+    });
+    f.pause();
+    f.journal.handoffRuntime(f.authority, f.version(), f.target, true);
+    const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+      f.state.runId,
+      "herdr",
+    )!;
+    f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const successor = f.journal.agents.reserveAgent(
+      f.authority,
+      {
+        ...f.workspace,
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        instructions: "Continue the retained conversation",
+        contract: HerdrAgentSessionContractSchema.parse({
+          backend: "codex",
+          runtime: "herdr",
+          requested: settings,
+          effective: settings,
+        }),
+        confinementProfile: "epicd-isolated",
+        replaces: f.agent,
+        conversationTransferId: transfer.transferId,
+      },
+      f.version(),
+    );
+    f.journal.agents.bindProvider(f.authority, successor, {
+      backend: "codex",
+      runtime: "herdr",
+      name: "continued",
+      paneId: "pane",
+      tabId: "tab",
+      terminalId: "terminal",
+      sessionId,
+    });
+
+    const row = f.db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .get(f.state.runId, f.agent.agentId, f.agent.agentGeneration) as {
+      record_json: string;
+    };
+    const damaged = JSON.parse(row.record_json);
+    damaged.schemaVersion = 1;
+    f.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(JSON.stringify(damaged), f.state.runId, f.agent.agentId, f.agent.agentGeneration);
+    expect(f.journal.agents.ownershipAssessment(f.state.runId, f.agent).state).toBe("isolated");
+
+    f.pause();
+    f.journal.handoffRuntime(
+      f.authority,
+      f.version(),
+      { runtime: "sdk", executable: f.codex, herdr: null },
+      true,
+    );
+    const backTransfer = f.journal.agents.pendingCoordinatorConversationTransfer(
+      f.state.runId,
+      "sdk",
+    )!;
+    f.journal.operatorControl(f.state.runId, f.version(), { kind: "resume" });
+    expect(() =>
+      f.journal.agents.reserveAgent(
+        f.authority,
+        {
+          ...f.workspace,
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          instructions: "Continue past the isolated historical owner",
+          contract: SdkAgentSessionContractSchema.parse({
+            backend: "codex",
+            runtime: "sdk",
+            requested: settings,
+            effective: settings,
+          }),
+          confinementProfile: "epicd-isolated",
+          replaces: successor,
+          conversationTransferId: backTransfer.transferId,
+        },
+        f.version(),
+      ),
+    ).not.toThrow();
+  });
+
   it.each([false, true])(
     "transfers one stopped coordinator session across runtimes (failed prior claim: %s)",
     async (failedClaim) => {

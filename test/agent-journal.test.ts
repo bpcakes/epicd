@@ -10,7 +10,7 @@ import { assertRuntimeHandoffReady } from "../src/adapters/runtime-handoff.js";
 import { WorkspaceManager } from "../src/adapters/workspaces.js";
 import type { NativeLaunchEndpoint } from "../src/domain/codex-launch.js";
 import { ActionKernel } from "../src/kernel/actions.js";
-import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
+import { digestJson, RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import {
   SdkAgentSessionContractSchema,
   HerdrAgentSessionContractSchema,
@@ -20,6 +20,7 @@ import type {
   ControllerAuthority,
   KernelAction,
   OrchestratorDecision,
+  TurnIdentity,
 } from "../src/domain/orchestration.js";
 import { initialRun } from "./fixtures/orchestration/state.js";
 import { fixtureAccounts } from "./fixtures/accounts.js";
@@ -188,6 +189,26 @@ function nativeEndpoint(root: string): NativeLaunchEndpoint {
     terminalId: randomUUID(),
     name: "owned-agent",
   };
+}
+
+function redirectTurnWorkspace(
+  db: Database.Database,
+  turnId: string,
+  workspace: WorkspaceRecord,
+): TurnIdentity {
+  const row = db.prepare("SELECT record_json FROM agent_turns WHERE turn_id = ?").get(turnId) as {
+    record_json: string;
+  };
+  const changed = JSON.parse(row.record_json);
+  changed.identity.workspaceId = workspace.workspaceId;
+  changed.identity.workspaceGeneration = workspace.workspaceGeneration;
+  changed.prompt.identity = changed.identity;
+  changed.promptDigest = digestJson(changed.prompt);
+  db.prepare("UPDATE agent_turns SET record_json = ? WHERE turn_id = ?").run(
+    JSON.stringify(changed),
+    turnId,
+  );
+  return changed.identity as TurnIdentity;
 }
 function decision(setup: ReturnType<typeof fixture>, action: KernelAction): OrchestratorDecision {
   const ticket = setup.journal.beginDecision(
@@ -1043,6 +1064,44 @@ describe("durable agent coordination", () => {
     );
   });
 
+  it("quarantines the relational owner workspace when an unreadable prepared turn names another workspace", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const prepared = setup.prepare(owner);
+    const unrelated = setup.workspace("diagnostic");
+    const redirectedIdentity = redirectTurnWorkspace(setup.db, prepared.identity.turnId, unrelated);
+    const raw = setup.db
+      .prepare(
+        "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .get(setup.authority.runId, owner.agentId, owner.agentGeneration) as {
+      record_json: string;
+    };
+    const corrupt = JSON.parse(raw.record_json);
+    corrupt.schemaVersion = 2;
+    delete corrupt.conversationContinuation;
+    setup.db
+      .prepare(
+        "UPDATE agent_instances SET record_json = ? WHERE run_id = ? AND agent_id = ? AND generation = ?",
+      )
+      .run(JSON.stringify(corrupt), setup.authority.runId, owner.agentId, owner.agentGeneration);
+
+    expect(setup.agents.turnForRecovery(setup.authority.runId, redirectedIdentity)).toMatchObject({
+      ownerValidity: "unreadable",
+      turn: { identity: redirectedIdentity, status: "prepared" },
+    });
+    setup.agents.cancelPreparedTurnWithoutOwner(setup.authority, redirectedIdentity);
+
+    expect(setup.agents.workspace(setup.authority.runId, owner)).toMatchObject({
+      status: "quarantined",
+      activeTurnId: null,
+    });
+    expect(setup.agents.workspace(setup.authority.runId, unrelated)).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+  });
+
   it("settles a stopped launch from intrinsic proof after its owner becomes unreadable", () => {
     const setup = fixture();
     const owner = setup.ready("specialist");
@@ -1064,6 +1123,8 @@ describe("durable agent coordination", () => {
       processTreeStopped: true as const,
     };
     setup.agents.recordLaunchStop(setup.authority, prepared.identity, stop);
+    const unrelated = setup.workspace("diagnostic");
+    const redirectedIdentity = redirectTurnWorkspace(setup.db, prepared.identity.turnId, unrelated);
     const raw = setup.db
       .prepare(
         "SELECT record_json FROM agent_instances WHERE run_id = ? AND agent_id = ? AND generation = ?",
@@ -1081,11 +1142,11 @@ describe("durable agent coordination", () => {
       .run(JSON.stringify(corrupt), setup.authority.runId, owner.agentId, owner.agentGeneration);
 
     expect(setup.agents.ownershipAssessment(setup.authority.runId, owner).state).toBe("isolated");
-    expect(setup.agents.turnForRecovery(setup.authority.runId, prepared.identity)).toMatchObject({
-      turn: { identity: prepared.identity, stopEvidence: null },
+    expect(setup.agents.turnForRecovery(setup.authority.runId, redirectedIdentity)).toMatchObject({
+      turn: { identity: redirectedIdentity, stopEvidence: null },
       ownerValidity: "not_required",
     });
-    const settled = setup.agents.settleStoppedTurnWithoutOwner(setup.authority, prepared.identity);
+    const settled = setup.agents.settleStoppedTurnWithoutOwner(setup.authority, redirectedIdentity);
     expect(settled).toMatchObject({
       status: "cancelled",
       stopRequested: true,
@@ -1095,6 +1156,10 @@ describe("durable agent coordination", () => {
     });
     expect(setup.agents.workspace(setup.authority.runId, owner)).toMatchObject({
       status: "quarantined",
+      activeTurnId: null,
+    });
+    expect(setup.agents.workspace(setup.authority.runId, unrelated)).toMatchObject({
+      status: "ready",
       activeTurnId: null,
     });
     expect(
