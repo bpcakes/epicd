@@ -428,26 +428,28 @@ describe.skipIf(process.platform !== "linux")("published whole-epic review", () 
     expect(() => s.journal.tracker.closedEpicScope(run)).toThrow("closure provenance");
   }, 30000);
 
-  it.each([
-    { status: "open" },
-    { description: "Changed work after task closure" },
-    { close_reason: "Unrelated closure" },
-    { assignee: "another-user" },
-    { new_children: ["demo.2"] },
-    { epic_description: "New epic acceptance scope" },
-  ])(
-    "invalidates the final target after observed scope/provenance change: %j",
-    async (change) => {
-      const s = await closureFixture(),
-        run = s.authority.runId;
-      await closed(s);
+  it("invalidates each fresh final target after an observed scope or provenance change", async () => {
+    const s = await closureFixture(),
+      run = s.authority.runId;
+    await closed(s);
+    const baseline = s.readTracker();
+    for (const change of [
+      { status: "open" },
+      { description: "Changed work after task closure" },
+      { close_reason: "Unrelated closure" },
+      { assignee: "another-user" },
+      { new_children: ["demo.2"] },
+      { epic_description: "New epic acceptance scope" },
+    ]) {
       const candidate = await prepare(s);
+      expect(s.journal.delivery.candidateCurrent(run, candidate)).toBe(true);
       s.writeTracker(change);
       await refresh(s);
       expect(s.journal.delivery.candidateCurrent(run, candidate)).toBe(false);
-    },
-    30000,
-  );
+      s.replaceTracker(baseline);
+      await refresh(s);
+    }
+  }, 60000);
 
   it("carries additional delivered task checks into final validation and rejects replacement commands", async () => {
     const s = await closureFixture(),

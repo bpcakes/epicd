@@ -194,16 +194,17 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
     resource(await s.dispatch({ kind: "complete_run" }));
   }, 45000);
 
-  it.each([
-    ["changed requirements", { epic_description: "A newly required behavior" }],
-    ["new open child", { new_children: ["demo.3"] }],
-    ["concurrent ownership", { epic_assignee: "someone-else" }],
-  ])(
-    "rejects %s from a fresh graph before dispatching root close",
-    async (_label, changes) => {
-      const s = await closureFixture();
-      const revision = await deliverTask(s);
-      await approveEpic(s, revision);
+  it("rejects each fresh graph divergence before dispatching root close", async () => {
+    const s = await closureFixture();
+    const revision = await deliverTask(s);
+    const baseline = s.readTracker();
+    for (const changes of [
+      { epic_description: "A newly required behavior" },
+      { new_children: ["demo.3"] },
+      { epic_assignee: "someone-else" },
+    ]) {
+      const candidate = await approveEpic(s, revision);
+      expect(s.journal.delivery.candidateCurrent(s.authority.runId, candidate)).toBe(true);
       s.writeTracker(changes);
       expect((await closeRoot(s, revision)).status).not.toBe("succeeded");
       expect(
@@ -213,9 +214,10 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
           .map((args) => args[1]),
       ).toEqual(["demo.1"]);
       expect(s.journal.control(s.authority.runId).status).toBe("active");
-    },
-    45000,
-  );
+      s.replaceTracker(baseline);
+      resource(await s.dispatch({ kind: "refresh_tracker" }));
+    }
+  }, 60000);
 
   it("does not treat an externally closed root as this run's completion proof", async () => {
     const s = await closureFixture();

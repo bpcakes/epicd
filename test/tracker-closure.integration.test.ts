@@ -182,11 +182,10 @@ describe.skipIf(process.platform !== "linux")("verified task closure", () => {
     expect(s.readTracker().status).toBe("in_progress");
   }, 30000);
 
-  it.each(["canonicalRef", "publicRef"] as const)(
-    "preserves changed %s state and never sends close",
-    async (destination) => {
-      const s = await closureFixture();
-      const { commit, publication } = await publishVerified(s);
+  it("preserves changed canonical and public ref state and never sends close", async () => {
+    const s = await closureFixture();
+    const { commit, publication } = await publishVerified(s);
+    for (const destination of ["canonicalRef", "publicRef"] as const) {
       const repository = publication[destination]!.repository.root.path;
       git(
         repository,
@@ -199,9 +198,15 @@ describe.skipIf(process.platform !== "linux")("verified task closure", () => {
       expect(s.trackerCommands().some((args) => args[0] === "close")).toBe(false);
       expect(git(repository, "rev-parse", `refs/heads/epicd/${s.authority.runId}`)).toBe(s.head);
       expect(s.readTracker().status).toBe("in_progress");
-    },
-    30000,
-  );
+      git(
+        repository,
+        "update-ref",
+        `refs/heads/epicd/${s.authority.runId}`,
+        commit.revision!,
+        s.head,
+      );
+    }
+  }, 30000);
 
   it("recognizes a lost CLI response and replays only the recorded action result", async () => {
     const s = await closureFixture();

@@ -211,6 +211,14 @@ else: sys.exit('unsupported')
         db.close();
       }
     },
+    replaceTracker: (value: Record<string, unknown>) => {
+      const db = new Database(join(setup.source, ".beads/beads.db"));
+      try {
+        db.prepare("UPDATE fixture_state SET body=?").run(JSON.stringify(value));
+      } finally {
+        db.close();
+      }
+    },
     trackerCommands: () =>
       readFileSync(join(setup.source, ".beads/commands.jsonl"), "utf8")
         .trim()

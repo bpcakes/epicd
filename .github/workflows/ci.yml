@@ -23,7 +23,26 @@ jobs:
       - run: npm run format:check
       - run: npm run build
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run test:fast
+
+  integration-tests:
+    name: integration-tests (${{ matrix.shard }}/4)
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:integration -- --shard=${{ matrix.shard }}/4 --maxWorkers=3
 
   platform-contract-tests:
     name: platform-contract-tests (${{ matrix.os }})

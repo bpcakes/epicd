@@ -559,11 +559,16 @@ Unlocking does not kill processes or prove they stopped. A replacement controlle
 ```bash
 npm run build
 npm run typecheck
-npm test
+npm run test:fast       # unit and UI feedback
+npm run test:changed    # tests related to the current Git changes
+npm run test:integration
+npm test                # complete suite
 npm run format:check
 ```
 
 Build before testing: supervised-process and CLI tests exercise the compiled entrypoints. Do not rebuild or edit source while those tests are running.
+
+Vitest runs isolated files with bounded parallelism. CI keeps the fast checks together and shards the integration files across four jobs. Use a focused file list while developing, then run the complete suite before delivery.
 
 Normal integration tests use owned temporary repositories and scripted provider results. They exercise real journaling, Git operations, confinement, and process stop; they do not prove model judgment. Authenticated model/native checks are opt-in and recorded separately. See the implementation plan for remaining acceptance scenarios and their live-test commands.
 

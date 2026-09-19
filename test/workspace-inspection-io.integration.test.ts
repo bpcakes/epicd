@@ -25,8 +25,11 @@ import {
 } from "../src/adapters/workspace-inspection-io.js";
 import {
   WorkspaceInspectionSchema,
+  workspaceInspectionScope,
   workspaceInspectionView,
 } from "../src/domain/workspace-inspection.js";
+import type { CommandLifetime } from "../src/domain/command-lifetime.js";
+import { digestJson } from "../src/domain/repository-policy.js";
 import type { KernelAction } from "../src/domain/orchestration.js";
 import type { WorkspaceRecord } from "../src/domain/agents.js";
 import { reconcileCommit } from "../src/kernel/commits.js";
@@ -90,6 +93,41 @@ function latest(s: Prepared) {
     .forWorkspace(s.f.authority.runId, s.workspace)
     .at(-1)!;
 }
+function retainObservedMaterialization(
+  s: Prepared,
+  template: CommandLifetime,
+  fingerprint: string,
+) {
+  const inspection = s.f.journal.workspaceInspections.reserve(
+    s.f.authority,
+    join(s.f.root, "managed"),
+    s.workspace,
+    { kind: "materialization" },
+  );
+  const execution: CommandLifetime = {
+    ...template,
+    ioId: randomUUID(),
+    operationId: inspection.inspectionId,
+    controllerLeaseId: s.f.authority.leaseId,
+    scopeDigest: workspaceInspectionScope(inspection),
+    launchDigest: digestJson(["retained-materialization-history", inspection.inspectionId]),
+  };
+  s.f.journal.workspaceInspections.bind(s.f.authority, inspection.inspectionId, execution);
+  s.f.journal.workspaceInspections.recordResult(s.f.authority, inspection.inspectionId, {
+    status: "observed",
+    observation: { kind: "materialization", ready: true, fingerprint },
+  });
+  s.f.journal.workspaceInspections.recordStop(s.f.authority, inspection.inspectionId, {
+    ioId: execution.ioId,
+    bindingDigest: digestJson(execution),
+    kind: "stopped",
+    code: 0,
+    reason: null,
+    error: null,
+    stoppedAt: new Date().toISOString(),
+  });
+  return s.f.journal.workspaceInspections.finish(s.f.authority, inspection.inspectionId);
+}
 async function invoke(s: Prepared) {
   return s.action
     ? s.f.dispatch(s.action)
@@ -116,11 +154,26 @@ describe.skipIf(process.platform !== "linux")("standalone workspace inspection l
     const s = await prepared("materialization"),
       { f } = s;
     registerWorkspaceDisposalCapabilities(f.kernel, f.manager);
-    const ids: string[] = [];
-    for (let i = 0; i < 65; i++) {
-      expect(await invoke(s)).toBe("ready");
-      ids.push(latest(s).inspectionId);
-    }
+    expect(await invoke(s)).toBe("ready");
+    const first = latest(s);
+    if (
+      !first.execution ||
+      first.workerResult?.status !== "observed" ||
+      first.workerResult.observation.kind !== "materialization" ||
+      !first.workerResult.observation.ready
+    )
+      throw new Error("Expected the real inspection to retain a ready materialization");
+    const ids = [first.inspectionId];
+    for (let i = 1; i < 64; i++)
+      ids.push(
+        retainObservedMaterialization(
+          s,
+          first.execution,
+          first.workerResult.observation.fingerprint,
+        ).inspectionId,
+      );
+    expect(await invoke(s)).toBe("ready");
+    ids.push(latest(s).inspectionId);
     expect(new Set(ids).size).toBe(65);
     expect(
       f.journal.workspaceInspections.forWorkspace(f.authority.runId, s.workspace),

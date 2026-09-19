@@ -20,7 +20,10 @@
     "format:check": "prettier --check src test README.md package.json tsconfig.json tsconfig.test.json vitest.config.ts",
     "start": "node dist/cli.js",
     "test": "vitest run",
+    "test:changed": "vitest run --changed",
     "test:coverage": "vitest run --coverage",
+    "test:fast": "vitest run --exclude 'test/**/*.integration.test.{ts,tsx}'",
+    "test:integration": "vitest run .integration.test.",
     "test:live-codex": "vitest run test/codex-live.integration.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit"
