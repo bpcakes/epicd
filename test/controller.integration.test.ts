@@ -25,7 +25,7 @@ import { OrchestratorController } from "../dist/controller.js";
 import { ActionKernel } from "../dist/kernel/actions.js";
 import { buildOrchestratorContext } from "../dist/orchestrator/context.js";
 import { ControlledDecisionSource } from "../dist/orchestrator/sdk-source.js";
-import { RepositoryPolicySchema } from "../src/domain/repository-policy.js";
+import { digestJson, RepositoryPolicySchema } from "../src/domain/repository-policy.js";
 import { SdkAgentSessionContractSchema } from "../src/domain/types.js";
 import type {
   ControllerAuthority,
@@ -182,6 +182,28 @@ function coordinatorCreations(store: StateStore, run: string) {
       if (!creation) throw new Error("Coordinator copy has no creation record");
       return creation;
     });
+}
+
+function redirectTurnWorkspace(
+  db: Database.Database,
+  runId: string,
+  turnId: string,
+  workspace: { workspaceId: string; workspaceGeneration: number },
+): TurnIdentity {
+  const row = db
+    .prepare("SELECT record_json FROM agent_turns WHERE run_id = ? AND turn_id = ?")
+    .get(runId, turnId) as { record_json: string };
+  const changed = JSON.parse(row.record_json);
+  changed.identity.workspaceId = workspace.workspaceId;
+  changed.identity.workspaceGeneration = workspace.workspaceGeneration;
+  changed.prompt.identity = changed.identity;
+  changed.promptDigest = digestJson(changed.prompt);
+  db.prepare("UPDATE agent_turns SET record_json = ? WHERE run_id = ? AND turn_id = ?").run(
+    JSON.stringify(changed),
+    runId,
+    turnId,
+  );
+  return changed.identity as TurnIdentity;
 }
 
 // Real SQLite, private Git copies, SDK event parsing and supervised process stop.
@@ -405,6 +427,149 @@ describe.runIf(process.platform === "linux")("single orchestrator controller boo
     }).run();
     expect(f.observed).toHaveLength(1);
     expect(restarted.orchestration.agents.operationalInstances(run)).toHaveLength(1);
+  });
+
+  it("contains redirected readable-owner turns through relational ownership", async () => {
+    const f = fixture();
+    const run = f.state.runId;
+    const journal = f.store.orchestration;
+    const lease = f.store.acquireLease(run);
+    const authority: ControllerAuthority = {
+      runId: run,
+      ownerToken: lease.ownerToken,
+      leaseId: lease.leaseId,
+    };
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const contract = SdkAgentSessionContractSchema.parse({
+      backend: "codex",
+      runtime: "sdk",
+      requested: settings,
+      effective: settings,
+    });
+    const reserveAgent = (label: string) => {
+      const workspace = journal.agents.reserveWorkspace(
+        authority,
+        {
+          root: join(f.root, "workspaces"),
+          purpose: "coordinator",
+          sourceMode: "immutable",
+          baselineRevision: f.state.epicBaseRevision,
+        },
+        journal.control(run).controlVersion,
+      );
+      mkdirSync(workspace.path, { recursive: true, mode: 0o700 });
+      writeFileSync(join(workspace.path, `${label}.txt`), "fixture\n");
+      journal.agents.markWorkspaceReady(authority, workspace, `${label}-fingerprint`);
+      return journal.agents.reserveAgent(
+        authority,
+        {
+          ...workspace,
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          instructions: `Readable recovery fixture ${label}`,
+          confinementProfile: "epicd-isolated",
+          contract,
+        },
+        journal.control(run).controlVersion,
+      );
+    };
+    const preparedOwner = reserveAgent("redirected-prepared");
+    const stoppedOwner = reserveAgent("redirected-stopped");
+    const unrelated = journal.agents.reserveWorkspace(
+      authority,
+      {
+        root: join(f.root, "workspaces"),
+        purpose: "diagnostic",
+        sourceMode: "mutable",
+        baselineRevision: f.state.epicBaseRevision,
+      },
+      journal.control(run).controlVersion,
+    );
+    mkdirSync(unrelated.path, { recursive: true, mode: 0o700 });
+    journal.agents.markWorkspaceReady(authority, unrelated, "unrelated-fingerprint");
+    const prepared = journal.agents.prepareTurn(
+      authority,
+      preparedOwner,
+      "redirected-readable-prepared",
+      "Cancel through the relational owner",
+      { type: "object" },
+      journal.control(run).controlVersion,
+    );
+    const stopped = journal.agents.prepareTurn(
+      authority,
+      stoppedOwner,
+      "redirected-readable-stopped",
+      "Settle through the relational owner",
+      { type: "object" },
+      journal.control(run).controlVersion,
+    );
+    const launches = new ControlledLaunches({
+      root: stoppedOwner.execution.runtimeRoot,
+      executable: stoppedOwner.execution.executable,
+      turnTimeoutMs: stoppedOwner.execution.turnTimeoutMs,
+    });
+    const { manifest } = launches.reserve(journal, authority, stopped.identity);
+    const stop = {
+      generation: manifest.generation,
+      stoppedAt: new Date().toISOString(),
+      kind: "stopped" as const,
+      code: 1,
+      signal: null,
+      interrupted: true,
+      processTreeStopped: true as const,
+    };
+    journal.agents.recordLaunchStop(authority, stopped.identity, stop);
+    const db = new Database(f.path);
+    cleanup.push(() => db.close());
+    const redirectedPrepared = redirectTurnWorkspace(db, run, prepared.identity.turnId, unrelated);
+    const redirectedStopped = redirectTurnWorkspace(db, run, stopped.identity.turnId, unrelated);
+    expect(journal.agents.turnForRecovery(run, redirectedPrepared).ownerValidity).toBe(
+      "unreadable",
+    );
+    expect(journal.agents.turnForRecovery(run, redirectedStopped).ownerValidity).toBe(
+      "not_required",
+    );
+    f.store.releaseLease(run, lease.ownerToken);
+
+    await expect(
+      new OrchestratorController(f.store, run, { dispatcher: f.driverFactory([]) }).run(),
+    ).rejects.toThrow("readable owner(s) with damaged turn history");
+
+    expect(f.observed).toHaveLength(0);
+    expect(journal.agents.instance(run, preparedOwner)).toMatchObject({
+      status: "reserved",
+      activeTurnId: null,
+    });
+    expect(journal.agents.instance(run, stoppedOwner)).toMatchObject({
+      status: "reserved",
+      activeTurnId: null,
+    });
+    expect(journal.agents.workspace(run, preparedOwner)).toMatchObject({
+      status: "quarantined",
+      activeTurnId: null,
+    });
+    expect(journal.agents.workspace(run, stoppedOwner)).toMatchObject({
+      status: "quarantined",
+      activeTurnId: null,
+    });
+    expect(journal.agents.workspace(run, unrelated)).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+    expect(journal.agents.turnForRecovery(run, redirectedPrepared).turn).toMatchObject({
+      status: "cancelled",
+      resultEligible: false,
+    });
+    expect(journal.agents.turnForRecovery(run, redirectedStopped).turn).toMatchObject({
+      status: "cancelled",
+      stopEvidence: JSON.stringify(stop),
+      resultEligible: false,
+    });
+    expect(
+      journal.observations(run).filter((entry) => entry.kind === "recovery.owner_uncontained"),
+    ).toHaveLength(2);
   });
 
   it("recovers submitted turns from exact stop proof when owning agent records are malformed", async () => {

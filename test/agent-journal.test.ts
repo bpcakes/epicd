@@ -868,7 +868,7 @@ describe("durable agent coordination", () => {
     ).toThrow("replaced in place");
   });
 
-  it("removes authority from a corrupt stopped owner without disabling healthy reservations", () => {
+  it("fails closed when a warmed unreadable owner diverges from its canonical assignment", () => {
     const setup = fixture();
     const owner = setup.ready("specialist");
     const prepared = setup.prepare(owner);
@@ -915,9 +915,9 @@ describe("durable agent coordination", () => {
 
     expect(() => setup.agents.instance(setup.authority.runId, owner)).toThrow();
     expect(() => setup.agents.turns(setup.authority.runId)).toThrow();
+    // Warm the isolated-owner inventory while the canonical assignment is still valid.
     expect(setup.agents.operationalInstances(setup.authority.runId)).toEqual([]);
     expect(setup.agents.workspaceWasAssigned(setup.authority.runId, owner)).toBe(true);
-    expect(setup.agents.workspaceHasNonReleasedOwner(setup.authority.runId, owner)).toBe(true);
     expect(setup.agents.assignmentIds(setup.authority.runId)).toContain(owner.assignmentId);
     const assignment = setup.agents.assignment(setup.authority.runId, owner.assignmentId);
     expect(() =>
@@ -948,18 +948,16 @@ describe("durable agent coordination", () => {
     expect(setup.agents.recoveryIntegrity(setup.authority.runId)).toMatchObject([
       {
         identity: { agentId: owner.agentId, agentGeneration: owner.agentGeneration },
-        state: "isolated",
+        state: "uncontained",
         affectedTurnIds: [prepared.identity.turnId],
       },
     ]);
-    expect(setup.agents.operationalTurns(setup.authority.runId)[0]).toMatchObject({
-      result: { answer: "historical" },
-      resultEligible: false,
-    });
-    expect(setup.agents.operationalTurnEntries(setup.authority.runId)[0]).toMatchObject({
-      owner: { state: "isolated", role: "worker" },
-      turn: { identity: prepared.identity, resultEligible: false },
-    });
+    expect(() => setup.agents.operationalTurns(setup.authority.runId)).toThrow(
+      "stop cannot be proved",
+    );
+    expect(() => setup.agents.operationalTurnEntries(setup.authority.runId)).toThrow(
+      "stop cannot be proved",
+    );
     expect(setup.reserve("specialist")).toMatchObject({ status: "reserved" });
   });
 
@@ -1064,6 +1062,146 @@ describe("durable agent coordination", () => {
     );
   });
 
+  it("rejects a re-digested prompt assignment that differs from its relational assignment", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const prepared = setup.prepare(owner);
+    const changed = structuredClone(prepared);
+    changed.prompt.assignment.instructions = "Redirected assignment authority";
+    changed.promptDigest = digestJson(changed.prompt);
+    setup.db
+      .prepare("UPDATE agent_turns SET record_json = ? WHERE turn_id = ?")
+      .run(JSON.stringify(changed), prepared.identity.turnId);
+
+    expect(() => setup.agents.turn(setup.authority.runId, prepared.identity)).toThrow(
+      "owning agent or assignment binding",
+    );
+    expect(setup.agents.turnForRecovery(setup.authority.runId, prepared.identity)).toMatchObject({
+      ownerValidity: "unreadable",
+      turn: { identity: prepared.identity, status: "prepared" },
+    });
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner)).toMatchObject({
+      state: "uncontained",
+      incident: { ownerRecordReadable: true },
+    });
+  });
+
+  it("invalidates warmed ownership when the canonical assignment payload changes", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const prepared = setup.prepare(owner);
+    const run = setup.authority.runId;
+
+    expect(setup.agents.operationalTurns(run)).toEqual([prepared]);
+    expect(setup.agents.ownershipAssessment(run, owner).state).toBe("valid");
+
+    const assignment = setup.agents.assignment(run, owner.assignmentId);
+    setup.db
+      .prepare("UPDATE agent_assignments SET record_json = ? WHERE assignment_id = ?")
+      .run(
+        JSON.stringify({ ...assignment, instructions: "Changed canonical authority" }),
+        assignment.assignmentId,
+      );
+
+    expect(setup.agents.ownershipAssessment(run, owner)).toMatchObject({
+      state: "uncontained",
+      incident: {
+        ownerRecordReadable: true,
+        affectedTurnIds: [prepared.identity.turnId],
+      },
+    });
+    expect(() => setup.agents.operationalTurns(run)).toThrow("stop cannot be proved");
+  });
+
+  it("contains a redirected prepared turn through its readable relational owner", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const prepared = setup.prepare(owner);
+    const unrelated = setup.workspace("diagnostic");
+    const redirectedIdentity = redirectTurnWorkspace(setup.db, prepared.identity.turnId, unrelated);
+
+    expect(() => setup.agents.turn(setup.authority.runId, redirectedIdentity)).toThrow(
+      "owning agent or assignment binding",
+    );
+    expect(setup.agents.turnForRecovery(setup.authority.runId, redirectedIdentity)).toMatchObject({
+      ownerValidity: "unreadable",
+      turn: { identity: redirectedIdentity, status: "prepared" },
+    });
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner)).toMatchObject({
+      state: "uncontained",
+      incident: { ownerRecordReadable: true },
+    });
+
+    setup.agents.cancelPreparedTurnWithoutOwner(setup.authority, redirectedIdentity);
+
+    expect(setup.agents.instance(setup.authority.runId, owner)).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+    expect(setup.agents.workspace(setup.authority.runId, owner)).toMatchObject({
+      status: "quarantined",
+      activeTurnId: null,
+    });
+    expect(setup.agents.workspace(setup.authority.runId, unrelated)).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+    expect(
+      setup.agents.turnForRecovery(setup.authority.runId, redirectedIdentity).turn,
+    ).toMatchObject({ status: "cancelled", resultEligible: false });
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner).state).toBe(
+      "uncontained",
+    );
+  });
+
+  it("settles a redirected stopped turn through its readable relational owner", () => {
+    const setup = fixture();
+    const owner = setup.ready("specialist");
+    const prepared = setup.prepare(owner);
+    const { manifest } = setup.launches.reserve(setup.journal, setup.authority, prepared.identity);
+    const stop = {
+      generation: manifest.generation,
+      stoppedAt: new Date().toISOString(),
+      kind: "stopped" as const,
+      code: 1,
+      signal: null,
+      interrupted: true,
+      processTreeStopped: true as const,
+    };
+    setup.agents.recordLaunchStop(setup.authority, prepared.identity, stop);
+    const unrelated = setup.workspace("diagnostic");
+    const redirectedIdentity = redirectTurnWorkspace(setup.db, prepared.identity.turnId, unrelated);
+
+    expect(setup.agents.turnForRecovery(setup.authority.runId, redirectedIdentity)).toMatchObject({
+      ownerValidity: "not_required",
+      turn: { identity: redirectedIdentity, stopEvidence: null },
+    });
+    const settled = setup.agents.settleStoppedTurnWithoutOwner(setup.authority, redirectedIdentity);
+
+    expect(settled).toMatchObject({
+      status: "cancelled",
+      stopRequested: true,
+      stopEvidence: JSON.stringify(stop),
+      result: null,
+      resultEligible: false,
+    });
+    expect(setup.agents.instance(setup.authority.runId, owner)).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+    expect(setup.agents.workspace(setup.authority.runId, owner)).toMatchObject({
+      status: "quarantined",
+      activeTurnId: null,
+    });
+    expect(setup.agents.workspace(setup.authority.runId, unrelated)).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner).state).toBe(
+      "uncontained",
+    );
+  });
+
   it("quarantines the relational owner workspace when an unreadable prepared turn names another workspace", () => {
     const setup = fixture();
     const owner = setup.ready("specialist");
@@ -1141,7 +1279,9 @@ describe("durable agent coordination", () => {
       )
       .run(JSON.stringify(corrupt), setup.authority.runId, owner.agentId, owner.agentGeneration);
 
-    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner).state).toBe("isolated");
+    expect(setup.agents.ownershipAssessment(setup.authority.runId, owner).state).toBe(
+      "uncontained",
+    );
     expect(setup.agents.turnForRecovery(setup.authority.runId, redirectedIdentity)).toMatchObject({
       turn: { identity: redirectedIdentity, stopEvidence: null },
       ownerValidity: "not_required",
@@ -1168,7 +1308,7 @@ describe("durable agent coordination", () => {
         .get(message.messageId),
     ).toMatchObject({ record_json: expect.stringContaining('"status":"indeterminate"') });
     expect(setup.agents.recoveryIntegrity(setup.authority.runId)).toMatchObject([
-      { state: "isolated", affectedTurnIds: [prepared.identity.turnId] },
+      { state: "uncontained", affectedTurnIds: [prepared.identity.turnId] },
     ]);
   });
 

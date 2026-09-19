@@ -742,6 +742,7 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
         }),
       ).toThrow("explicitly abandon");
       if (status === "pending") {
+        vi.stubEnv("HERDR_ENV", "1");
         f.detach();
         journal.operatorControl(run, f.version(), { kind: "resume" });
         await expect(new OrchestratorController(store, run).run()).rejects.toThrow(
@@ -1180,6 +1181,116 @@ describe.runIf(process.platform === "linux")("explicit current-format runtime ha
         f.version(),
       ),
     ).not.toThrow();
+  });
+
+  it("rejects a continued workspace when unrelated released history becomes uncontained", async () => {
+    const f = await fixture();
+    const run = f.state.runId;
+    f.journal.agents.bindProvider(f.authority, f.agent, {
+      backend: "codex",
+      runtime: "sdk",
+      sessionId: randomUUID(),
+    });
+    const retainedTurn = f.journal.agents.prepareTurn(
+      f.authority,
+      f.agent,
+      randomUUID(),
+      "Retain history before a fresh conversation",
+      { type: "object" },
+      f.version(),
+    );
+    f.journal.agents.markSubmitting(f.authority, retainedTurn.identity);
+    f.journal.agents.acknowledgePrompt(
+      f.authority,
+      retainedTurn.identity,
+      retainedTurn.promptDigest,
+      "Fixture acknowledged exact turn",
+    );
+    f.journal.agents.finishTurn(f.authority, retainedTurn.identity, {
+      status: "completed",
+      result: { fact: "retained" },
+      stopEvidence: "Fixture has no external process",
+    });
+
+    f.pause();
+    f.journal.handoffRuntime(f.authority, f.version(), f.target);
+    f.journal.operatorControl(run, f.version(), { kind: "resume" });
+    const settings = { model: "gpt-6-astra", reasoningEffort: "high" as const };
+    const unrelated = f.journal.agents.reserveAgent(
+      f.authority,
+      {
+        ...f.workspace,
+        role: "orchestrator",
+        purpose: "coordination",
+        taskId: null,
+        candidateId: null,
+        instructions: "Start an unrelated fresh conversation",
+        contract: HerdrAgentSessionContractSchema.parse({
+          backend: "codex",
+          runtime: "herdr",
+          requested: settings,
+          effective: settings,
+        }),
+        confinementProfile: "epicd-isolated",
+        replaces: f.agent,
+      },
+      f.version(),
+    );
+    const unrelatedSessionId = randomUUID();
+    f.journal.agents.bindProvider(f.authority, unrelated, {
+      backend: "codex",
+      runtime: "herdr",
+      name: "fresh",
+      paneId: "pane",
+      tabId: "tab",
+      terminalId: "terminal",
+      sessionId: unrelatedSessionId,
+    });
+
+    f.pause();
+    f.journal.handoffRuntime(
+      f.authority,
+      f.version(),
+      { runtime: "sdk", executable: f.codex, herdr: null },
+      true,
+    );
+    const transfer = f.journal.agents.pendingCoordinatorConversationTransfer(run, "sdk")!;
+
+    const row = f.db
+      .prepare("SELECT record_json FROM agent_turns WHERE run_id = ? AND turn_id = ?")
+      .get(run, retainedTurn.identity.turnId) as { record_json: string };
+    const damaged = JSON.parse(row.record_json);
+    damaged.prompt.assignment.instructions = "Damaged retained assignment";
+    f.db
+      .prepare("UPDATE agent_turns SET record_json = ? WHERE run_id = ? AND turn_id = ?")
+      .run(JSON.stringify(damaged), run, retainedTurn.identity.turnId);
+    expect(f.journal.agents.ownershipAssessment(run, f.agent).state).toBe("uncontained");
+
+    f.journal.operatorControl(run, f.version(), { kind: "resume" });
+
+    expect(() =>
+      f.journal.agents.reserveAgent(
+        f.authority,
+        {
+          ...f.workspace,
+          role: "orchestrator",
+          purpose: "coordination",
+          taskId: null,
+          candidateId: null,
+          instructions: "Do not cross unrelated uncontained history",
+          contract: SdkAgentSessionContractSchema.parse({
+            backend: "codex",
+            runtime: "sdk",
+            requested: settings,
+            effective: settings,
+          }),
+          confinementProfile: "epicd-isolated",
+          replaces: unrelated,
+          conversationTransferId: transfer.transferId,
+        },
+        f.version(),
+      ),
+    ).toThrow("Use a fresh workspace for each agent instance");
   });
 
   it.each([false, true])(

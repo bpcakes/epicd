@@ -377,6 +377,7 @@ type OwnershipAgentRow = {
   generation: number;
   workspace_id: string;
   workspace_generation: number;
+  assignment_id: string;
   record_json: string;
   revision: string | null;
   workspace_revision: string | null;
@@ -390,6 +391,12 @@ type OwnershipTurnRow = {
 };
 type OwnershipMessageRow = {
   message_id: string;
+  agent_id: string;
+  agent_generation: number;
+  record_json: string;
+};
+type OwnershipAssignmentRow = {
+  assignment_id: string;
   agent_id: string;
   agent_generation: number;
   record_json: string;
@@ -441,7 +448,11 @@ export class AgentJournal {
   private snapshotOwnership: Map<string, Map<string, AgentOwnershipAssessment>> | null = null;
   private readonly ownershipCache = new Map<
     string,
-    { revision: string | null; entries: Map<string, OwnershipCacheEntry> }
+    {
+      revision: string | null;
+      assignmentRevision: string;
+      entries: Map<string, OwnershipCacheEntry>;
+    }
   >();
 
   constructor(
@@ -1002,32 +1013,26 @@ export class AgentJournal {
       )
       .get(runId, identity.workspaceId, identity.workspaceGeneration);
   }
-  /** Malformed ownership is a conflict, never evidence that a workspace is available. */
-  workspaceHasNonReleasedOwner(runId: string, identity: WorkspaceIdentity): boolean {
-    return this.workspaceHasConflictingOwner(runId, identity, new Set());
-  }
-
   /** A validated transfer may cross only its own isolated, stopped historical owners. */
   private workspaceHasConflictingOwner(
     runId: string,
     identity: WorkspaceIdentity,
+    ownership: ReadonlyMap<string, AgentOwnershipAssessment>,
     isolatedTransferAncestors: ReadonlySet<string>,
   ): boolean {
     const rows = this.db
       .prepare(
-        "SELECT agent_id, generation, record_json FROM agent_instances WHERE run_id = ? AND workspace_id = ? AND workspace_generation = ?",
+        "SELECT agent_id, generation FROM agent_instances WHERE run_id = ? AND workspace_id = ? AND workspace_generation = ?",
       )
       .all(runId, identity.workspaceId, identity.workspaceGeneration) as {
       agent_id: string;
       generation: number;
-      record_json: string;
     }[];
-    return rows.some(({ agent_id, generation, record_json }) => {
-      const parsed = AgentInstanceSchema.safeParse(JSON.parse(record_json));
-      if (parsed.success) return parsed.data.status !== "released";
-      return !isolatedTransferAncestors.has(
-        agentIdentityKey({ agentId: agent_id, agentGeneration: generation }),
-      );
+    return rows.some(({ agent_id, generation }) => {
+      const key = agentIdentityKey({ agentId: agent_id, agentGeneration: generation });
+      const assessment = ownership.get(key);
+      if (assessment?.state === "valid") return assessment.agent.status !== "released";
+      return assessment?.state !== "isolated" || !isolatedTransferAncestors.has(key);
     });
   }
   /** Invalid historical assignments conservatively disqualify independence. */
@@ -1084,19 +1089,33 @@ export class AgentJournal {
    * Integrity changes are versioned by owner inside the same SQLite transaction as
    * their durable rows. Savepoint rollback therefore rolls the version back too,
    * and unchanged historical owners never need their turn/mailbox payloads parsed
-   * again merely because another owner advanced.
+   * again merely because another owner advanced. Assignments are immutable during
+   * normal operation; their ordered durable bytes remain part of the cache identity
+   * so out-of-band damage cannot reuse an earlier aggregate assessment.
    */
   private ownershipEntries(runId: string): Map<string, OwnershipCacheEntry> {
     const revisionRow = this.db
       .prepare("SELECT revision FROM agent_ownership_epochs WHERE run_id = ?")
       .get(runId) as { revision: string } | undefined;
     const revision = revisionRow?.revision ?? null;
+    const assignmentRows = this.db
+      .prepare(
+        `SELECT assignment_id, agent_id, agent_generation, record_json
+         FROM agent_assignments WHERE run_id = ? ORDER BY rowid`,
+      )
+      .all(runId) as OwnershipAssignmentRow[];
+    const assignmentRevision = digestJson(assignmentRows);
     const cached = this.ownershipCache.get(runId);
-    if (revision !== null && cached?.revision === revision) return cached.entries;
+    if (
+      revision !== null &&
+      cached?.revision === revision &&
+      cached.assignmentRevision === assignmentRevision
+    )
+      return cached.entries;
     const rows = this.db
       .prepare(
         `SELECT agent.rowid, agent.agent_id, agent.generation, agent.workspace_id,
-                agent.workspace_generation, agent.record_json, revision.revision,
+                agent.workspace_generation, agent.assignment_id, agent.record_json, revision.revision,
                 workspace_revision.revision AS workspace_revision
          FROM agent_instances agent
          LEFT JOIN agent_ownership_revisions revision
@@ -1109,7 +1128,7 @@ export class AgentJournal {
          WHERE agent.run_id = ? ORDER BY agent.rowid`,
       )
       .all(runId) as OwnershipAgentRow[];
-    const prior = cached?.entries;
+    const prior = cached?.assignmentRevision === assignmentRevision ? cached.entries : undefined;
     const inventory = new Map<string, OwnershipCacheEntry>();
     if (prior === undefined) {
       const turnRows = this.db
@@ -1187,7 +1206,7 @@ export class AgentJournal {
         inventory.set(key, this.assessOwnership(runId, row, turns, messages));
       }
     }
-    this.ownershipCache.set(runId, { revision, entries: inventory });
+    this.ownershipCache.set(runId, { revision, assignmentRevision, entries: inventory });
     return inventory;
   }
 
@@ -1239,7 +1258,15 @@ export class AgentJournal {
       }
       try {
         if (parsedAgent.success) this.validateTurnAgainstAgent(parsed.data, parsedAgent.data);
-        else this.validateTurnIntrinsic(parsed.data);
+        else
+          this.validateTurnAgainstOwnerBinding(parsed.data, {
+            runId,
+            agentId: row.agent_id,
+            agentGeneration: row.generation,
+            assignmentId: row.assignment_id,
+            workspaceId: row.workspace_id,
+            workspaceGeneration: row.workspace_generation,
+          });
       } catch (error) {
         if (!(error instanceof InvalidTurnRecordError)) throw error;
         contained = false;
@@ -2012,15 +2039,23 @@ export class AgentJournal {
           "conversation_transfer_mismatch",
           "Conversation transfer does not match the stopped coordinator replacement",
         );
+      const ownership = this.ownershipInventory(authority.runId);
       const isolatedTransferAncestors = new Set<string>();
       if (transferSource) {
-        const lineage = this.conversationLineage(authority.runId, transferSource);
+        const lineage = this.conversationLineage(authority.runId, transferSource, ownership);
         for (const ancestor of lineage.identities) {
           const key = agentIdentityKey(ancestor);
           if (lineage.ownership?.get(key)?.state === "isolated") isolatedTransferAncestors.add(key);
         }
       }
-      if (this.workspaceHasConflictingOwner(authority.runId, workspace, isolatedTransferAncestors))
+      if (
+        this.workspaceHasConflictingOwner(
+          authority.runId,
+          workspace,
+          ownership,
+          isolatedTransferAncestors,
+        )
+      )
         throw new AgentCoordinationError(
           "workspace_assigned",
           "Use a fresh workspace for each agent instance",
@@ -2938,11 +2973,14 @@ export class AgentJournal {
     });
   }
 
-  /** Recovery workspace authority comes from the turn owner's relational binding, not turn JSON. */
-  private relationalOwnerWorkspaceForTurn(runId: string, turnId: string): WorkspaceRecord {
+  /** Recovery authority comes from relational ownership; malformed owner JSON remains untouched. */
+  private relationalOwnerForTurn(
+    runId: string,
+    turnId: string,
+  ): { agent: AgentInstance | null; workspace: WorkspaceRecord } {
     const binding = this.db
       .prepare(
-        `SELECT owner.workspace_id, owner.workspace_generation
+        `SELECT owner.workspace_id, owner.workspace_generation, owner.record_json
          FROM agent_turns turn_record
          JOIN agent_instances owner
            ON owner.run_id = turn_record.run_id
@@ -2950,16 +2988,29 @@ export class AgentJournal {
              AND owner.generation = turn_record.agent_generation
          WHERE turn_record.run_id = ? AND turn_record.turn_id = ?`,
       )
-      .get(runId, turnId) as { workspace_id: string; workspace_generation: number } | undefined;
+      .get(runId, turnId) as
+      { workspace_id: string; workspace_generation: number; record_json: string } | undefined;
     if (!binding)
       throw new AgentCoordinationError(
         "unknown_turn",
         "Turn owner binding is missing, stale, or belongs to another run",
       );
-    return this.workspace(runId, {
-      workspaceId: binding.workspace_id,
-      workspaceGeneration: binding.workspace_generation,
-    });
+    const parsedAgent = AgentInstanceSchema.safeParse(JSON.parse(binding.record_json));
+    return {
+      agent: parsedAgent.success ? parsedAgent.data : null,
+      workspace: this.workspace(runId, {
+        workspaceId: binding.workspace_id,
+        workspaceGeneration: binding.workspace_generation,
+      }),
+    };
+  }
+
+  /** A readable damaged owner must not remain busy after its exact turn is contained. */
+  private clearRecoveredTurnFromOwner(agent: AgentInstance | null, turnId: string): void {
+    if (!agent || agent.activeTurnId !== turnId) return;
+    agent.activeTurnId = null;
+    if (agent.status === "busy") agent.status = agent.provider ? "ready" : "reserved";
+    this.saveAgent(agent);
   }
 
   /** Recovery-only cancellation whose no-launch proof is intrinsic to the turn row. */
@@ -2986,7 +3037,7 @@ export class AgentJournal {
           "prompt_may_be_submitted",
           "Owner-independent cancellation requires an intrinsically valid never-launched turn",
         );
-      const workspace = this.relationalOwnerWorkspaceForTurn(authority.runId, identity.turnId);
+      const owner = this.relationalOwnerForTurn(authority.runId, identity.turnId);
       const messages = this.all(
         AgentMailboxMessageSchema,
         "SELECT record_json FROM agent_messages WHERE run_id = ? AND agent_id = ? AND agent_generation = ? ORDER BY rowid",
@@ -3003,9 +3054,11 @@ export class AgentJournal {
       turn.resultEligible = false;
       turn.stopEvidence = "Kernel cancelled the prepared turn before dispatch";
       this.saveTurnIntrinsic(turn);
-      if (workspace.activeTurnId === identity.turnId) workspace.activeTurnId = null;
-      if (!["retired", "disposed"].includes(workspace.status)) workspace.status = "quarantined";
-      this.saveWorkspace(workspace);
+      this.clearRecoveredTurnFromOwner(owner.agent, identity.turnId);
+      if (owner.workspace.activeTurnId === identity.turnId) owner.workspace.activeTurnId = null;
+      if (!["retired", "disposed"].includes(owner.workspace.status))
+        owner.workspace.status = "quarantined";
+      this.saveWorkspace(owner.workspace);
       this.changed(
         authority,
         "agent.unreadable_owner_contained",
@@ -3042,7 +3095,7 @@ export class AgentJournal {
           "launch_not_stopped",
           "Owner-independent settlement requires the exact launch's trusted stop receipt",
         );
-      const workspace = this.relationalOwnerWorkspaceForTurn(authority.runId, identity.turnId);
+      const owner = this.relationalOwnerForTurn(authority.runId, identity.turnId);
       const messages = this.all(
         AgentMailboxMessageSchema,
         "SELECT record_json FROM agent_messages WHERE run_id = ? AND agent_id = ? AND agent_generation = ? ORDER BY rowid",
@@ -3059,9 +3112,11 @@ export class AgentJournal {
       turn.resultEligible = false;
       turn.stopEvidence = JSON.stringify(stop);
       this.saveTurnIntrinsic(turn);
-      if (workspace.activeTurnId === identity.turnId) workspace.activeTurnId = null;
-      if (!["retired", "disposed"].includes(workspace.status)) workspace.status = "quarantined";
-      this.saveWorkspace(workspace);
+      this.clearRecoveredTurnFromOwner(owner.agent, identity.turnId);
+      if (owner.workspace.activeTurnId === identity.turnId) owner.workspace.activeTurnId = null;
+      if (!["retired", "disposed"].includes(owner.workspace.status))
+        owner.workspace.status = "quarantined";
+      this.saveWorkspace(owner.workspace);
       this.changed(
         authority,
         "agent.unreadable_owner_contained",
@@ -3694,8 +3749,8 @@ export class AgentJournal {
     return this.validateTurnAgainstAgent(turn, agent);
   }
   private validateTurnAgainstAgent(turn: TurnRecord, agent: AgentInstance | undefined): TurnRecord {
-    this.validateTurnIntrinsic(turn);
     if (!agent) throw new InvalidTurnRecordError("Persisted turn has no readable owning agent");
+    this.validateTurnAgainstOwnerBinding(turn, agent);
     if (
       turn.launch &&
       (turn.launch.backend !== agent.contract.backend ||
@@ -3703,6 +3758,45 @@ export class AgentJournal {
     )
       throw new InvalidTurnRecordError(
         "Persisted turn launch differs from its owning agent contract",
+      );
+    return turn;
+  }
+  /** Relational identity remains authoritative even when the owner payload is unreadable. */
+  private validateTurnAgainstOwnerBinding(
+    turn: TurnRecord,
+    owner: Pick<
+      AgentInstance,
+      | "runId"
+      | "agentId"
+      | "agentGeneration"
+      | "assignmentId"
+      | "workspaceId"
+      | "workspaceGeneration"
+    >,
+  ): TurnRecord {
+    this.validateTurnIntrinsic(turn);
+    const assignmentRow = this.db
+      .prepare(
+        `SELECT record_json FROM agent_assignments
+         WHERE run_id = ? AND assignment_id = ? AND agent_id = ? AND agent_generation = ?`,
+      )
+      .get(owner.runId, owner.assignmentId, owner.agentId, owner.agentGeneration) as
+      { record_json: string } | undefined;
+    const assignment = assignmentRow
+      ? AgentAssignmentSchema.safeParse(JSON.parse(assignmentRow.record_json))
+      : null;
+    if (
+      turn.identity.runId !== owner.runId ||
+      turn.identity.agentId !== owner.agentId ||
+      turn.identity.agentGeneration !== owner.agentGeneration ||
+      turn.identity.assignmentId !== owner.assignmentId ||
+      turn.identity.workspaceId !== owner.workspaceId ||
+      turn.identity.workspaceGeneration !== owner.workspaceGeneration ||
+      !assignment?.success ||
+      digestJson(turn.prompt.assignment) !== digestJson(assignment.data)
+    )
+      throw new InvalidTurnRecordError(
+        "Persisted turn differs from its owning agent or assignment binding",
       );
     return turn;
   }
