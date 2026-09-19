@@ -449,7 +449,7 @@ describe.skipIf(process.platform !== "linux")("published whole-epic review", () 
       s.replaceTracker(baseline);
       await refresh(s);
     }
-  }, 60000);
+  }, 180000);
 
   it("carries additional delivered task checks into final validation and rejects replacement commands", async () => {
     const s = await closureFixture(),

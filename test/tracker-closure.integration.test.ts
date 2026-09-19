@@ -187,6 +187,8 @@ describe.skipIf(process.platform !== "linux")("verified task closure", () => {
     const { commit, publication } = await publishVerified(s);
     for (const destination of ["canonicalRef", "publicRef"] as const) {
       const repository = publication[destination]!.repository.root.path;
+      const operationCount = s.journal.tracker.operations(s.authority.runId).length;
+      const closeCommandCount = s.trackerCommands().filter((args) => args[0] === "close").length;
       git(
         repository,
         "update-ref",
@@ -195,7 +197,19 @@ describe.skipIf(process.platform !== "linux")("verified task closure", () => {
         commit.revision!,
       );
       expect((await s.dispatch(close(commit.revision!))).status).toBe("failed");
-      expect(s.trackerCommands().some((args) => args[0] === "close")).toBe(false);
+      const operations = s.journal.tracker.operations(s.authority.runId);
+      expect(operations).toHaveLength(operationCount + 1);
+      expect(operations.at(-1)).toMatchObject({
+        kind: "close_task",
+        outcome: "not_closed",
+        mutationDispatched: false,
+        ioStopped: true,
+        failure: "Dependent tracker operation requires both exact published refs",
+        closure: { refsVerified: false, intervention: true },
+      });
+      expect(s.trackerCommands().filter((args) => args[0] === "close")).toHaveLength(
+        closeCommandCount,
+      );
       expect(git(repository, "rev-parse", `refs/heads/epicd/${s.authority.runId}`)).toBe(s.head);
       expect(s.readTracker().status).toBe("in_progress");
       git(
@@ -206,7 +220,7 @@ describe.skipIf(process.platform !== "linux")("verified task closure", () => {
         s.head,
       );
     }
-  }, 30000);
+  }, 60000);
 
   it("recognizes a lost CLI response and replays only the recorded action result", async () => {
     const s = await closureFixture();

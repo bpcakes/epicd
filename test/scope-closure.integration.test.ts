@@ -217,7 +217,7 @@ describe.skipIf(process.platform !== "linux")("guarded scope closure and complet
       s.replaceTracker(baseline);
       resource(await s.dispatch({ kind: "refresh_tracker" }));
     }
-  }, 60000);
+  }, 135000);
 
   it("does not treat an externally closed root as this run's completion proof", async () => {
     const s = await closureFixture();

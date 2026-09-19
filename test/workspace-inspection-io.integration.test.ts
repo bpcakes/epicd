@@ -164,14 +164,15 @@ describe.skipIf(process.platform !== "linux")("standalone workspace inspection l
     )
       throw new Error("Expected the real inspection to retain a ready materialization");
     const ids = [first.inspectionId];
-    for (let i = 1; i < 64; i++)
-      ids.push(
-        retainObservedMaterialization(
-          s,
-          first.execution,
-          first.workerResult.observation.fingerprint,
-        ).inspectionId,
+    for (let i = 1; i < 64; i++) {
+      const retained = retainObservedMaterialization(
+        s,
+        first.execution,
+        first.workerResult.observation.fingerprint,
       );
+      expect(retained.outcome).toBe("observed");
+      ids.push(retained.inspectionId);
+    }
     expect(await invoke(s)).toBe("ready");
     ids.push(latest(s).inspectionId);
     expect(new Set(ids).size).toBe(65);
