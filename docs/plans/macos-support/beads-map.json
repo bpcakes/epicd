@@ -1,0 +1,30 @@
+{
+  "epic": "epicd-m7r",
+  "tasks": {
+    "MAC-01": "epicd-m7r.1",
+    "MAC-02": "epicd-m7r.2",
+    "MAC-03": "epicd-m7r.3",
+    "MAC-04": "epicd-m7r.4",
+    "MAC-05": "epicd-m7r.5",
+    "MAC-06": "epicd-m7r.6",
+    "MAC-07": "epicd-m7r.7",
+    "MAC-08": "epicd-m7r.8",
+    "MAC-09": "epicd-m7r.9",
+    "MAC-10": "epicd-m7r.10",
+    "MAC-11": "epicd-m7r.11",
+    "MAC-12": "epicd-m7r.12",
+    "MAC-13": "epicd-m7r.13",
+    "MAC-14": "epicd-m7r.14",
+    "MAC-15": "epicd-m7r.15",
+    "MAC-16": "epicd-m7r.16",
+    "MAC-17": "epicd-m7r.17",
+    "MAC-18": "epicd-m7r.18",
+    "MAC-19": "epicd-m7r.19",
+    "MAC-20": "epicd-m7r.20",
+    "MAC-21": "epicd-m7r.21",
+    "MAC-22": "epicd-m7r.22",
+    "MAC-23": "epicd-m7r.23",
+    "MAC-24": "epicd-m7r.24",
+    "MAC-25": "epicd-m7r.25"
+  }
+}

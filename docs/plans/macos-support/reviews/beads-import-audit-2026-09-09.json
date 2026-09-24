@@ -1,0 +1,42 @@
+{
+  "epic": "epicd-m7r",
+  "tasks": 25,
+  "blocking_edges": 102,
+  "parent_edges": 25,
+  "ready": [
+    "epicd-m7r.1",
+    "epicd-m7r.2"
+  ],
+  "passes": [
+    {
+      "pass": 1,
+      "result": "PASS",
+      "detail": "One epic, 25 unique open children, exact full descriptions and nonempty acceptance fields; no truncation."
+    },
+    {
+      "pass": 2,
+      "result": "PASS",
+      "detail": "102 exact blocking edges, no cycles, all tasks reach final gate, ready set MAC-01/MAC-02."
+    },
+    {
+      "pass": 3,
+      "result": "PASS",
+      "detail": "Independent review of six actual saved issues preserved native-only scope, positive feasibility, receipt custody and fixture/service proof boundaries."
+    },
+    {
+      "pass": 4,
+      "result": "PASS",
+      "detail": "All 25 saved packets retain rationale, source context, implementation contract, adverse tests, acceptance and actual prerequisite IDs; isolated packets had passed plan review."
+    },
+    {
+      "pass": 5,
+      "result": "PASS",
+      "detail": "Independent review of seven actual saved issues preserved installation, preflight, default TUI, native SDK/Herdr and final release requirements."
+    },
+    {
+      "pass": 6,
+      "result": "PASS",
+      "detail": "JSONL and live issue readback agree on descriptions, criteria, statuses and all 127 parent/blocking edges; clean sync and preserved graph."
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "date": "2026-09-24",
+  "audit": "second master audit",
+  "baseline": "48e1577c84add53e83da81498a81ed877ac01489",
+  "epic": "epicd-m7r",
+  "tasks": 25,
+  "blocking_edges": 103,
+  "parent_edges": 25,
+  "ready": [
+    "epicd-m7r.1",
+    "epicd-m7r.2"
+  ],
+  "added_blocking_edges": [],
+  "checks": {
+    "plan_task_packet_equality": "PASS",
+    "saved_description_acceptance_equality": "PASS",
+    "sqlite_jsonl_bv_graph_equality": "PASS",
+    "acyclic_and_all_reach_MAC_25": "PASS",
+    "stable_ids_and_status_metadata": "PASS",
+    "unrelated_23_records_unchanged": "PASS",
+    "referenced_local_paths_exist": "PASS",
+    "br_ready_matches_roots": "PASS"
+  },
+  "sha256": {
+    "plan.md": "7e0a69846688211c38ab93f32494130c705b3f591e07391a33dcc7985ccd408d",
+    "tasks.json": "0a5c35a1ed5967a64e494ec3d373e128d6e7b43389102390034d97038354dc82",
+    "beads-map.json": "143e81f1d639f452ba756a1626c9b7ce3ebaa9407b7c338751ac07e94de00925"
+  },
+  "historical_import_audit": "reviews/beads-import-audit-2026-09-09.json",
+  "prior_alignment_audit": "reviews/master-alignment-audit-2026-09-24.json",
+  "changed_task_contracts": [
+    "MAC-02",
+    "MAC-03",
+    "MAC-05",
+    "MAC-06",
+    "MAC-08",
+    "MAC-19",
+    "MAC-20"
+  ],
+  "scope": "Plan/tracker validation and local Bash capability inspection; no implementation, product tests, native qualification or live model delivery.",
+  "final_verification": {
+    "date": "2026-09-24",
+    "baseline": "48e1577c84add53e83da81498a81ed877ac01489",
+    "independent_focused_review": "PASS; no remaining material findings",
+    "fresh_tracker_and_graph_readback": "PASS",
+    "all_23_upstream_records_match_master": "PASS",
+    "planning_json_and_source_references": "PASS",
+    "contract_changes_this_round": false,
+    "native_feasibility": "Unproven; MAC-01 remains the positive gate",
+    "product_tests": "Not run; planning/tracker changes only"
+  }
+}

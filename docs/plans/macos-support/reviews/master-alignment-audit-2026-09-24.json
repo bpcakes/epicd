@@ -1,0 +1,35 @@
+{
+  "date": "2026-09-24",
+  "baseline": "48e1577c84add53e83da81498a81ed877ac01489",
+  "epic": "epicd-m7r",
+  "tasks": 25,
+  "blocking_edges": 103,
+  "parent_edges": 25,
+  "ready": [
+    "epicd-m7r.1",
+    "epicd-m7r.2"
+  ],
+  "added_blocking_edges": [
+    {
+      "dependent": "epicd-m7r.8",
+      "prerequisite": "epicd-m7r.6"
+    }
+  ],
+  "checks": {
+    "plan_task_packet_equality": "PASS",
+    "saved_description_acceptance_equality": "PASS",
+    "sqlite_jsonl_bv_graph_equality": "PASS",
+    "acyclic_and_all_reach_MAC_25": "PASS",
+    "stable_ids_and_status_metadata": "PASS",
+    "unrelated_23_records_unchanged": "PASS",
+    "referenced_local_paths_exist": "PASS",
+    "br_ready_matches_roots": "PASS"
+  },
+  "sha256": {
+    "plan.md": "12dc3293b6f9c9e4f841f71a6b0116d9d10323c6dab88b74ad5f89dd6344a729",
+    "tasks.json": "ff8e0c74c938700020c0ffe890be6bda4894a8e2033df1632d8458f36751fbc5",
+    "beads-map.json": "143e81f1d639f452ba756a1626c9b7ce3ebaa9407b7c338751ac07e94de00925"
+  },
+  "historical_import_audit": "reviews/beads-import-audit-2026-09-09.json",
+  "scope": "Plan/tracker validation only; no implementation, native qualification or live model tests."
+}
